@@ -951,11 +951,9 @@ fn fetch_monitor_via_cdp(
     emit_progress: bool,
 ) -> Result<Value, String> {
     let port = headless_browser::active_chrome_port(platform);
-    let wait_selector = if Platform::parse(platform) == Some(Platform::Douyin) {
-        "a[href*=\"/video/\"]"
-    } else {
-        "a[href*=\"/explore/\"]"
-    };
+    let wait_selector = crate::scraper::adapter_for_str(platform)
+        .map(|adapter| adapter.list_wait_selector())
+        .unwrap_or("a[href*=\"/explore/\"]");
     let watch_id = watch.map(|item| item.id.clone()).unwrap_or_default();
     // limit 必须在抓取前解析：抽取器按它决定滚动到第几屏 / 收多少条。
     let limit = resolve_scan_limit(state, payload);

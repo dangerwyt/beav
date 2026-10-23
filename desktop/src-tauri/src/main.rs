@@ -53,6 +53,7 @@ mod provider_compat;
 mod provider_runtime;
 mod redclaw_profile;
 mod runtime;
+mod scraper;
 mod scheduler;
 mod session_manager;
 mod skills;

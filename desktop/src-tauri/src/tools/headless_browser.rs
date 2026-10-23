@@ -23,7 +23,6 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
-use crate::platform::Platform;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
@@ -1308,11 +1307,9 @@ async fn scrape_post_detail_once(
             .send_request("Page.navigate", Some(nav_params), Some(&session_id))
             .await?;
         // 等详情锚点出现（xhs: #detail-title/#detail-desc；dy: 视频文案区）。多 selector 用逗号列表。
-        let wait_selector = if Platform::parse(platform) == Some(Platform::Douyin) {
-            "[data-e2e=\"video-desc\"], .video-info-detail"
-        } else {
-            "#detail-title, #detail-desc, .note-content"
-        };
+        let wait_selector = crate::scraper::adapter_for_str(platform)
+            .map(|adapter| adapter.detail_wait_selector())
+            .unwrap_or("#detail-title, #detail-desc, .note-content");
         let _ = client
             .wait_for_selector(&session_id, wait_selector, 10)
             .await;
@@ -1336,11 +1333,9 @@ async fn scrape_post_detail_once(
         tokio::time::sleep(Duration::from_millis(800)).await;
         // 等正文文本真正填进容器（xhs 客户端渲染有延迟：标题先出、正文后填），
         // 避免抓到「元素在但 textContent 空」的半渲染页 → 触发「页面未解析到正文」。
-        let content_wait = if Platform::parse(platform) == Some(Platform::Douyin) {
-            "[data-e2e=\"video-desc\"]"
-        } else {
-            "#detail-desc, .note-text, .desc"
-        };
+        let content_wait = crate::scraper::adapter_for_str(platform)
+            .map(|adapter| adapter.content_wait_selector())
+            .unwrap_or("#detail-desc, .note-text, .desc");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let has = client
