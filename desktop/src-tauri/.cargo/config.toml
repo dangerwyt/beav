@@ -1,0 +1,9 @@
+# Local build hardening for this Windows dev machine.
+# The `calamine` crate triggers a rustc segfault (0xc0000005, STATUS_ACCESS_VIOLATION)
+# under INCREMENTAL compilation on this toolchain (rustc 1.99.0 / MSVC). Disabling
+# incremental builds avoids the crash. This is safe on all platforms.
+[profile.dev]
+incremental = false
+
+[profile.release]
+incremental = false

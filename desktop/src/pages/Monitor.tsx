@@ -1,0 +1,2324 @@
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { Radar, Plus, RefreshCw, Trash2, ExternalLink, Zap, Sparkles, Check, X, Eye, Loader2, Link2, Lock, LogOut, ChevronDown, ChevronLeft, ChevronRight, FlaskConical, BookOpen, Copy, Download, Video, Film, History } from 'lucide-react';
+import { clsx } from 'clsx';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { MonitorChromeStatus, MonitorChromeLaunchResult, MonitorChromeTestResult } from '../bridge/domains/monitorBridge';
+import { resolveAssetUrl } from '../utils/pathManager';
+
+interface CompetitorWatch {
+  id: string;
+  name: string;
+  platform: string;
+  profileUrl: string | null;
+  handle: string | null;
+  note: string | null;
+  enabled: boolean;
+  intervalHours: number;
+  lastFetchAt: string | null;
+  /** 深层历史是否已补过（补过一次后不再每晚重复深翻）。 */
+  historyBackfilledAt?: string | null;
+  /** 该监控已收录的帖子数（后端 watch-list 从 monitored_posts 派生，不依赖前端选中的 posts 数组）。 */
+  postCount?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface MonitoredPost {
+  id: string;
+  watchId: string | null;
+  platform: string;
+  author: string;
+  authorUrl: string | null;
+  postUrl: string;
+  title: string;
+  mediaType?: string;
+  coverUrl?: string | null;
+  images?: string[];
+  content: string;
+  /** 详情页是否成功抓取过（图/标题抓到即算，纯图/无正文笔记也算）。作为缓存钥匙，避免无正文帖每次打开都重抓。 */
+  detailFetched?: boolean;
+  excerpt: string | null;
+  publishedAt: string | null;
+  likes: number;
+  comments: number;
+  collects: number;
+  prevLikes: number;
+  prevComments: number;
+  isNew: boolean;
+  spike: boolean;
+  spikeRatio: number;
+  capturedVia: string;
+  topicInjected: boolean;
+  /** 是否已对该帖做过爆文拆解（后端 post_deconstructions 落库标记）。 */
+  deconstructed?: boolean;
+  /** 视频下载态：none / downloading / done / failed。 */
+  videoStatus?: string;
+  /** 本地视频文件路径（下载后填）。 */
+  videoLocalPath?: string | null;
+  /** 轻量代理视频路径（720p/H.264，WebView 内直接播放用）；原片常 4K/HEVC 播不了。 */
+  videoPreviewPath?: string | null;
+  videoSize?: number | null;
+  videoDownloadedAt?: number | null;
+  videoError?: string | null;
+  /** 本地视频是否含音轨（null/undefined = 未探测）。抖音 DASH 常只给视频轨，无音轨则无法转写。 */
+  videoHasAudio?: boolean | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 爆文拆解沉淀：一篇对标帖经 LLM 拆出的方法论要素（对应后端 PostDeconstructionRecord）。 */
+interface PostDeconstruction {
+  id: string;
+  postId: string;
+  platform: string;
+  author: string;
+  postTitle: string;
+  postUrl: string;
+  topicAngle: string;
+  copyStructure: string;
+  opening: string;
+  titlePatterns: string[];
+  hooks: string[];
+  reusableTakeaway: string;
+  rawContent?: string;
+  sourceEvidence?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 视频本体分析沉淀：ASR 字幕 + 抽帧 + LLM 摘要（对应后端 PostVideoAnalysisRecord）。 */
+interface PostVideoAnalysis {
+  id: string;
+  postId: string;
+  platform: string;
+  author: string;
+  postTitle: string;
+  postUrl: string;
+  localPath: string;
+  durationSecs?: number | null;
+  transcript: string;
+  /** 转写状态：ok / no-audio / not-configured / failed / pending（尚未转写）/ 空串（未知）。 */
+  transcriptStatus: string;
+  /** 转写失败的具体原因（status 非 ok 时后端会填），供 UI 显示真实原因。 */
+  transcriptError?: string | null;
+  frames: string[];
+  summary: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+const PLATFORM_OPTIONS = [
+  { value: '', label: '自动识别' },
+  { value: 'bilibili', label: 'B 站' },
+  { value: 'xiaohongshu', label: '小红书' },
+  { value: 'douyin', label: '抖音' },
+  { value: 'weibo', label: '微博' },
+  { value: 'zhihu', label: '知乎' },
+  { value: 'weixin', label: '微信公众号' },
+  { value: 'web', label: '其他网页' },
+];
+
+const platformLabel = (code: string): string => {
+  const found = PLATFORM_OPTIONS.find((opt) => opt.value === code);
+  return found ? found.label : (code || '网页');
+};
+
+const formatTs = (ts: string | null | undefined): string => {
+  if (!ts) return '—';
+  const n = Number(ts);
+  if (!Number.isFinite(n)) return ts;
+  let ms = n;
+  if (ms < 1e12) ms *= 1000; // 兼容秒级时间戳
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return ts;
+  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+};
+
+/** 把一篇拆解沉淀格式化成可复制的纯文本（用于「复制方法论」）。 */
+const formatDeconText = (d: PostDeconstruction): string => {
+  const lines: string[] = [];
+  lines.push(`【爆文拆解】${d.postTitle || '(无标题)'}`);
+  lines.push(`博主：${d.author} · ${platformLabel(d.platform)}`);
+  lines.push('');
+  lines.push(`一、选题角度：${d.topicAngle || '—'}`);
+  lines.push(`二、文案结构：${d.copyStructure || '—'}`);
+  lines.push(`三、开场白：${d.opening || '—'}`);
+  lines.push(`四、标题句式：`);
+  (d.titlePatterns.length ? d.titlePatterns : ['—']).forEach((t, i) => lines.push(`  ${i + 1}. ${t}`));
+  lines.push(`五、钩子 / 悬念点：`);
+  (d.hooks.length ? d.hooks : ['—']).forEach((h, i) => lines.push(`  ${i + 1}. ${h}`));
+  lines.push(`六、可复用方法论：${d.reusableTakeaway || '—'}`);
+  return lines.join('\n');
+};
+
+/**
+ * 把后端回传的 deconstruction 记录（camelCase 已对齐，但容错 snake_case）规整成前端类型。
+ * 纯函数，置于模块作用域 —— 避免被组件内的 useEffect 依赖数组在「声明前」引用触发 TDZ（ReferenceError）。
+ */
+function normalizeDecon(raw: Record<string, unknown> | null | undefined): PostDeconstruction | null {
+  if (!raw) return null;
+  const arr = (key: string): string[] => {
+    const v = raw[key];
+    return Array.isArray(v) ? v.map((x) => String(x)) : [];
+  };
+  const num = (key: string): number => {
+    const n = Number(raw[key]);
+    return Number.isFinite(n) ? n : 0;
+  };
+  return {
+    id: String(raw.id ?? ''),
+    postId: String(raw.postId ?? raw.post_id ?? ''),
+    platform: String(raw.platform ?? ''),
+    author: String(raw.author ?? ''),
+    postTitle: String(raw.postTitle ?? raw.post_title ?? ''),
+    postUrl: String(raw.postUrl ?? raw.post_url ?? ''),
+    topicAngle: String(raw.topicAngle ?? raw.topic_angle ?? ''),
+    copyStructure: String(raw.copyStructure ?? raw.copy_structure ?? ''),
+    opening: String(raw.opening ?? ''),
+    titlePatterns: arr('titlePatterns').length ? arr('titlePatterns') : arr('title_patterns'),
+    hooks: arr('hooks'),
+    reusableTakeaway: String(raw.reusableTakeaway ?? raw.reusable_takeaway ?? ''),
+    rawContent: raw.rawContent != null ? String(raw.rawContent) : undefined,
+    sourceEvidence: raw.sourceEvidence != null ? String(raw.sourceEvidence) : undefined,
+    createdAt: num('createdAt') || num('created_at'),
+    updatedAt: num('updatedAt') || num('updated_at'),
+  };
+}
+
+/** 爆文拆解六要素展示卡（详情弹窗与方法论库共用）。fields 区 + 复制按钮。 */
+function DeconFields({ decon }: { decon: PostDeconstruction }) {
+  const copyAll = () => {
+    const text = formatDeconText(decon);
+    void navigator.clipboard?.writeText(text).catch(() => {});
+  };
+  const Field = ({ label, children }: { label: string; children: ReactNode }) => (
+    <div>
+      <div className="text-[11px] font-medium text-accent-primary/80 mb-1">{label}</div>
+      <div className="text-sm text-text-secondary leading-relaxed">{children}</div>
+    </div>
+  );
+  return (
+    <div className="rounded-lg border border-accent-primary/20 bg-accent-primary/[0.04] p-3 space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 text-[12px] font-semibold text-accent-primary">
+          <FlaskConical className="w-3.5 h-3.5" />爆文拆解方法论
+        </div>
+        <button
+          onClick={copyAll}
+          className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-md border border-border text-text-tertiary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+          title="复制六要素为纯文本"
+        >
+          <Copy className="w-3 h-3" />复制
+        </button>
+      </div>
+
+      <Field label="选题角度（为什么火）">{decon.topicAngle || '—'}</Field>
+      <Field label="文案结构（怎么铺）">{decon.copyStructure || '—'}</Field>
+      <Field label="开场白（前 3 秒）">{decon.opening || '—'}</Field>
+
+      <Field label="标题句式">
+        {decon.titlePatterns.length ? (
+          <ul className="list-disc pl-5 space-y-0.5">
+            {decon.titlePatterns.map((t, i) => (
+              <li key={i}>{t}</li>
+            ))}
+          </ul>
+        ) : (
+          '—'
+        )}
+      </Field>
+
+      <Field label="钩子 / 悬念点">
+        {decon.hooks.length ? (
+          <ul className="list-disc pl-5 space-y-0.5">
+            {decon.hooks.map((h, i) => (
+              <li key={i}>{h}</li>
+            ))}
+          </ul>
+        ) : (
+          '—'
+        )}
+      </Field>
+
+      <Field label="可复用方法论 / 论点">{decon.reusableTakeaway || '—'}</Field>
+
+      {decon.sourceEvidence && (
+        <div className="text-[11px] text-text-tertiary border-t border-border pt-2">
+          佐证：{decon.sourceEvidence}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 后端回传的视频分析记录（camelCase 已对齐，容错 snake_case）→ 前端类型。
+ * 模块作用域纯函数，原因同 normalizeDecon：避免 useEffect 依赖数组在声明前引用触发 TDZ。
+ */
+function normalizeVideoAnalysis(raw: Record<string, unknown> | null | undefined): PostVideoAnalysis | null {
+  if (!raw) return null;
+  const postId = String(raw.postId ?? raw.post_id ?? '');
+  if (!postId) return null;
+  const num = (key: string, fallbackKey?: string): number => {
+    // 后端返回 camelCase（如 updatedAt）；旧写法在给了 fallbackKey 时只读 snake_case，
+    // 把 camelCase 值丢掉 → updatedAt 恒 0 → 展示成 1970/1/1。这里先读主键再退回 fallback。
+    const value = raw[key] ?? (fallbackKey != null ? raw[fallbackKey] : undefined);
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const framesRaw = Array.isArray(raw.frames) ? raw.frames : [];
+  const duration = Number(raw.durationSecs ?? raw.duration_secs);
+  return {
+    id: String(raw.id ?? ''),
+    postId,
+    platform: String(raw.platform ?? ''),
+    author: String(raw.author ?? ''),
+    postTitle: String(raw.postTitle ?? raw.post_title ?? ''),
+    postUrl: String(raw.postUrl ?? raw.post_url ?? ''),
+    localPath: String(raw.localPath ?? raw.local_path ?? ''),
+    durationSecs: Number.isFinite(duration) ? duration : null,
+    transcript: String(raw.transcript ?? ''),
+    transcriptStatus: String(raw.transcriptStatus ?? raw.transcript_status ?? ''),
+    transcriptError:
+      raw.transcriptError != null || raw.transcript_error != null
+        ? String(raw.transcriptError ?? raw.transcript_error ?? '')
+        : null,
+    frames: framesRaw.map((f) => String(f)).filter(Boolean),
+    summary: String(raw.summary ?? ''),
+    createdAt: num('createdAt', 'created_at'),
+    updatedAt: num('updatedAt', 'updated_at'),
+  };
+}
+
+/** 视频分析展示卡：时长 + 关键帧网格 + 语音转写全文 + LLM 摘要。 */
+function VideoAnalysisPanel({ analysis }: { analysis: PostVideoAnalysis }) {
+  const [showAll, setShowAll] = useState(false);
+  const transcript = analysis.transcript.trim();
+  const longTranscript = transcript.length > 600;
+  return (
+    <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/[0.04] p-3 space-y-3">
+      <div className="flex items-center gap-1.5 text-[12px] font-semibold text-emerald-600 dark:text-emerald-400">
+        <Film className="w-3.5 h-3.5" />视频本体分析
+        {analysis.durationSecs != null && (
+          <span className="text-[11px] font-normal text-text-tertiary">
+            · {Math.round(analysis.durationSecs)} 秒
+          </span>
+        )}
+      </div>
+
+      {analysis.frames.length > 0 && (
+        <div>
+          <div className="text-[11px] font-medium text-text-tertiary mb-1.5">
+            关键帧（{analysis.frames.length} 张 / 每 15s 一帧）
+          </div>
+          <div className="grid grid-cols-4 gap-1.5">
+            {analysis.frames.slice(0, 8).map((frame, i) => (
+              <img
+                key={i}
+                src={resolveAssetUrl(frame)}
+                alt={`关键帧 ${i + 1}`}
+                className="w-full aspect-square object-cover rounded border border-border bg-surface-secondary"
+                loading="lazy"
+              />
+            ))}
+          </div>
+          {analysis.frames.length > 8 && (
+            <div className="text-[11px] text-text-tertiary mt-1">仅显示前 8 帧，共 {analysis.frames.length} 张</div>
+          )}
+        </div>
+      )}
+
+      {transcript ? (
+        <div>
+          <div className="text-[11px] font-medium text-text-tertiary mb-1">语音转写（ASR）</div>
+          <p className="text-sm text-text-secondary whitespace-pre-wrap leading-relaxed">
+            {showAll || !longTranscript ? transcript : `${transcript.slice(0, 600)}…`}
+          </p>
+          {longTranscript && (
+            <button
+              onClick={() => setShowAll((v) => !v)}
+              className="mt-1 text-[11px] text-accent-primary hover:underline"
+            >
+              {showAll ? '收起' : `展开全文（共 ${transcript.length} 字）`}
+            </button>
+          )}
+        </div>
+      ) : (
+        <div className="text-[11px] text-text-tertiary">
+          {analysis.transcriptStatus === 'no-audio'
+            ? '该视频没有音轨（抖音 DASH 只提供视频轨），无法做语音转写。重新下载该视频会自动补音轨后再分析。'
+            : analysis.transcriptStatus === 'not-configured'
+              ? '未配置语音转写服务 —— 请到「设置」填写 transcription 端点 / 模型后重新分析。'
+              : analysis.transcriptStatus === 'pending'
+                ? '排队等待语音转写（下载阶段结束后自动补）。'
+                : analysis.transcriptStatus === 'failed'
+                  ? `语音转写失败：${analysis.transcriptError || '原因未知'}`
+                  : '未取到语音转写 —— 可能是纯音乐 / 无口播视频，或转写服务未配置。'}
+        </div>
+      )}
+
+      {analysis.summary && (
+        <div>
+          <div className="text-[11px] font-medium text-text-tertiary mb-1">内容摘要</div>
+          <p className="text-sm text-text-secondary whitespace-pre-wrap leading-relaxed">{analysis.summary}</p>
+        </div>
+      )}
+
+      <div className="text-[11px] text-text-tertiary border-t border-border pt-2">
+        分析于 {formatTs(String(analysis.updatedAt))}
+        {analysis.localPath ? ` · ${analysis.localPath}` : ''}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 本地视频播放器：优先播 720p/H.264 轻量代理（WebView 对 4K/HEVC 原片往往放不出来）；
+ * 代理缺失时从原片路径派生 `<id>.preview.mp4` 试探（已下载的原片可能已有代理）；
+ * 派生也 404 → onError 回退到原片（H.264 ≤1080p + faststart 在 asset 协议下可播）。
+ */
+function VideoPlayerWithFallback({
+  localPath,
+  previewPath,
+}: {
+  localPath: string;
+  previewPath?: string;
+}) {
+  const derivedPreview = previewPath
+    || (localPath && /\.mp4(\?|#|$)/i.test(localPath)
+      ? localPath.replace(/\.mp4(\?|#|$)/i, '.preview.mp4$1')
+      : null);
+  const [src, setSrc] = useState<string | null>(derivedPreview);
+  const [triedFallback, setTriedFallback] = useState(false);
+  const onError = () => {
+    if (!triedFallback && src && src !== localPath) {
+      setTriedFallback(true);
+      setSrc(localPath);
+    }
+  };
+  if (!src) return null;
+  return (
+    <>
+      <video
+        key={src}
+        src={resolveAssetUrl(src)}
+        controls
+        preload="metadata"
+        onError={onError}
+        className="w-full max-h-80 rounded-lg border border-border bg-black"
+      />
+      {!previewPath && (
+        <p className="text-[11px] text-amber-600 dark:text-amber-400">
+          该视频为旧版本下载（无轻量代理文件），正在尝试本地代理；若内置播放器仍放不出，可点「重新下载」生成可播放版，或用系统播放器打开原片。
+        </p>
+      )}
+    </>
+  );
+}
+
+export function Monitor({ isActive = true }: { isActive?: boolean }) {
+  const [watches, setWatches] = useState<CompetitorWatch[]>([]);
+  const [selectedWatchId, setSelectedWatchId] = useState<string | null>(null);
+  const [posts, setPosts] = useState<MonitoredPost[]>([]);
+
+  const [loadingWatches, setLoadingWatches] = useState(true);
+  const [loadingPosts, setLoadingPosts] = useState(false);
+  const [fetching, setFetching] = useState(false);
+  /** 「补历史」进行中的博主 id（null = 空闲）。深翻要滚几十秒，按钮各自转圈。 */
+  const [historyBusyId, setHistoryBusyId] = useState<string | null>(null);
+  /** 补历史实时进度：watchId -> { scanned, total }，驱动「已抓 X / 共 Y」进度条。 */
+  const [backfillProgress, setBackfillProgress] = useState<Record<string, { scanned: number; total: number; phase?: string }>>({});
+  const [adhocUrl, setAdhocUrl] = useState('');
+  const [fetchNote, setFetchNote] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+  const [watchesError, setWatchesError] = useState<string | null>(null);
+  const [postsError, setPostsError] = useState<string | null>(null);
+
+  const [addOpen, setAddOpen] = useState(false);
+  const [addForm, setAddForm] = useState({
+    name: '',
+    platform: '',
+    profileUrl: '',
+    note: '',
+    intervalHours: 24,
+    enabled: true,
+  });
+  const [addError, setAddError] = useState('');
+
+  // —— 本地详情弹窗（点标题在 Beav 内看正文，不跳平台）——
+  const [detailPost, setDetailPost] = useState<MonitoredPost | null>(null);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailNote, setDetailNote] = useState<string | null>(null);
+  const [detailImages, setDetailImages] = useState<string[]>([]);
+  // 大图预览：点缩略图打开，记录当前查看的索引（支持左右切换 / ESC / 点背景关闭）
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+
+  // —— Chrome 头浏览器（小红书 / 抖音登录态抓取）——
+  const [chromeStatus, setChromeStatus] = useState<MonitorChromeStatus | null>(null);
+  const [chromeOpen, setChromeOpen] = useState(true);
+  const [chromeBusy, setChromeBusy] = useState(false);
+  const [chromeLoginPlatform, setChromeLoginPlatform] = useState<'xiaohongshu' | 'douyin'>('xiaohongshu');
+  const [chromeTestResult, setChromeTestResult] = useState<string | null>(null);
+
+  // —— 爆文拆解（详情弹窗内）——
+  const [deconResult, setDeconResult] = useState<PostDeconstruction | null>(null);
+  const [deconLoading, setDeconLoading] = useState(false);
+  const [deconError, setDeconError] = useState<string | null>(null);
+
+  // —— 方法论库（已沉淀的爆文拆解列表，模态浏览）——
+  const [methodsOpen, setMethodsOpen] = useState(false);
+  const [methodsItems, setMethodsItems] = useState<PostDeconstruction[]>([]);
+  const [methodsAuthors, setMethodsAuthors] = useState<string[]>([]);
+  const [methodsLoading, setMethodsLoading] = useState(false);
+  const [methodsAuthor, setMethodsAuthor] = useState('');
+  const [methodsPlatform, setMethodsPlatform] = useState('');
+  const [methodsExpanded, setMethodsExpanded] = useState<Set<string>>(new Set());
+
+  // —— 视频下载 + 本体分析（详情弹窗内，仅 mediaType==='video' 的帖可用）——
+  const [videoBusyId, setVideoBusyId] = useState<string | null>(null);
+  const [videoAnalyzingId, setVideoAnalyzingId] = useState<string | null>(null);
+  const [videoError, setVideoError] = useState<string | null>(null);
+  const [videoAnalysis, setVideoAnalysis] = useState<PostVideoAnalysis | null>(null);
+
+  const watchesRef = useRef<CompetitorWatch[]>([]);
+  const selectedRef = useRef<string | null>(null);
+
+  // 关闭详情弹窗时一并关闭大图预览
+  useEffect(() => {
+    if (!detailOpen) setLightboxIndex(null);
+  }, [detailOpen]);
+
+  // 大图预览的键盘操作：ESC 关闭，左右方向键切换（多图时）
+  useEffect(() => {
+    if (lightboxIndex === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setLightboxIndex(null);
+      } else if (e.key === 'ArrowLeft' && detailImages.length > 1) {
+        setLightboxIndex((i) => (i === null ? null : (i - 1 + detailImages.length) % detailImages.length));
+      } else if (e.key === 'ArrowRight' && detailImages.length > 1) {
+        setLightboxIndex((i) => (i === null ? null : (i + 1) % detailImages.length));
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [lightboxIndex, detailImages.length]);
+  // 两个列表各自的加载序号 —— 不能共用一个 ref，否则先后发起的请求会互相作废，
+  // 导致先发出的那个永远不落 loading=false（「一直加载中 / 请求超时」的真凶）。
+  const watchesLoadSeq = useRef(0);
+  const postsLoadSeq = useRef(0);
+
+  useEffect(() => {
+    watchesRef.current = watches;
+    selectedRef.current = selectedWatchId;
+  }, [watches, selectedWatchId]);
+
+  const loadWatches = useCallback(async () => {
+    const seq = watchesLoadSeq.current + 1;
+    watchesLoadSeq.current = seq;
+    setLoadingWatches(true);
+    setWatchesError(null);
+    try {
+      const list = (await window.ipcRenderer.monitor.watchList({})) as CompetitorWatch[];
+      if (seq !== watchesLoadSeq.current) return;
+      setWatches(Array.isArray(list) ? list : []);
+    } catch (e) {
+      console.error('Failed to load watchlist:', e);
+      if (seq === watchesLoadSeq.current) {
+        setWatches([]);
+        setWatchesError(e instanceof Error ? e.message : '加载监控列表失败');
+      }
+    } finally {
+      if (seq === watchesLoadSeq.current) setLoadingWatches(false);
+    }
+  }, []);
+
+  const loadPosts = useCallback(async () => {
+    const seq = postsLoadSeq.current + 1;
+    postsLoadSeq.current = seq;
+    setLoadingPosts(true);
+    setPostsError(null);
+    try {
+      const payload: Record<string, unknown> = {};
+      if (selectedRef.current) payload.watchId = selectedRef.current;
+      const list = (await window.ipcRenderer.monitor.postList(payload)) as MonitoredPost[];
+      if (seq !== postsLoadSeq.current) return;
+      setPosts(Array.isArray(list) ? list : []);
+    } catch (e) {
+      console.error('Failed to load posts:', e);
+      if (seq === postsLoadSeq.current) {
+        setPosts([]);
+        setPostsError(e instanceof Error ? e.message : '加载动态失败');
+      }
+    } finally {
+      if (seq === postsLoadSeq.current) setLoadingPosts(false);
+    }
+  }, []);
+
+  const loadChromeStatus = useCallback(async () => {
+    try {
+      const status = (await window.ipcRenderer.monitor.chromeStatus(chromeLoginPlatform)) as MonitorChromeStatus;
+      setChromeStatus(status);
+    } catch (e) {
+      console.warn('chrome status failed:', e);
+    }
+  }, [chromeLoginPlatform]);
+
+  useEffect(() => {
+    if (!isActive) return;
+    void loadWatches();
+  }, [isActive, loadWatches]);
+
+  useEffect(() => {
+    if (!isActive) return;
+    void loadPosts();
+  }, [isActive, selectedWatchId, loadPosts]);
+
+  // 单次抓取条数已由后端固定为 30（SCAN_LIMIT），前端不再拉取/展示可配置项。
+
+  useEffect(() => {
+    if (!isActive) return;
+    void loadChromeStatus();
+  }, [isActive, loadChromeStatus]);
+
+  // 看门狗：兜底防止 IPC 卡死导致永久 loading（16s 强制解锁并展示错误提示）
+  useEffect(() => {
+    if (!isActive) return;
+    const timer = window.setTimeout(() => {
+      setLoadingWatches((prev) => {
+        if (prev && watchesRef.current.length === 0) {
+          setWatchesError((msg) => msg || '请求超时（16s），请检查后端通道是否注册');
+        }
+        return false;
+      });
+      setLoadingPosts((prev) => {
+        if (prev && posts.length === 0) {
+          setPostsError((msg) => msg || '请求超时（16s），请检查后端通道是否注册');
+        }
+        return false;
+      });
+    }, 16_000);
+    return () => window.clearTimeout(timer);
+  }, [isActive, posts.length]);
+
+  const showToast = useCallback((kind: 'ok' | 'err', text: string) => {
+    setToast({ kind, text });
+    window.setTimeout(() => setToast(null), 2600);
+  }, []);
+
+  // 监听后端「每日 00:00 批量预取」完成事件：常驻 APP 的帖子列表是内存旧快照，
+  // 预取已把新帖的正文/媒体类型/视频落库，必须刷新列表才能命中 openDetail 的本地缓存 → 秒开。
+  // 没有这一层，即使后端已补全，用户次日打开仍要走异步 fetch（不「秒见正文」）。
+  useEffect(() => {
+    if (!isActive) return;
+    let unlisten: UnlistenFn | undefined;
+    listen<{
+      newPosts?: number;
+      videosDownloaded?: number;
+      videosTranscribed?: number;
+      detailEnriched?: number;
+      detailSkipped?: number;
+      skipNote?: string | null;
+      backfilled?: number;
+      recoveredDownloading?: number;
+    }>('monitor:prefetch-done', (event) => {
+      void loadPosts();
+      const p = event.payload ?? {};
+      const parts: string[] = [];
+      if ((p.newPosts ?? 0) > 0) parts.push(`新增 ${p.newPosts} 篇`);
+      if ((p.detailEnriched ?? 0) > 0) parts.push(`补全正文 ${p.detailEnriched} 篇`);
+      if ((p.backfilled ?? 0) > 0) parts.push(`回填存量 ${p.backfilled} 篇`);
+      if ((p.videosTranscribed ?? 0) > 0) parts.push(`转写 ${p.videosTranscribed} 个视频`);
+      if (parts.length) showToast('ok', `每日预取完成：${parts.join('、')}，已可秒开`);
+      // 正文没抓到就明确告知原因（常见：该平台 Chrome 未连接），否则用户只看到「打开没正文」
+      if ((p.detailSkipped ?? 0) > 0) {
+        showToast(
+          'err',
+          `有 ${p.detailSkipped} 篇未抓到正文${p.skipNote ? `：${p.skipNote}` : ''}`,
+        );
+      }
+    })
+      .then((u) => {
+        unlisten = u;
+      })
+      .catch(() => {});
+    return () => {
+      unlisten?.();
+    };
+  }, [isActive, loadPosts, showToast]);
+
+  // 监听后端「补历史」实时进度：深翻是 Rust 侧逐轮滚动，每轮上报一次
+  // { watchId, scanned, total }，前端据此刷新「已抓 X / 共 Y」进度条。
+  useEffect(() => {
+    if (!isActive) return;
+    let unlisten: UnlistenFn | undefined;
+    listen<{ watchId?: string; scanned?: number; total?: number; phase?: string }>(
+      'monitor:backfill-progress',
+      (event) => {
+        const p = event.payload ?? {};
+        if (!p.watchId) return;
+        const wid = p.watchId as string;
+        // phase=videos-done：后台历史视频批处理结束，清掉该监控的进度条
+        if (p.phase === 'videos-done') {
+          setBackfillProgress((prev) => {
+            const next = { ...prev };
+            delete next[wid];
+            return next;
+          });
+          return;
+        }
+        setBackfillProgress((prev) => ({
+          ...prev,
+          [wid]: {
+            scanned: p.scanned ?? 0,
+            total: p.total ?? 0,
+            phase: p.phase,
+          },
+        }));
+      },
+    )
+      .then((u) => {
+        unlisten = u;
+      })
+      .catch(() => {});
+    return () => {
+      unlisten?.();
+    };
+  }, [isActive]);
+
+  const openExternal = useCallback(async (url?: string | null) => {
+    if (!url) return;
+    try {
+      await window.ipcRenderer.openExternalUrl(url);
+    } catch (e) {
+      console.warn('openExternalUrl failed:', e);
+    }
+  }, []);
+
+  const handleFetchWatch = useCallback(async (watch: CompetitorWatch) => {
+    setFetching(true);
+    setFetchNote(null);
+    try {
+      const result = (await window.ipcRenderer.monitor.fetch({ watchId: watch.id })) as {
+        success?: boolean;
+        scanned?: number;
+        created?: MonitoredPost[];
+        note?: string;
+      };
+      const createdCount = result?.created?.length ?? 0;
+      setFetchNote(result?.note || `已扫描 ${result?.scanned ?? 0} 条链接，新增 ${createdCount} 条动态。`);
+      await Promise.all([loadWatches(), loadPosts()]);
+      showToast('ok', `「${watch.name}」抓取完成，新增 ${createdCount} 条动态`);
+    } catch (e) {
+      console.error('fetch failed:', e);
+      showToast('err', e instanceof Error ? e.message : '抓取失败');
+    } finally {
+      setFetching(false);
+    }
+  }, [loadWatches, loadPosts, showToast]);
+
+  const handleAdhocFetch = useCallback(async () => {
+    const url = adhocUrl.trim();
+    if (!url) {
+      setAddError('请输入主页或单篇链接');
+      return;
+    }
+    setFetching(true);
+    setFetchNote(null);
+    try {
+      const result = (await window.ipcRenderer.monitor.fetch({ url })) as {
+        success?: boolean;
+        scanned?: number;
+        created?: MonitoredPost[];
+        note?: string;
+      };
+      const createdCount = result?.created?.length ?? 0;
+      setFetchNote(result?.note || `已扫描 ${result?.scanned ?? 0} 条链接，新增 ${createdCount} 条动态。`);
+      await Promise.all([loadWatches(), loadPosts()]);
+      showToast('ok', `抓取完成，新增 ${createdCount} 条动态`);
+    } catch (e) {
+      console.error('adhoc fetch failed:', e);
+      showToast('err', e instanceof Error ? e.message : '抓取失败');
+    } finally {
+      setFetching(false);
+    }
+  }, [adhocUrl, loadWatches, loadPosts, showToast]);
+
+  // 补历史：深翻博主主页，把更早的历史帖一次性抓下来（日常抓取只取最新 N 条）。
+  const handleBackfillHistory = useCallback(async (watchId: string) => {
+    setHistoryBusyId(watchId);
+    try {
+      const result = (await window.ipcRenderer.monitor.backfillHistory(watchId)) as {
+        success?: boolean;
+        watched?: number;
+        scanned?: number;
+        profileTotal?: number;
+        newPosts?: number;
+        detailEnriched?: number;
+        detailSkipped?: number;
+        skipNote?: string | null;
+        pendingVideos?: number;
+        hint?: string | null;
+        failed?: number;
+      };
+      const added = result?.newPosts ?? 0;
+      const enriched = result?.detailEnriched ?? 0;
+      const scanned = result?.scanned ?? 0;
+      const profileTotal = result?.profileTotal ?? 0;
+      await Promise.all([loadWatches(), loadPosts()]);
+      if (scanned === 0) {
+        // 一条都没抓到 → 报出原因（最常见：Chrome 未连接）
+        showToast(
+          'err',
+          `没抓到任何帖子${result?.skipNote ? `：${result.skipNote}` : '（请确认该平台 Chrome 已连接）'}`,
+        );
+      } else {
+        showToast(
+          'ok',
+          `补历史完成：扫描 ${scanned} 条${profileTotal > 0 ? `（主页共 ${profileTotal} 篇）` : ''}，补进 ${added} 篇历史，补全正文 ${enriched} 篇`,
+        );
+      }
+      if ((result?.detailSkipped ?? 0) > 0) {
+        showToast(
+          'err',
+          `有 ${result?.detailSkipped} 篇未抓到正文${result?.skipNote ? `：${result.skipNote}` : ''}`,
+        );
+      }
+      if ((result?.pendingVideos ?? 0) > 0) {
+        showToast('ok', `已开始后台处理 ${result?.pendingVideos} 个历史视频（下载+转写），完成后列表自动刷新`);
+      }
+      if (result?.hint) {
+        showToast('err', result.hint);
+      }
+    } catch (e) {
+      console.error('backfill history failed:', e);
+      showToast('err', e instanceof Error ? e.message : '补历史失败');
+    } finally {
+      setHistoryBusyId(null);
+      setBackfillProgress((prev) => {
+        // 视频还在后台批处理（phase=videos）→ 保留进度条，等 videos-done 事件再清
+        if (prev[watchId]?.phase === 'videos') return prev;
+        const next = { ...prev };
+        delete next[watchId];
+        return next;
+      });
+    }
+  }, [loadWatches, loadPosts, showToast]);
+
+  const handleRemove = useCallback(async (id: string) => {
+    try {
+      await window.ipcRenderer.monitor.watchRemove(id);
+      setSelectedWatchId((prev) => (prev === id ? null : prev));
+      await Promise.all([loadWatches(), loadPosts()]);
+    } catch (e) {
+      console.error('remove failed:', e);
+      showToast('err', e instanceof Error ? e.message : '删除失败');
+    }
+  }, [loadWatches, loadPosts, showToast]);
+
+  const handleClear = useCallback(async () => {
+    const ok = window.confirm(
+      '确定清空全部「对标博主」和「全部动态」数据吗？\n此操作不可恢复。',
+    );
+    if (!ok) return;
+    try {
+      const result = (await window.ipcRenderer.monitor.clear()) as {
+        success?: boolean;
+        removedWatchlist?: number;
+        removedPosts?: number;
+      };
+      setSelectedWatchId(null);
+      await Promise.all([loadWatches(), loadPosts()]);
+      showToast(
+        'ok',
+        `已清空：对标博主 ${result?.removedWatchlist ?? 0} 个、动态 ${result?.removedPosts ?? 0} 条`,
+      );
+    } catch (e) {
+      console.error('clear failed:', e);
+      showToast('err', e instanceof Error ? e.message : '清空失败');
+    }
+  }, [loadWatches, loadPosts, showToast]);
+
+  const handlePostRemove = useCallback(async (postId: string) => {
+    try {
+      await window.ipcRenderer.monitor.postRemove(postId);
+      await loadPosts();
+    } catch (e) {
+      console.error('post remove failed:', e);
+      showToast('err', e instanceof Error ? e.message : '删除动态失败');
+    }
+  }, [loadPosts, showToast]);
+
+  const handleClearPosts = useCallback(async () => {
+    const ok = window.confirm('确定清空全部「动态」数据吗？\n此操作不可恢复（对标博主列表不受影响）。');
+    if (!ok) return;
+    try {
+      const result = (await window.ipcRenderer.monitor.clearPosts()) as {
+        success?: boolean;
+        removedPosts?: number;
+      };
+      await loadPosts();
+      showToast('ok', `已清空 ${result?.removedPosts ?? 0} 条动态`);
+    } catch (e) {
+      console.error('clear posts failed:', e);
+      showToast('err', e instanceof Error ? e.message : '清空动态失败');
+    }
+  }, [loadPosts, showToast]);
+
+  // 本地详情：首次点开时后端经 CDP 抓正文（约 10-20s），之后走缓存秒开。
+  const openDetail = useCallback(async (post: MonitoredPost, refresh = false) => {
+    // 切换帖子时清空上一条的拆解结果，避免串味。
+    setDeconResult(null);
+    setDeconError(null);
+    // 同理清空上一条的视频分析（下载态 / 错误 / 分析结果都跟着 detailPost 走）。
+    setVideoAnalysis(null);
+    setVideoError(null);
+    // 已抓取过（正文有 or 已标记 detailFetched）且非主动刷新 → 直接本地展示，秒开、不请求后端。
+    // 纯图/无正文笔记 content 永远空，但 detailFetched 为真 → 同样命中缓存，不再反复重抓。
+    // 图片列表已随详情抓取落库（post.images）；老数据没图时用封面兜底，避免二次打开空白。
+    if (!refresh && (post.detailFetched || (post.content && post.content.trim()))) {
+      setDetailPost(post);
+      setDetailImages(
+        Array.isArray(post.images) && post.images.length
+          ? post.images
+          : post.coverUrl
+            ? [post.coverUrl]
+            : [],
+      );
+      setDetailNote(null);
+      setDetailOpen(true);
+      setDetailLoading(false);
+      return;
+    }
+    if (!refresh) {
+      // 非刷新：先打开面板并展示已有缓存（图片/封面兜底），避免二次打开空白，再异步覆盖。
+      setDetailPost(post);
+      setDetailImages(
+        Array.isArray(post.images) && post.images.length
+          ? post.images
+          : post.coverUrl
+            ? [post.coverUrl]
+            : [],
+      );
+      setDetailNote(null);
+      setDetailOpen(true);
+    }
+    setDetailLoading(true);
+    try {
+      const result = (await window.ipcRenderer.monitor.postDetail(post.id, refresh)) as {
+        success?: boolean;
+        post?: MonitoredPost;
+        fetched?: boolean;
+        images?: string[] | null;
+        note?: string;
+      };
+      // 优先用后端回传的 post；失败回退到入参 post（保留当前展示）。
+      setDetailPost(result?.post ?? post);
+      // 抓到有效图片就用新的；否则保留现有缩略图（prefill 已兜底 cover/image），不清空。
+      const incoming = Array.isArray(result?.images) ? result.images : [];
+      if (incoming.length) setDetailImages(incoming);
+      setDetailNote(result?.note || null);
+      // 回写列表状态：让卡片带上正文+图片，下次直接命中客户端缓存，无需再进后端。
+      // 注意：刷新（refresh=true）也要回写，否则二次打开仍读不到新抓到的图。
+      if (result?.post) {
+        setPosts((prev) =>
+          prev.map((p) => (p.id === result.post!.id ? { ...p, ...result.post } : p)),
+        );
+      }
+    } catch (e) {
+      console.error('post detail failed:', e);
+      // 抓取失败：保留当前 detailImages，仅提示，避免清空缩略图。
+      setDetailNote(e instanceof Error ? e.message : '获取详情失败');
+    } finally {
+      setDetailLoading(false);
+    }
+  }, []);
+
+  const handleAdd = useCallback(async () => {
+    const name = addForm.name.trim();
+    if (!name) {
+      setAddError('请输入博主名称');
+      return;
+    }
+    try {
+      await window.ipcRenderer.monitor.watchAdd({
+        name,
+        platform: addForm.platform || undefined,
+        profileUrl: addForm.profileUrl.trim() || undefined,
+        note: addForm.note.trim() || undefined,
+        enabled: addForm.enabled,
+        intervalHours: addForm.intervalHours,
+      });
+      setAddOpen(false);
+      setAddForm({ name: '', platform: '', profileUrl: '', note: '', intervalHours: 24, enabled: true });
+      setAddError('');
+      await loadWatches();
+      showToast('ok', `已添加监控「${name}」`);
+    } catch (e) {
+      console.error('add failed:', e);
+      setAddError(e instanceof Error ? e.message : '添加失败');
+    }
+  }, [addForm, loadWatches, showToast]);
+
+  const handleChromeLaunch = useCallback(async () => {
+    setChromeBusy(true);
+    setChromeTestResult(null);
+    try {
+      const url = chromeLoginPlatform === 'xiaohongshu'
+        ? 'https://www.xiaohongshu.com'
+        : 'https://www.douyin.com';
+      const result = (await window.ipcRenderer.monitor.chromeLaunch({
+        platform: chromeLoginPlatform,
+        url,
+      })) as MonitorChromeLaunchResult;
+      if (result.success) {
+        showToast('ok', `已用 Chrome 打开登录页，请在浏览器中登录${chromeLoginPlatform === 'xiaohongshu' ? '小红书' : '抖音'}`);
+      } else {
+        showToast('err', '启动 Chrome 失败');
+      }
+      await loadChromeStatus();
+    } catch (e) {
+      console.error('chrome launch failed:', e);
+      showToast('err', e instanceof Error ? e.message : '启动 Chrome 失败');
+    } finally {
+      setChromeBusy(false);
+    }
+  }, [chromeLoginPlatform, loadChromeStatus, showToast]);
+
+  const handleChromeTest = useCallback(async () => {
+    setChromeBusy(true);
+    setChromeTestResult(null);
+    const testUrl = chromeLoginPlatform === 'xiaohongshu'
+      ? 'https://www.xiaohongshu.com'
+      : 'https://www.douyin.com';
+    try {
+      const result = (await window.ipcRenderer.monitor.chromeTest({
+        platform: chromeLoginPlatform,
+        url: testUrl,
+      })) as MonitorChromeTestResult & { result?: { title?: string; loggedOut?: boolean } };
+      if (result.success && result.result && typeof result.result === 'object') {
+        const title = result.result.title || '';
+        const loggedOut = result.result.loggedOut;
+        const platformLabelText = chromeLoginPlatform === 'xiaohongshu' ? '小红书' : '抖音';
+        if (loggedOut) {
+          setChromeTestResult(`已连上 ${platformLabelText} Chrome，但页面显示「${title}」—— 看起来还没登录（登录页无个人主页/消息入口）。请先完成登录再点测试。`);
+          showToast('err', `${platformLabelText} 该页面似乎未登录`);
+        } else {
+          setChromeTestResult(`连接成功 · ${platformLabelText} 页面标题：${title}`);
+          showToast('ok', `CDP 连接成功（${platformLabelText}）`);
+        }
+      } else if (result.success) {
+        setChromeTestResult(`连接成功 · 结果：${JSON.stringify(result.result ?? result)}`);
+        showToast('ok', 'CDP 连接成功');
+      } else {
+        setChromeTestResult(`连接失败：${result.error || '未知错误'}`);
+        showToast('err', 'CDP 连接失败');
+      }
+    } catch (e) {
+      console.error('chrome test failed:', e);
+      setChromeTestResult(e instanceof Error ? e.message : '连接异常');
+      showToast('err', e instanceof Error ? e.message : '连接异常');
+    } finally {
+      setChromeBusy(false);
+    }
+  }, [chromeLoginPlatform, showToast]);
+
+  const handleChromeLogout = useCallback(async () => {
+    try {
+      await window.ipcRenderer.monitor.chromeLogout();
+      setChromeTestResult(null);
+      showToast('ok', '已退出登录');
+      await loadChromeStatus();
+    } catch (e) {
+      console.error('chrome logout failed:', e);
+      showToast('err', e instanceof Error ? e.message : '退出失败');
+    }
+  }, [loadChromeStatus, showToast]);
+
+  const handleInject = useCallback(async (post: MonitoredPost) => {
+    try {
+      const result = (await window.ipcRenderer.monitor.injectTopic({ ids: [post.id] })) as {
+        success?: boolean;
+        count?: number;
+      };
+      await loadPosts();
+      showToast('ok', `已加入选题（${result?.count ?? 1} 条）`);
+    } catch (e) {
+      console.error('inject failed:', e);
+      showToast('err', e instanceof Error ? e.message : '加入选题失败');
+    }
+  }, [loadPosts, showToast]);
+
+  const handleInjectAll = useCallback(async () => {
+    const pending = posts.filter((p) => !p.topicInjected).map((p) => p.id);
+    if (pending.length === 0) {
+      showToast('err', '没有可加入的未选动态');
+      return;
+    }
+    try {
+      const result = (await window.ipcRenderer.monitor.injectTopic({ ids: pending })) as {
+        success?: boolean;
+        count?: number;
+      };
+      await loadPosts();
+      showToast('ok', `已批量加入选题（${result?.count ?? pending.length} 条）`);
+    } catch (e) {
+      console.error('inject all failed:', e);
+      showToast('err', e instanceof Error ? e.message : '批量加入失败');
+    }
+  }, [posts, loadPosts, showToast]);
+
+  // 拆解一篇对标帖：调后端 LLM 拆解并落库，结果写入 deconResult 供详情弹窗展示。
+  const runDeconstruct = useCallback(async (post: MonitoredPost) => {
+    if (!post.content || !post.content.trim()) {
+      setDeconError('该帖本地暂无正文，请先在详情里「重新抓正文」后再拆解');
+      return;
+    }
+    setDeconLoading(true);
+    setDeconError(null);
+    try {
+      const result = (await window.ipcRenderer.monitor.deconstruct(post.id)) as {
+        success?: boolean;
+        error?: string;
+        deconstruction?: Record<string, unknown>;
+      };
+      if (!result?.success || !result.deconstruction) {
+        setDeconError(result?.error || '拆解失败');
+        return;
+      }
+      const decon = normalizeDecon(result.deconstruction);
+      setDeconResult(decon);
+      // 回写卡片：标记该帖已拆解，下次列表里直接带「已拆解」徽标。
+      setPosts((prev) => prev.map((p) => (p.id === post.id ? { ...p, deconstructed: true } : p)));
+      // 同步详情对象：重新打开同一帖子时（deconResult 被清空）能经 effect 自动取回沉淀。
+      setDetailPost((prev) => (prev && prev.id === post.id ? { ...prev, deconstructed: true } : prev));
+    } catch (e) {
+      console.error('deconstruct failed:', e);
+      setDeconError(e instanceof Error ? e.message : '拆解失败');
+    } finally {
+      setDeconLoading(false);
+    }
+  }, [normalizeDecon]);
+
+  // 方法论库：加载已沉淀的爆文拆解列表（可按作者 / 平台过滤）。
+  const loadMethods = useCallback(async () => {
+    setMethodsLoading(true);
+    try {
+      const result = (await window.ipcRenderer.monitor.deconList({
+        author: methodsAuthor || undefined,
+        platform: methodsPlatform || undefined,
+      })) as {
+        success?: boolean;
+        items?: Record<string, unknown>[];
+        authors?: string[];
+      };
+      const items = Array.isArray(result?.items) ? (result.items.map((it) => normalizeDecon(it)).filter(Boolean) as PostDeconstruction[]) : [];
+      // createdAt 倒序（最新沉淀在前）
+      items.sort((a, b) => b.createdAt - a.createdAt);
+      setMethodsItems(items);
+      setMethodsAuthors(Array.isArray(result?.authors) ? (result.authors as string[]) : []);
+    } catch (e) {
+      console.error('decon list failed:', e);
+      setMethodsItems([]);
+      setMethodsAuthors([]);
+    } finally {
+      setMethodsLoading(false);
+    }
+  }, [methodsAuthor, methodsPlatform, normalizeDecon]);
+
+  // 方法论库模态内：过滤条件变化或重新打开时，自动重载列表。
+  useEffect(() => {
+    if (methodsOpen) void loadMethods();
+  }, [methodsOpen, methodsAuthor, methodsPlatform, loadMethods]);
+
+  // 打开详情时，若该帖已被标记为「已拆解」，自动从方法论库取回沉淀结果展示（不重复调 LLM）。
+  useEffect(() => {
+    if (!detailPost || !detailPost.deconstructed) return;
+    if (deconResult && deconResult.postId === detailPost.id) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = (await window.ipcRenderer.monitor.deconList({
+          author: detailPost.author,
+          platform: detailPost.platform,
+        })) as { items?: Record<string, unknown>[] };
+        if (cancelled) return;
+        const found = (result?.items || [])
+          .map((it) => normalizeDecon(it))
+          .find((d) => d && d.postId === detailPost.id);
+        if (found) setDeconResult(found);
+      } catch (e) {
+        console.warn('load existing decon failed:', e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [detailPost, deconResult, normalizeDecon]);
+
+  // 下载视频本体：后端 CDP 现抽签名直链 → ffmpeg 落盘到 workspace/monitor-videos/<post_id>.mp4。
+  // 成功后回写卡片状态并让详情对象同步（否则再次打开详情仍是旧状态）。
+  const runDownloadVideo = useCallback(async (post: MonitoredPost) => {
+    setVideoBusyId(post.id);
+    setVideoError(null);
+    // 乐观置为「下载中」，让卡片立刻出 loading 态
+    setPosts((prev) => prev.map((p) => (p.id === post.id ? { ...p, videoStatus: 'downloading' } : p)));
+    setDetailPost((prev) => (prev && prev.id === post.id ? { ...prev, videoStatus: 'downloading' } : prev));
+    try {
+      const result = (await window.ipcRenderer.monitor.downloadVideo(post.id)) as {
+        success?: boolean;
+        localPath?: string;
+        previewPath?: string | null;
+        size?: number;
+        hasAudio?: boolean;
+        audioWarning?: string | null;
+        error?: string;
+        note?: string;
+      };
+      if (!result?.success) {
+        const msg = result?.error || result?.note || '下载视频失败';
+        setVideoError(msg);
+        setPosts((prev) => prev.map((p) => (p.id === post.id ? { ...p, videoStatus: 'failed', videoError: msg } : p)));
+        setDetailPost((prev) => (prev && prev.id === post.id ? { ...prev, videoStatus: 'failed', videoError: msg } : prev));
+        return;
+      }
+      const size = Number(result.size ?? 0);
+      const preview = result.previewPath ?? null;
+      // 后端会在下载后探测音轨（抖音 DASH 只给视频轨时会补下音频再合并），
+      // 这里必须把 hasAudio / 下载时间一起写回本地状态 ——
+      // 漏写会导致「明明重新下载成功了，界面还挂着『没有音轨』的黄条 + 旧的下载时间」。
+      const hasAudio = result.hasAudio;
+      const downloadedAt = Date.now();
+      setPosts((prev) =>
+        prev.map((p) =>
+          p.id === post.id
+            ? {
+                ...p,
+                videoStatus: 'done',
+                videoLocalPath: result.localPath ?? p.videoLocalPath ?? null,
+                videoPreviewPath: preview,
+                videoSize: size,
+                videoError: null,
+                videoDownloadedAt: downloadedAt,
+                ...(typeof hasAudio === 'boolean' ? { videoHasAudio: hasAudio } : {}),
+              }
+            : p,
+        ),
+      );
+      setDetailPost((prev) =>
+        prev && prev.id === post.id
+          ? {
+              ...prev,
+              videoStatus: 'done',
+              videoLocalPath: result.localPath ?? prev.videoLocalPath ?? null,
+              videoPreviewPath: preview,
+              videoSize: size,
+              videoError: null,
+              videoDownloadedAt: downloadedAt,
+              ...(typeof hasAudio === 'boolean' ? { videoHasAudio: hasAudio } : {}),
+            }
+          : prev,
+      );
+      if (hasAudio === false) {
+        showToast('err', result.audioWarning || '视频已下载，但仍未取到音轨（页面未提供音频地址）');
+      } else {
+        showToast('ok', preview ? '视频已下载（已生成轻量播放版）' : '视频已下载到本地');
+      }
+    } catch (e) {
+      console.error('download video failed:', e);
+      const msg = e instanceof Error ? e.message : '下载视频失败';
+      setVideoError(msg);
+      setPosts((prev) => prev.map((p) => (p.id === post.id ? { ...p, videoStatus: 'failed', videoError: msg } : p)));
+      setDetailPost((prev) => (prev && prev.id === post.id ? { ...prev, videoStatus: 'failed', videoError: msg } : prev));
+    } finally {
+      setVideoBusyId(null);
+    }
+  }, [showToast]);
+
+  // 分析已下载的视频：抽帧 + ASR 转写（+ 预留 LLM 摘要），结果写回 videoAnalysis。
+  const runAnalyzeVideo = useCallback(async (post: MonitoredPost) => {
+    setVideoAnalyzingId(post.id);
+    setVideoError(null);
+    try {
+      const result = (await window.ipcRenderer.monitor.analyzeVideo(post.id)) as {
+        success?: boolean;
+        analysis?: Record<string, unknown>;
+        error?: string;
+        note?: string;
+      };
+      if (!result?.success) {
+        setVideoError(result?.error || result?.note || '分析视频失败');
+        return;
+      }
+      setVideoAnalysis(normalizeVideoAnalysis(result.analysis));
+    } catch (e) {
+      console.error('analyze video failed:', e);
+      setVideoError(e instanceof Error ? e.message : '分析视频失败');
+    } finally {
+      setVideoAnalyzingId(null);
+    }
+  }, []);
+
+  // 打开详情时若该帖已下载过视频，自动取回已沉淀的分析结果（不重复跑 ffmpeg/ASR）。
+  useEffect(() => {
+    if (!detailPost || detailPost.videoStatus !== 'done') return;
+    if (videoAnalysis && videoAnalysis.postId === detailPost.id) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = (await window.ipcRenderer.monitor.videoAnalysis(detailPost.id)) as {
+          success?: boolean;
+          analysis?: Record<string, unknown> | null;
+        };
+        if (cancelled) return;
+        const found = normalizeVideoAnalysis(result?.analysis);
+        if (found) setVideoAnalysis(found);
+      } catch (e) {
+        console.warn('load existing video analysis failed:', e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [detailPost, videoAnalysis]);
+
+  const selectedWatch = watches.find((w) => w.id === selectedWatchId) || null;
+  const uninjectedCount = posts.filter((p) => !p.topicInjected).length;
+
+  return (
+    <div className="flex h-full">
+      {/* 监控列表 - 左栏 */}
+      <div className="w-72 border-r border-border bg-surface-secondary/30 flex flex-col">
+        <div className="p-4 border-b border-border flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Radar className="w-4 h-4 text-accent-primary" strokeWidth={1.8} />
+            <h2 className="text-sm font-semibold text-text-primary">对标博主</h2>
+            <span className="text-[11px] text-text-tertiary">{watches.length}</span>
+          </div>
+          <button
+            onClick={() => { setAddError(''); setAddOpen(true); }}
+            className="p-1.5 text-text-tertiary hover:text-accent-primary hover:bg-surface-primary rounded transition-colors"
+            title="添加监控"
+          >
+            <Plus className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => void handleClear()}
+            disabled={watches.length === 0 && posts.length === 0}
+            className="p-1.5 text-text-tertiary hover:text-red-500 hover:bg-surface-primary rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            title="清空对标博主与全部动态"
+          >
+            <Trash2 className="w-4 h-4" />
+          </button>
+        </div>
+
+        {/* 登录管理 - Chrome 头浏览器（小红书 / 抖音登录态抓取） */}
+        <div className="mx-2 mt-2 rounded-lg border border-border bg-surface-primary overflow-hidden">
+          <button
+            onClick={() => setChromeOpen((prev) => !prev)}
+            className="w-full flex items-center justify-between px-3 py-2.5 text-left hover:bg-surface-secondary/50 transition-colors"
+          >
+            <div className="flex items-center gap-2">
+              <Lock className="w-4 h-4 text-accent-primary" strokeWidth={1.8} />
+              <span className="text-sm font-semibold text-text-primary">登录管理</span>
+              {chromeStatus?.debugReady ? (
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-600">已就绪</span>
+              ) : (
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-secondary text-text-tertiary">未就绪</span>
+              )}
+            </div>
+            <ChevronDown className={clsx('w-4 h-4 text-text-tertiary transition-transform', chromeOpen && 'rotate-180')} />
+          </button>
+
+          {chromeOpen && (
+            <div className="px-3 pb-3 pt-1 space-y-3">
+              <div className="text-[11px] leading-relaxed text-text-tertiary">
+                {chromeStatus === null ? '正在检测本机 Chrome…' : (
+                  chromeStatus.chromeInstalled ? (
+                    <>{chromeLoginPlatform === 'xiaohongshu' ? '小红书' : '抖音'} Chrome
+                      {chromeStatus.debugReady ? (
+                        <> · 调试端口 <span className="text-emerald-600">{chromeStatus.debugPort}</span>（已就绪）</>
+                      ) : (
+                        <span className="text-amber-600"> · 未启动，请点下面「打开 Chrome 登录」</span>
+                      )}</>
+                  ) : (
+                    <span className="text-amber-600">未检测到 Chrome / Edge / Brave，请先安装 Google Chrome</span>
+                  )
+                )}
+              </div>
+
+              <p className="text-[11px] leading-relaxed text-text-tertiary">
+                小红书 / 抖音需要登录态抓取。先选平台点「打开登录页」，在弹出的 Chrome 内完成登录（cookie 仅存于本机独立 profile）。之后 Beav 复用登录态抓取。
+              </p>
+
+              <div className="flex gap-1.5">
+                {(['xiaohongshu', 'douyin'] as const).map((p) => (
+                  <button
+                    key={p}
+                    onClick={() => setChromeLoginPlatform(p)}
+                    className={clsx(
+                      'flex-1 text-xs px-2 py-1.5 rounded-md border transition-colors',
+                      chromeLoginPlatform === p
+                        ? 'bg-accent-primary/10 text-accent-primary border-accent-primary/30'
+                        : 'border-border text-text-secondary hover:text-text-primary',
+                    )}
+                  >
+                    {p === 'xiaohongshu' ? '小红书' : '抖音'}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <button
+                  onClick={() => void handleChromeLaunch()}
+                  disabled={chromeBusy || !chromeStatus?.chromeInstalled}
+                  className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 text-sm rounded-lg bg-accent-primary text-white hover:bg-accent-primary/90 transition-colors disabled:opacity-50"
+                >
+                  {chromeBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Lock className="w-3.5 h-3.5" />}
+                  打开 Chrome 登录{chromeLoginPlatform === 'xiaohongshu' ? '小红书' : '抖音'}
+                </button>
+
+                <div className="flex gap-1.5">
+                  <button
+                    onClick={() => void handleChromeTest()}
+                    disabled={chromeBusy}
+                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                  >
+                    <RefreshCw className={clsx('w-3 h-3', chromeBusy && 'animate-spin')} />测试连接
+                  </button>
+                  <button
+                    onClick={() => void handleChromeLogout()}
+                    disabled={!chromeStatus?.debugReady}
+                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-red-500 hover:border-red-200 transition-colors disabled:opacity-50"
+                  >
+                    <LogOut className="w-3 h-3" />退出登录
+                  </button>
+                </div>
+              </div>
+
+              {chromeTestResult && (
+                <div className={clsx(
+                  'text-[11px] rounded-md px-2 py-1.5 border',
+                  chromeTestResult.startsWith('连接成功')
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : 'bg-red-50 text-red-600 border-red-200',
+                )}>
+                  {chromeTestResult}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div className="flex-1 overflow-auto p-2 space-y-1">
+          <button
+            onClick={() => setSelectedWatchId(null)}
+            className={clsx(
+              'w-full text-left px-3 py-2.5 rounded-lg transition-colors text-sm',
+              selectedWatchId === null
+                ? 'bg-accent-primary/10 text-accent-primary border border-accent-primary/30'
+                : 'hover:bg-surface-primary text-text-primary',
+            )}
+          >
+            <div className="flex items-center gap-2">
+              <Eye className="w-4 h-4 shrink-0" strokeWidth={1.7} />
+              <span className="font-medium truncate">全部动态</span>
+            </div>
+            <div className="text-xs text-text-tertiary mt-0.5 truncate">查看所有抓取到的帖子</div>
+          </button>
+
+          {watchesError && watches.length === 0 ? (
+            <div className="text-center text-xs py-6 px-3">
+              <p className="text-red-500 mb-2">加载监控列表失败</p>
+              <p className="text-text-tertiary break-words mb-3">{watchesError}</p>
+              <button
+                onClick={() => void loadWatches()}
+                className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40"
+              >
+                <RefreshCw className="w-3 h-3" />重试
+              </button>
+            </div>
+          ) : loadingWatches && watches.length === 0 ? (
+            <div className="text-center text-text-tertiary text-xs py-8">加载中...</div>
+          ) : watches.length === 0 ? (
+            <div className="text-center text-text-tertiary text-xs py-8">
+              <Radar className="w-8 h-8 mx-auto mb-2 opacity-30" />
+              <p>还没有监控对象</p>
+              <button onClick={() => { setAddError(''); setAddOpen(true); }} className="mt-2 text-accent-primary hover:underline">
+                添加一个博主
+              </button>
+            </div>
+          ) : (
+            watches.map((watch) => (
+              <div
+                key={watch.id}
+                className={clsx(
+                  'group relative w-full text-left px-3 py-2.5 rounded-lg transition-colors border',
+                  selectedWatchId === watch.id
+                    ? 'bg-accent-primary/10 border-accent-primary/30'
+                    : 'border-transparent hover:bg-surface-primary',
+                )}
+              >
+                <button
+                  onClick={() => setSelectedWatchId(watch.id)}
+                  className="w-full text-left pr-7"
+                >
+                  <div className="flex items-center gap-2">
+                    <span className={clsx(
+                      'w-1.5 h-1.5 rounded-full shrink-0',
+                      watch.enabled ? 'bg-emerald-500' : 'bg-text-tertiary/40',
+                    )} />
+                    <span className="text-sm font-medium text-text-primary truncate flex-1">{watch.name}</span>
+                    {watch.platform && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-primary text-text-tertiary shrink-0">
+                        {platformLabel(watch.platform)}
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[11px] text-text-tertiary mt-1 truncate">
+                    上次抓取：{formatTs(watch.lastFetchAt)} · 已收录 {watch.postCount ?? posts.filter((p) => p.watchId === watch.id).length} 篇
+                  </div>
+                  {/* 补历史进行中：实时进度条（已抓 X / 共 Y）。
+                      分母 Y 滚动阶段用主页声明的作品总数；翻到底后后端会发 phase=scrolling-done
+                      把分母修正为「实际可抓总量」（声明数常含私密/已删/审核中不渲染的条目，
+                      否则进度会永远停在 73/87）。
+                      phase=videos：正文/列表已抓完，后台正在并行「下载+转写」历史视频。 */}
+                  {(historyBusyId === watch.id || backfillProgress[watch.id]?.phase === 'videos') ? (
+                    <div className="mt-1">
+                      <div className="h-1.5 w-full rounded-full bg-surface-primary overflow-hidden">
+                        {(() => {
+                          const prog = backfillProgress[watch.id];
+                          const total = prog?.total ?? 0;
+                          const pct = total > 0 ? Math.min(100, Math.round(((prog?.scanned ?? 0) / total) * 100)) : 0;
+                          return (
+                            <div
+                              className={clsx(
+                                'h-full rounded-full transition-all duration-300',
+                                total > 0 ? 'bg-accent-primary' : 'bg-accent-primary/60 animate-pulse',
+                              )}
+                              style={{ width: total > 0 ? `${pct}%` : '45%' }}
+                            />
+                          );
+                        })()}
+                      </div>
+                      <div className="text-[10px] text-text-tertiary mt-0.5 truncate">
+                        {(() => {
+                          const prog = backfillProgress[watch.id];
+                          const total = prog?.total ?? 0;
+                          if (prog?.phase === 'videos') {
+                            return `历史视频处理中：${prog?.scanned ?? 0}${total > 0 ? ` / 共 ${total}` : ''} 个`;
+                          }
+                          if (prog?.phase === 'transcribe') {
+                            return `语音转写中：${prog?.scanned ?? 0}${total > 0 ? ` / 共 ${total}` : ''} 个`;
+                          }
+                          return `补历史中：已抓 ${prog?.scanned ?? 0}${total > 0 ? ` / 共 ${total}` : ''} 篇`;
+                        })()}
+                      </div>
+                    </div>
+                  ) : (
+                    !watch.historyBackfilledAt &&
+                    watch.enabled && (
+                      <div className="text-[10px] text-amber-600 mt-0.5 truncate">
+                        历史未补齐（点右上角补历史）
+                      </div>
+                    )
+                  )}
+                </button>
+                {/* 补历史：绝对定位在条目右上角。
+                    放在 <button> 之外 —— 嵌套 button 是非法 HTML，点击也会被父级抢走。 */}
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void handleBackfillHistory(watch.id);
+                  }}
+                  disabled={historyBusyId !== null}
+                  className="absolute right-2 top-2 p-1 rounded text-text-tertiary hover:text-accent-primary hover:bg-surface-primary transition-colors disabled:opacity-40"
+                  title={`补历史：把「${watch.name}」主页更早的历史帖抓下来`}
+                >
+                  {historyBusyId === watch.id ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <History className="w-3.5 h-3.5" />
+                  )}
+                </button>
+                <div className="flex items-center gap-1 mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <button
+                    onClick={() => void handleFetchWatch(watch)}
+                    disabled={fetching}
+                    className="flex-1 inline-flex items-center justify-center gap-1 text-[11px] px-2 py-1 rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                    title="抓取该博主"
+                  >
+                    <RefreshCw className={clsx('w-3 h-3', fetching && 'animate-spin')} />
+                    抓取
+                  </button>
+                  <button
+                    onClick={() => void handleRemove(watch.id)}
+                    className="inline-flex items-center justify-center w-7 h-7 rounded-md text-text-tertiary hover:text-red-500 hover:bg-surface-primary transition-colors"
+                    title="删除监控"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      {/* 帖子动态 - 右栏 */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* 头部 */}
+        <div className="px-6 py-4 border-b border-border">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="min-w-0">
+              <h1 className="text-lg font-semibold text-text-primary flex items-center gap-2">
+                {selectedWatch ? (
+                  <>
+                    {selectedWatch.name}
+                    <span className="text-[11px] font-normal px-2 py-0.5 rounded-full bg-surface-secondary text-text-tertiary">
+                      {platformLabel(selectedWatch.platform)}
+                    </span>
+                  </>
+                ) : (
+                  '全部动态'
+                )}
+              </h1>
+              <p className="text-xs text-text-tertiary mt-0.5">
+                {selectedWatch?.profileUrl ? (
+                  <button onClick={() => void openExternal(selectedWatch.profileUrl)} className="inline-flex items-center gap-1 hover:text-accent-primary">
+                    <Link2 className="w-3 h-3" />主页链接
+                  </button>
+                ) : '抓取到的对标帖子'}
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => { setMethodsAuthor(''); setMethodsPlatform(''); setMethodsOpen(true); }}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                title="浏览已沉淀的爆文拆解方法论库"
+              >
+                <BookOpen className="w-3.5 h-3.5" />
+                方法论库
+              </button>
+              {uninjectedCount > 0 && (
+                <button
+                  onClick={() => void handleInjectAll()}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md bg-accent-primary text-white hover:bg-accent-primary/90 transition-colors"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  全部加入选题
+                </button>
+              )}
+              <button
+                onClick={() => void loadPosts()}
+                className="p-1.5 text-text-tertiary hover:text-accent-primary hover:bg-surface-primary rounded transition-colors"
+                title="刷新动态"
+              >
+                <RefreshCw className={clsx('w-4 h-4', loadingPosts && 'animate-spin')} />
+              </button>
+              <button
+                onClick={() => void handleClearPosts()}
+                disabled={posts.length === 0}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-red-500 hover:border-red-200 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                title="清空全部动态（不影响对标博主）"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                清空动态
+              </button>
+            </div>
+          </div>
+
+          {/* 临时抓取链接 */}
+          <div className="mt-3 flex items-center gap-2">
+            <input
+              value={adhocUrl}
+              onChange={(e) => setAdhocUrl(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && void handleAdhocFetch()}
+              placeholder="粘贴博主主页或单篇帖子链接，临时抓取（不加入监控列表）"
+              className="flex-1 bg-surface-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
+            />
+            <button
+              onClick={() => void handleAdhocFetch()}
+              disabled={fetching || !adhocUrl.trim()}
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-sm rounded-lg bg-accent-primary text-white hover:bg-accent-primary/90 transition-colors disabled:opacity-50"
+            >
+              {fetching ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+              抓取
+            </button>
+          </div>
+          {/* 抓取条数已固定，不再开放配置（后端 SCAN_LIMIT=30） */}
+          <div className="mt-2 text-[11px] text-text-tertiary">
+            单次抓取固定 30 条（web / 小红书 / 抖音统一生效）；补历史另走深翻，不受此限制。
+          </div>
+          {fetchNote && (
+            <div className="mt-2 text-[12px] text-text-tertiary bg-surface-secondary/60 border border-border rounded-lg px-3 py-2">
+              {fetchNote}
+            </div>
+          )}
+        </div>
+
+        {/* 帖子列表 */}
+        <div className="flex-1 overflow-auto p-4 space-y-3">
+          {postsError && posts.length === 0 ? (
+            <div className="text-center text-sm py-16">
+              <p className="text-red-500 mb-2">加载动态失败</p>
+              <p className="text-text-tertiary text-xs mb-3 break-words max-w-md mx-auto">{postsError}</p>
+              <button
+                onClick={() => void loadPosts()}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />重试
+              </button>
+            </div>
+          ) : loadingPosts && posts.length === 0 ? (
+            <div className="text-center text-text-tertiary text-sm py-16">加载中...</div>
+          ) : posts.length === 0 ? (
+            <div className="text-center text-text-tertiary py-16">
+              <Zap className="w-10 h-10 mx-auto mb-3 opacity-30" />
+              <p className="text-sm">还没有抓取到的动态</p>
+              <p className="text-xs mt-1">从左侧选择一个博主点击「抓取」，或在上方粘贴链接。</p>
+            </div>
+          ) : (
+            posts.map((post) => (
+              <div
+                key={post.id}
+                className="rounded-xl border border-border bg-surface-primary p-4 transition-colors"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {post.isNew && (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-sky-100 text-sky-700">
+                          <Sparkles className="w-3 h-3" />新抓取
+                        </span>
+                      )}
+                      {post.deconstructed && (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-accent-primary/10 text-accent-primary">
+                          <FlaskConical className="w-3 h-3" />已拆解
+                        </span>
+                      )}
+                      <span className="text-[11px] px-1.5 py-0.5 rounded-full bg-surface-secondary text-text-tertiary">
+                        {platformLabel(post.platform)}
+                      </span>
+                      {post.mediaType === 'video' && (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-purple-100 text-purple-700">
+                          视频
+                        </span>
+                      )}
+                      {post.mediaType === 'video' && post.videoStatus === 'done' && (
+                        <span
+                          className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700"
+                          title="视频本体已下载到本地，可进详情播放与分析"
+                        >
+                          <Check className="w-2.5 h-2.5" />已下载
+                        </span>
+                      )}
+                      {post.mediaType === 'video' && post.videoStatus === 'downloading' && (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">
+                          <Loader2 className="w-2.5 h-2.5 animate-spin" />下载中
+                        </span>
+                      )}
+                      {post.mediaType === 'video' && post.videoStatus === 'failed' && (
+                        <span
+                          className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-red-100 text-red-700"
+                          title={post.videoError || '视频下载失败，可进详情重试'}
+                        >
+                          下载失败
+                        </span>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => void openDetail(post)}
+                      className="mt-2 text-left block w-full"
+                      title="在 Beav 内查看详情"
+                    >
+                      <h3 className="text-sm font-semibold text-text-primary hover:text-accent-primary line-clamp-2 leading-snug">
+                        {post.title || '(无标题)'}
+                      </h3>
+                    </button>
+                    <div className="text-xs text-text-tertiary mt-1">
+                      {post.author}
+                      {post.authorUrl && (
+                        <button onClick={() => void openExternal(post.authorUrl)} className="ml-1 inline-flex items-center hover:text-accent-primary">
+                          <ExternalLink className="w-3 h-3" />
+                        </button>
+                      )}
+                      <span className="mx-1.5">·</span>
+                      {post.publishedAt ? (
+                        <>
+                          发布 {post.publishedAt}
+                          <span className="mx-1.5">·</span>
+                          抓取 {formatTs(post.updatedAt)}
+                        </>
+                      ) : (
+                        <>抓取 {formatTs(post.updatedAt)}</>
+                      )}
+                    </div>
+                    {post.excerpt && (
+                      <p className="text-xs text-text-secondary mt-2 line-clamp-3 leading-relaxed">
+                        {post.excerpt}
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="shrink-0 flex flex-col items-end gap-2">
+                    {post.topicInjected ? (
+                      <span className="inline-flex items-center gap-1 text-[11px] text-emerald-600 bg-emerald-50 px-2 py-1 rounded-md">
+                        <Check className="w-3 h-3" />已入选题
+                      </span>
+                    ) : (
+                      <button
+                        onClick={() => void handleInject(post)}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                        title="加入选题中心"
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />加入选题
+                      </button>
+                    )}
+                    <button
+                      onClick={() => { void openDetail(post); if (post.content?.trim()) void runDeconstruct(post); }}
+                      disabled={!post.content?.trim() || deconLoading}
+                      className="inline-flex items-center gap-1 text-[11px] text-text-tertiary hover:text-accent-primary disabled:opacity-40"
+                      title={post.content?.trim() ? '拆解这篇爆文的方法论' : '需先抓到正文'}
+                    >
+                      <FlaskConical className="w-3 h-3" />拆解
+                    </button>
+                    <button
+                      onClick={() => void openExternal(post.postUrl)}
+                      className="inline-flex items-center gap-1 text-[11px] text-text-tertiary hover:text-accent-primary"
+                      title="打开原文"
+                    >
+                      <ExternalLink className="w-3 h-3" />原文
+                    </button>
+                    <button
+                      onClick={() => void handlePostRemove(post.id)}
+                      className="inline-flex items-center gap-1 text-[11px] text-text-tertiary hover:text-red-500"
+                      title="删除这条动态"
+                    >
+                      <Trash2 className="w-3 h-3" />删除
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      {/* 本地详情弹窗 —— 点卡片标题打开，正文在 Beav 内看，不跳平台 */}
+      {detailOpen && detailPost && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+          onClick={() => setDetailOpen(false)}
+        >
+          <div
+            className="w-full max-w-2xl max-h-[80vh] mx-4 bg-surface-primary rounded-xl border border-border shadow-2xl overflow-hidden flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-6 py-4 border-b border-border flex items-center justify-between gap-3 shrink-0">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-[11px] px-2 py-0.5 rounded-full bg-surface-secondary text-text-tertiary shrink-0">
+                  {platformLabel(detailPost.platform)}
+                </span>
+                {detailPost.mediaType === 'video' && (
+                  <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 shrink-0">
+                    视频
+                  </span>
+                )}
+                <span className="text-xs text-text-tertiary truncate">{detailPost.author}</span>
+                {detailPost.publishedAt && (
+                  <span className="text-xs text-text-tertiary shrink-0">· {detailPost.publishedAt}</span>
+                )}
+              </div>
+              <button onClick={() => setDetailOpen(false)} className="text-text-tertiary hover:text-text-primary shrink-0">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-auto px-6 py-4 space-y-4">
+              <h2 className="text-base font-semibold text-text-primary leading-snug">
+                {detailPost.title || '(无标题)'}
+              </h2>
+
+              {detailLoading && (
+                <div className="flex items-center gap-2 text-xs text-text-tertiary">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  正在从平台抓取正文…（首次约 10-20 秒，之后走本地缓存秒开）
+                </div>
+              )}
+
+              {detailPost.coverUrl && (
+                <img
+                  src={detailPost.coverUrl}
+                  alt="封面"
+                  className="w-full max-h-80 object-cover rounded-lg border border-border"
+                />
+              )}
+              {detailPost.mediaType === 'video' && (
+                <div className="space-y-2">
+                  {/* 已下载 → 本地直接播。
+                      播放源用 720p/H.264 代理视频：原片常是 4K/HEVC/数百 MB，
+                      WebView2 多数环境无 HEVC 解码器，且 asset 协议不支持 Range 分段请求，
+                      直接播原片会一直转圈。代理文件缺失（老数据 / 转码失败）时退回原片。 */}
+                  {detailPost.videoStatus === 'done' && detailPost.videoLocalPath && (
+                    <VideoPlayerWithFallback
+                      localPath={detailPost.videoLocalPath}
+                      previewPath={detailPost.videoPreviewPath ?? undefined}
+                    />
+                  )}
+                  {detailPost.videoStatus === 'downloading' && (
+                    <div className="flex items-center gap-2 text-xs text-text-tertiary">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      正在下载视频…（CDP 抽直链 + ffmpeg 落盘，稍等）
+                    </div>
+                  )}
+                  {detailPost.videoStatus !== 'done' && detailPost.videoStatus !== 'downloading' && (
+                    <p className="text-xs text-text-tertiary">
+                      尚未下载视频本体 —— 点底部「下载视频」用登录态 Chrome 抓下来后，这里可直接播放并做转写分析；否则请点「原文」跳转平台。
+                    </p>
+                  )}
+                  {detailPost.videoSize ? (
+                    <p className="text-[11px] text-text-tertiary">
+                      本地文件 {(detailPost.videoSize / 1024 / 1024).toFixed(1)} MB
+                      {detailPost.videoDownloadedAt
+                        ? ` · ${formatTs(String(detailPost.videoDownloadedAt))}`
+                        : ''}
+                    </p>
+                  ) : null}
+                  {detailPost.videoStatus === 'done' && detailPost.videoHasAudio === false && (
+                    <div className="text-[12px] text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-lg px-3 py-2">
+                      这个视频只有画面、没有声音（抖音 DASH 只提供了视频轨），所以无法做语音转写。重新下载该视频会自动补上音频轨后再分析。
+                    </div>
+                  )}
+                  {videoError && (
+                    <div className="text-[12px] text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2 break-words">
+                      {videoError}
+                    </div>
+                  )}
+                  {videoAnalyzingId === detailPost.id && (
+                    <div className="flex items-center gap-2 text-xs text-text-tertiary">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      正在抽帧 + 语音转写…（视频越长越慢）
+                    </div>
+                  )}
+                  {videoAnalysis && videoAnalysis.postId === detailPost.id && (
+                    <VideoAnalysisPanel analysis={videoAnalysis} />
+                  )}
+                </div>
+              )}
+
+              {detailPost.content ? (
+                <p className="text-sm text-text-secondary whitespace-pre-wrap leading-relaxed">
+                  {detailPost.content}
+                </p>
+              ) : (
+                !detailLoading && (
+                  <p className="text-xs text-text-tertiary">
+                    暂无本地正文
+                    {detailPost.excerpt ? `：${detailPost.excerpt}` : ''}
+                  </p>
+                )
+              )}
+
+              {detailImages.length > 0 && (
+                <div className="grid grid-cols-3 gap-2">
+                  {detailImages.map((src, index) => (
+                    <button
+                      key={index}
+                      type="button"
+                      onClick={() => setLightboxIndex(index)}
+                      title="点击查看大图"
+                      className="relative overflow-hidden rounded-lg border border-border cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-accent-primary/40"
+                    >
+                      <img
+                        src={src}
+                        alt={`配图 ${index + 1}`}
+                        className="w-full h-28 object-cover transition-transform duration-150 hover:scale-105"
+                      />
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {detailNote && (
+                <div className="text-[12px] text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                  {detailNote}
+                </div>
+              )}
+
+              {/* 爆文拆解结果区：拆解中 / 错误 / 已沉淀六要素 */}
+              {deconLoading && (
+                <div className="flex items-center gap-2 text-xs text-text-tertiary border border-border rounded-lg px-3 py-2.5">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  正在用 AI 拆解这篇爆文的方法论…（约 10-30 秒）
+                </div>
+              )}
+              {deconError && (
+                <div className="text-[12px] text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                  {deconError}
+                </div>
+              )}
+              {deconResult && deconResult.postId === detailPost.id && (
+                <DeconFields decon={deconResult} />
+              )}
+            </div>
+
+            <div className="px-6 py-3 border-t border-border flex items-center justify-between gap-3 shrink-0">
+              <div className="flex items-center gap-4 text-xs text-text-tertiary">
+                <span>赞 {detailPost.likes}</span>
+                <span>藏 {detailPost.collects}</span>
+                <span>评 {detailPost.comments}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                {detailPost.mediaType === 'video' && (
+                  <>
+                    <button
+                      onClick={() => void runDownloadVideo(detailPost)}
+                      disabled={videoBusyId === detailPost.id || detailPost.videoStatus === 'downloading'}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                      title="用已登录的小红书 / 抖音 Chrome 抽出真实视频直链并下载到本地"
+                    >
+                      <Download className={clsx('w-3 h-3', videoBusyId === detailPost.id && 'animate-bounce')} />
+                      {detailPost.videoStatus === 'done' ? '重新下载' : '下载视频'}
+                    </button>
+                    <button
+                      onClick={() => void runAnalyzeVideo(detailPost)}
+                      disabled={videoAnalyzingId === detailPost.id || detailPost.videoStatus !== 'done'}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                      title={detailPost.videoStatus === 'done' ? '抽关键帧 + 语音转写' : '请先下载视频本体'}
+                    >
+                      <Video className={clsx('w-3 h-3', videoAnalyzingId === detailPost.id && 'animate-pulse')} />
+                      分析视频
+                    </button>
+                  </>
+                )}
+                <button
+                  onClick={() => void runDeconstruct(detailPost)}
+                  disabled={deconLoading || !detailPost.content || !detailPost.content.trim()}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                  title={detailPost.content?.trim() ? '用 AI 拆解这篇爆文的方法论' : '请先抓到正文再拆解'}
+                >
+                  <FlaskConical className={clsx('w-3 h-3', deconLoading && 'animate-spin')} />
+                  {deconResult && deconResult.postId === detailPost.id ? '重新拆解' : '拆解'}
+                </button>
+                {deconResult && deconResult.postId === detailPost.id && (
+                  <button
+                    onClick={() => void handleInject(detailPost)}
+                    disabled={detailPost.topicInjected}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md bg-accent-primary text-white hover:bg-accent-primary/90 transition-colors disabled:opacity-50"
+                  >
+                    <Sparkles className="w-3 h-3" />
+                    {detailPost.topicInjected ? '已入选题' : '加入选题'}
+                  </button>
+                )}
+                <button
+                  onClick={() => void openDetail(detailPost, true)}
+                  disabled={detailLoading}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                >
+                  <RefreshCw className={clsx('w-3 h-3', detailLoading && 'animate-spin')} />
+                  重新抓正文
+                </button>
+                <button
+                  onClick={() => void openExternal(detailPost.postUrl)}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                >
+                  <ExternalLink className="w-3 h-3" />原文
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 大图预览 —— 点缩略图打开：背景关闭 / ESC / 左右切换，多图显示「当前/总数」 */}
+      {lightboxIndex !== null && detailImages[lightboxIndex] && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-sm"
+          onClick={() => setLightboxIndex(null)}
+        >
+          <button
+            type="button"
+            onClick={() => setLightboxIndex(null)}
+            className="absolute top-4 right-4 text-white/80 hover:text-white transition-colors"
+            title="关闭"
+          >
+            <X className="w-6 h-6" />
+          </button>
+          {detailImages.length > 1 && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setLightboxIndex((i) => (i === null ? null : (i - 1 + detailImages.length) % detailImages.length));
+              }}
+              className="absolute left-4 top-1/2 -translate-y-1/2 text-white/80 hover:text-white transition-colors"
+              title="上一张"
+            >
+              <ChevronLeft className="w-9 h-9" />
+            </button>
+          )}
+          {detailImages.length > 1 && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setLightboxIndex((i) => (i === null ? null : (i + 1) % detailImages.length));
+              }}
+              className="absolute right-4 top-1/2 -translate-y-1/2 text-white/80 hover:text-white transition-colors"
+              title="下一张"
+            >
+              <ChevronRight className="w-9 h-9" />
+            </button>
+          )}
+          <img
+            src={detailImages[lightboxIndex]}
+            alt={`配图 ${lightboxIndex + 1}`}
+            className="max-w-[92vw] max-h-[88vh] object-contain rounded-lg shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          />
+          {detailImages.length > 1 && (
+            <span className="absolute bottom-4 left-1/2 -translate-x-1/2 text-white/70 text-xs bg-black/40 px-2 py-1 rounded-full">
+              {lightboxIndex + 1} / {detailImages.length}
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* 方法论库 —— 已沉淀的爆文拆解列表，可按作者 / 平台过滤，点开看六要素，一键加入选题 */}
+      {methodsOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+          onClick={() => setMethodsOpen(false)}
+        >
+          <div
+            className="w-full max-w-3xl max-h-[82vh] mx-4 bg-surface-primary rounded-xl border border-border shadow-2xl overflow-hidden flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-6 py-4 border-b border-border flex items-center justify-between gap-3 shrink-0">
+              <div className="flex items-center gap-2 min-w-0">
+                <BookOpen className="w-4 h-4 text-accent-primary" strokeWidth={1.8} />
+                <h3 className="text-base font-semibold text-text-primary">方法论库</h3>
+                <span className="text-[11px] text-text-tertiary">{methodsItems.length} 篇已拆解</span>
+              </div>
+              <button onClick={() => setMethodsOpen(false)} className="text-text-tertiary hover:text-text-primary shrink-0">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* 过滤栏 */}
+            <div className="px-6 py-3 border-b border-border flex items-center gap-2 flex-wrap shrink-0">
+              <label className="text-xs text-text-secondary whitespace-nowrap">作者</label>
+              <select
+                value={methodsAuthor}
+                onChange={(e) => { setMethodsAuthor(e.target.value); }}
+                className="bg-surface-secondary border border-border rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
+              >
+                <option value="">全部</option>
+                {methodsAuthors.map((a) => (
+                  <option key={a} value={a}>{a}</option>
+                ))}
+              </select>
+              <label className="text-xs text-text-secondary whitespace-nowrap ml-2">平台</label>
+              <select
+                value={methodsPlatform}
+                onChange={(e) => { setMethodsPlatform(e.target.value); }}
+                className="bg-surface-secondary border border-border rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
+              >
+                <option value="">全部</option>
+                {PLATFORM_OPTIONS.filter((p) => p.value).map((p) => (
+                  <option key={p.value} value={p.value}>{p.label}</option>
+                ))}
+              </select>
+              <button
+                onClick={() => void loadMethods()}
+                disabled={methodsLoading}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+              >
+                <RefreshCw className={clsx('w-3 h-3', methodsLoading && 'animate-spin')} />刷新
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-auto px-6 py-4 space-y-3">
+              {methodsLoading ? (
+                <div className="text-center text-text-tertiary text-sm py-16">加载中...</div>
+              ) : methodsItems.length === 0 ? (
+                <div className="text-center text-text-tertiary py-16">
+                  <FlaskConical className="w-10 h-10 mx-auto mb-3 opacity-30" />
+                  <p className="text-sm">方法论库还是空的</p>
+                  <p className="text-xs mt-1">在帖子的「拆解」里用 AI 拆出第一篇爆文方法论吧。</p>
+                </div>
+              ) : (
+                methodsItems.map((item) => {
+                  const expanded = methodsExpanded.has(item.id);
+                  return (
+                    <div key={item.id} className="rounded-xl border border-border bg-surface-primary overflow-hidden">
+                      <button
+                        onClick={() => setMethodsExpanded((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(item.id)) next.delete(item.id); else next.add(item.id);
+                          return next;
+                        })}
+                        className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left hover:bg-surface-secondary/40 transition-colors"
+                      >
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-[11px] px-1.5 py-0.5 rounded-full bg-surface-secondary text-text-tertiary">
+                              {platformLabel(item.platform)}
+                            </span>
+                            <span className="text-[11px] text-text-tertiary">{item.author}</span>
+                            <span className="text-xs text-text-secondary font-medium truncate">{item.postTitle || '(无标题)'}</span>
+                          </div>
+                          <div className="text-[11px] text-text-tertiary mt-0.5">
+                            {item.createdAt ? formatTs(String(item.createdAt)) : ''}
+                          </div>
+                        </div>
+                        <ChevronRight className={clsx('w-4 h-4 text-text-tertiary transition-transform shrink-0', expanded && 'rotate-90')} />
+                      </button>
+
+                      {expanded && (
+                        <div className="px-4 pb-4 space-y-3 border-t border-border pt-3">
+                          <DeconFields decon={item} />
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => void (async () => {
+                                try {
+                                  const result = (await window.ipcRenderer.monitor.injectTopic({ ids: [item.postId] })) as { success?: boolean; count?: number };
+                                  showToast('ok', `已加入选题（${result?.count ?? 1} 条）`);
+                                } catch (e) {
+                                  showToast('err', e instanceof Error ? e.message : '加入选题失败');
+                                }
+                              })()}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md bg-accent-primary text-white hover:bg-accent-primary/90 transition-colors"
+                            >
+                              <Sparkles className="w-3 h-3" />加入选题
+                            </button>
+                            {item.postUrl && (
+                              <button
+                                onClick={() => void openExternal(item.postUrl)}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                              >
+                                <ExternalLink className="w-3 h-3" />原文
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 添加监控弹窗 */}
+      {addOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+          <div className="w-full max-w-md mx-4 bg-surface-primary rounded-xl border border-border shadow-2xl overflow-hidden">
+            <div className="px-6 py-4 border-b border-border flex items-center justify-between">
+              <h3 className="text-base font-semibold text-text-primary">添加对标博主</h3>
+              <button onClick={() => setAddOpen(false)} className="text-text-tertiary hover:text-text-primary">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="px-6 py-4 space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-text-secondary mb-1.5">博主名称 *</label>
+                <input
+                  value={addForm.name}
+                  onChange={(e) => { setAddForm((f) => ({ ...f, name: e.target.value })); setAddError(''); }}
+                  onKeyDown={(e) => e.key === 'Enter' && void handleAdd()}
+                  placeholder="例如：XX 说 AI"
+                  className="w-full bg-surface-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
+                  autoFocus
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-text-secondary mb-1.5">平台</label>
+                <select
+                  value={addForm.platform}
+                  onChange={(e) => setAddForm((f) => ({ ...f, platform: e.target.value }))}
+                  className="w-full bg-surface-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
+                >
+                  {PLATFORM_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-text-secondary mb-1.5">主页链接</label>
+                <input
+                  value={addForm.profileUrl}
+                  onChange={(e) => setAddForm((f) => ({ ...f, profileUrl: e.target.value }))}
+                  placeholder="https://space.bilibili.com/xxxx"
+                  className="w-full bg-surface-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-text-secondary mb-1.5">备注</label>
+                <input
+                  value={addForm.note}
+                  onChange={(e) => setAddForm((f) => ({ ...f, note: e.target.value }))}
+                  placeholder="可选，例如：重点关注选题方向"
+                  className="w-full bg-surface-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-text-secondary mb-1.5">
+                  抓取间隔（小时）：{addForm.intervalHours}
+                </label>
+                <input
+                  type="range"
+                  min={1}
+                  max={168}
+                  value={addForm.intervalHours}
+                  onChange={(e) => setAddForm((f) => ({ ...f, intervalHours: Number(e.target.value) }))}
+                  className="w-full accent-[color:var(--accent-primary,#6366f1)]"
+                />
+              </div>
+              <label className="flex items-center gap-2 text-sm text-text-secondary cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={addForm.enabled}
+                  onChange={(e) => setAddForm((f) => ({ ...f, enabled: e.target.checked }))}
+                  className="accent-[color:var(--accent-primary,#6366f1)]"
+                />
+                启用监控
+              </label>
+              {addError && <p className="text-xs text-red-500">{addError}</p>}
+            </div>
+
+            <div className="px-6 py-4 bg-surface-secondary border-t border-border flex items-center justify-end gap-3">
+              <button
+                onClick={() => setAddOpen(false)}
+                className="px-4 py-2 text-sm text-text-secondary hover:text-text-primary border border-border rounded-lg transition-colors"
+              >
+                取消
+              </button>
+              <button
+                onClick={() => void handleAdd()}
+                className="px-4 py-2 text-sm text-white bg-accent-primary hover:bg-accent-primary/90 rounded-lg transition-colors"
+              >
+                添加
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toast */}
+      {toast && (
+        <div className={clsx(
+          'fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] px-4 py-2.5 rounded-lg shadow-lg text-sm font-medium',
+          toast.kind === 'ok' ? 'bg-emerald-600 text-white' : 'bg-red-600 text-white',
+        )}>
+          {toast.text}
+        </div>
+      )}
+    </div>
+  );
+}
