@@ -475,6 +475,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   // —— 视频下载 + 本体分析（详情弹窗内，仅 mediaType==='video' 的帖可用）——
   const [videoBusyId, setVideoBusyId] = useState<string | null>(null);
   const [videoAnalyzingId, setVideoAnalyzingId] = useState<string | null>(null);
+  const [videoTranscribingId, setVideoTranscribingId] = useState<string | null>(null);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [videoAnalysis, setVideoAnalysis] = useState<PostVideoAnalysis | null>(null);
 
@@ -1257,6 +1258,33 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
     }
   }, []);
 
+  // 显式重新跑 ASR（会覆盖已有转写；换服务商/修正字幕时用）
+  const runRetranscribeVideo = useCallback(async (post: MonitoredPost) => {
+    setVideoTranscribingId(post.id);
+    setVideoError(null);
+    try {
+      const result = (await window.ipcRenderer.monitor.transcribeVideo(post.id)) as {
+        success?: boolean;
+        status?: string;
+        analysis?: Record<string, unknown>;
+        error?: string;
+        note?: string;
+      };
+      if (!result?.success) {
+        setVideoError(result?.error || result?.note || '重新转写失败');
+        return;
+      }
+      setVideoAnalysis(normalizeVideoAnalysis(result.analysis));
+      showToast('ok', '重新转写完成');
+      await loadPosts();
+    } catch (e) {
+      console.error('retranscribe video failed:', e);
+      setVideoError(e instanceof Error ? e.message : '重新转写失败');
+    } finally {
+      setVideoTranscribingId(null);
+    }
+  }, [loadPosts, showToast]);
+
   // 打开详情时若该帖已下载过视频，自动取回已沉淀的分析结果（不重复跑 ffmpeg/ASR）。
   useEffect(() => {
     if (!detailPost || detailPost.videoStatus !== 'done') return;
@@ -2020,6 +2048,15 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                     >
                       <Video className={clsx('w-3 h-3', videoAnalyzingId === detailPost.id && 'animate-pulse')} />
                       分析视频
+                    </button>
+                    <button
+                      onClick={() => void runRetranscribeVideo(detailPost)}
+                      disabled={videoTranscribingId === detailPost.id || detailPost.videoStatus !== 'done'}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                      title="重新跑语音转写（会覆盖已有转写；换服务商后可用）"
+                    >
+                      <RefreshCw className={clsx('w-3 h-3', videoTranscribingId === detailPost.id && 'animate-spin')} />
+                      重新转写
                     </button>
                   </>
                 )}

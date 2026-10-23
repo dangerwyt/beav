@@ -2447,10 +2447,49 @@ fn analyze_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value) 
         .get("skipTranscript")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let force_transcript = payload
+        .get("force")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // 已有可用转写时直接复用：重新分析通常只想刷新抽帧/摘要，
+    // 不能因为一次网络抖动或服务商故障，把之前成功的结果覆盖成空。
+    let existing_analysis = with_store(state, |store| {
+        Ok(store
+            .post_video_analyses
+            .iter()
+            .find(|a| a.post_id == id)
+            .cloned())
+    })?;
+    let existing_transcript = existing_analysis
+        .as_ref()
+        .filter(|a| a.transcript_status == "ok" && !a.transcript.trim().is_empty())
+        .map(|a| (a.transcript.clone(), a.transcript_status.clone(), a.transcript_error.clone()));
+
     let (transcript, transcript_status, transcript_error) = if skip_transcript {
         (String::new(), "pending".to_string(), None)
+    } else if !force_transcript {
+        if let Some((text, status, error)) = existing_transcript.clone() {
+            (text, status, error)
+        } else {
+            run_transcription(app, state, &local_path_str)
+        }
     } else {
         run_transcription(app, state, &local_path_str)
+    };
+
+    // 本次转写失败/为空、但之前有成功结果 → 保留旧结果
+    let (transcript, transcript_status, transcript_error) = if !skip_transcript
+        && transcript.trim().is_empty()
+        && transcript_status != "ok"
+    {
+        if let Some((text, status, error)) = existing_transcript {
+            (text, status, error)
+        } else {
+            (transcript, transcript_status, transcript_error)
+        }
+    } else {
+        (transcript, transcript_status, transcript_error)
     };
     let duration_secs = probe_duration_secs(app, &local_path_str);
 
