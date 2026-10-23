@@ -4,6 +4,7 @@ import { clsx } from 'clsx';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { MonitorChromeStatus, MonitorChromeLaunchResult, MonitorChromeTestResult } from '../bridge/domains/monitorBridge';
 import { resolveAssetUrl } from '../utils/pathManager';
+import { CDP_PLATFORMS, PLATFORM_HOME, PLATFORMS, type CdpPlatform } from '../constants/platforms';
 
 interface CompetitorWatch {
   id: string;
@@ -109,13 +110,7 @@ interface PostVideoAnalysis {
 
 const PLATFORM_OPTIONS = [
   { value: '', label: '自动识别' },
-  { value: 'bilibili', label: 'B 站' },
-  { value: 'xiaohongshu', label: '小红书' },
-  { value: 'douyin', label: '抖音' },
-  { value: 'weibo', label: '微博' },
-  { value: 'zhihu', label: '知乎' },
-  { value: 'weixin', label: '微信公众号' },
-  { value: 'web', label: '其他网页' },
+  ...PLATFORMS,
 ];
 
 const platformLabel = (code: string): string => {
@@ -458,7 +453,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [chromeStatus, setChromeStatus] = useState<MonitorChromeStatus | null>(null);
   const [chromeOpen, setChromeOpen] = useState(true);
   const [chromeBusy, setChromeBusy] = useState(false);
-  const [chromeLoginPlatform, setChromeLoginPlatform] = useState<'xiaohongshu' | 'douyin'>('xiaohongshu');
+  const [chromeLoginPlatform, setChromeLoginPlatform] = useState<CdpPlatform>(CDP_PLATFORMS[0]);
   const [chromeTestResult, setChromeTestResult] = useState<string | null>(null);
 
   // —— 爆文拆解（详情弹窗内）——
@@ -965,15 +960,13 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
     setChromeBusy(true);
     setChromeTestResult(null);
     try {
-      const url = chromeLoginPlatform === 'xiaohongshu'
-        ? 'https://www.xiaohongshu.com'
-        : 'https://www.douyin.com';
+      const url = PLATFORM_HOME[chromeLoginPlatform];
       const result = (await window.ipcRenderer.monitor.chromeLaunch({
         platform: chromeLoginPlatform,
         url,
       })) as MonitorChromeLaunchResult;
       if (result.success) {
-        showToast('ok', `已用 Chrome 打开登录页，请在浏览器中登录${chromeLoginPlatform === 'xiaohongshu' ? '小红书' : '抖音'}`);
+        showToast('ok', `已用 Chrome 打开登录页，请在浏览器中登录${platformLabel(chromeLoginPlatform)}`);
       } else {
         showToast('err', '启动 Chrome 失败');
       }
@@ -989,9 +982,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const handleChromeTest = useCallback(async () => {
     setChromeBusy(true);
     setChromeTestResult(null);
-    const testUrl = chromeLoginPlatform === 'xiaohongshu'
-      ? 'https://www.xiaohongshu.com'
-      : 'https://www.douyin.com';
+    const testUrl = PLATFORM_HOME[chromeLoginPlatform];
     try {
       const result = (await window.ipcRenderer.monitor.chromeTest({
         platform: chromeLoginPlatform,
@@ -1000,7 +991,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       if (result.success && result.result && typeof result.result === 'object') {
         const title = result.result.title || '';
         const loggedOut = result.result.loggedOut;
-        const platformLabelText = chromeLoginPlatform === 'xiaohongshu' ? '小红书' : '抖音';
+        const platformLabelText = platformLabel(chromeLoginPlatform);
         if (loggedOut) {
           setChromeTestResult(`已连上 ${platformLabelText} Chrome，但页面显示「${title}」—— 看起来还没登录（登录页无个人主页/消息入口）。请先完成登录再点测试。`);
           showToast('err', `${platformLabelText} 该页面似乎未登录`);
@@ -1336,7 +1327,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               <div className="text-[11px] leading-relaxed text-text-tertiary">
                 {chromeStatus === null ? '正在检测本机 Chrome…' : (
                   chromeStatus.chromeInstalled ? (
-                    <>{chromeLoginPlatform === 'xiaohongshu' ? '小红书' : '抖音'} Chrome
+                    <>{platformLabel(chromeLoginPlatform)} Chrome
                       {chromeStatus.debugReady ? (
                         <> · 调试端口 <span className="text-emerald-600">{chromeStatus.debugPort}</span>（已就绪）</>
                       ) : (
@@ -1353,7 +1344,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               </p>
 
               <div className="flex gap-1.5">
-                {(['xiaohongshu', 'douyin'] as const).map((p) => (
+                {CDP_PLATFORMS.map((p) => (
                   <button
                     key={p}
                     onClick={() => setChromeLoginPlatform(p)}
@@ -1364,7 +1355,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                         : 'border-border text-text-secondary hover:text-text-primary',
                     )}
                   >
-                    {p === 'xiaohongshu' ? '小红书' : '抖音'}
+                    {platformLabel(p)}
                   </button>
                 ))}
               </div>
@@ -1376,7 +1367,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 text-sm rounded-lg bg-accent-primary text-white hover:bg-accent-primary/90 transition-colors disabled:opacity-50"
                 >
                   {chromeBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Lock className="w-3.5 h-3.5" />}
-                  打开 Chrome 登录{chromeLoginPlatform === 'xiaohongshu' ? '小红书' : '抖音'}
+                  打开 Chrome 登录{platformLabel(chromeLoginPlatform)}
                 </button>
 
                 <div className="flex gap-1.5">

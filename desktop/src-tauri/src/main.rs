@@ -46,6 +46,7 @@ mod memory;
 mod memory_maintenance;
 mod official_support;
 mod persistence;
+mod platform;
 mod process_utils;
 mod profile_learning;
 mod provider_compat;

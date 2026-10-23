@@ -8,6 +8,7 @@ use crate::{app_brand_display_name, make_id, now_i64, AppState, AppStore};
 use crate::ffmpeg_program;
 use crate::ffprobe_program;
 use crate::workspace_root;
+use crate::platform::Platform;
 use crate::store::types::PostVideoAnalysisRecord;
 use crate::commands::media_transcribe::execute_media_transcribe;
 use std::path::PathBuf;
@@ -353,7 +354,7 @@ fn post_detail(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
     })?
     .ok_or_else(|| "动态不存在".to_string())?;
 
-    let can_cdp = record.platform == "xiaohongshu" || record.platform == "douyin";
+    let can_cdp = Platform::parse(&record.platform).map(|p| p.is_cdp()).unwrap_or(false);
     if !can_cdp {
         return Ok(json!({
             "success": true, "post": record, "fetched": false,
@@ -507,7 +508,7 @@ fn post_detail(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
                     // 这样能区分「未登录 / 被 xsec_token 拦 / 验证码 / 改版」。
                     let mut hint =
                         "页面未解析到正文，已展示缓存信息".to_string();
-                    if record.platform == "xiaohongshu"
+                    if Platform::parse(&record.platform) == Some(Platform::Xiaohongshu)
                         && !record.post_url.contains("xsec_token")
                     {
                         hint.push_str("；链接缺 xsec_token（可能已过期），请重新抓取该博主");
@@ -568,21 +569,10 @@ fn host_of(url: &str) -> Option<String> {
 
 fn platform_of(url: &str) -> String {
     let host = host_of(url).unwrap_or_default();
-    if host.contains("bilibili") {
-        "bilibili".to_string()
-    } else if host.contains("xiaohongshu") {
-        "xiaohongshu".to_string()
-    } else if host.contains("douyin") {
-        "douyin".to_string()
-    } else if host.contains("weibo") {
-        "weibo".to_string()
-    } else if host.contains("zhihu") {
-        "zhihu".to_string()
-    } else if host.contains("weixin") || host.contains("mp.weixin") {
-        "weixin".to_string()
-    } else {
-        "web".to_string()
-    }
+    Platform::from_host(&host)
+        .unwrap_or(Platform::Web)
+        .as_str()
+        .to_string()
 }
 
 /// 单次抓取条数：**固定值，不再对用户开放配置**。
@@ -703,7 +693,7 @@ fn fetch_monitor(
         .map(|item| item.platform.clone())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| platform_of(&url));
-    if platform_hint == "xiaohongshu" || platform_hint == "douyin" {
+    if Platform::parse(&platform_hint).map(|p| p.is_cdp()).unwrap_or(false) {
         if headless_browser::active_chrome_port(&platform_hint) == 0 {
             return Ok(json!({
                 "success": true,
@@ -961,7 +951,7 @@ fn fetch_monitor_via_cdp(
     emit_progress: bool,
 ) -> Result<Value, String> {
     let port = headless_browser::active_chrome_port(platform);
-    let wait_selector = if platform == "douyin" {
+    let wait_selector = if Platform::parse(platform) == Some(Platform::Douyin) {
         "a[href*=\"/video/\"]"
     } else {
         "a[href*=\"/explore/\"]"
@@ -1868,8 +1858,8 @@ async fn extract_video_stream_url_async(
 ) -> Result<VideoStreamCandidates, String> {
     let mut expression = VIDEO_EXTRACT_EXPRESSION.to_string();
     expression = expression
-        .replace("__XHS__", if platform == "xiaohongshu" { "true" } else { "false" })
-        .replace("__DY__", if platform == "douyin" { "true" } else { "false" });
+        .replace("__XHS__", if Platform::parse(platform) == Some(Platform::Xiaohongshu) { "true" } else { "false" })
+        .replace("__DY__", if Platform::parse(platform) == Some(Platform::Douyin) { "true" } else { "false" });
 
     let result =
         headless_browser::navigate_and_eval_settle(ws_url, post_url, &expression, 8_000).await?;
@@ -2111,7 +2101,7 @@ fn download_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value)
         Ok(store.monitored_posts.iter().find(|p| p.id == id).cloned())
     })?
     .ok_or_else(|| "动态不存在".to_string())?;
-    if record.platform != "xiaohongshu" && record.platform != "douyin" {
+    if !Platform::parse(&record.platform).map(|p| p.supports_video()).unwrap_or(false) {
         return Ok(json!({
             "success": false,
             "note": "目前仅支持小红书 / 抖音的视频下载（需登录态 Chrome）。",
@@ -2130,12 +2120,10 @@ fn download_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value)
     let dest_str = dest.display().to_string();
     let platform = record.platform.clone();
     let post_url = record.post_url.clone();
-    let referer = if platform == "xiaohongshu" {
-        "https://www.xiaohongshu.com"
-    } else {
-        "https://www.douyin.com"
-    }
-    .to_string();
+    let referer = Platform::parse(&platform)
+        .map(|p| p.home_url())
+        .unwrap_or(Platform::Douyin.home_url())
+        .to_string();
     let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".to_string();
 
     // 标记下载中，便于前端展示状态
@@ -2815,7 +2803,7 @@ pub fn run_daily_prefetch(app: AppHandle) -> Result<Value, String> {
                 .monitored_posts
                 .iter()
                 .filter(|p| p.watch_id.as_deref() == Some(watch.id.as_str()))
-                .filter(|p| p.platform == "xiaohongshu" || p.platform == "douyin")
+                .filter(|p| Platform::parse(&p.platform).map(|x| x.is_cdp()).unwrap_or(false))
                 .filter(|p| !p.detail_fetched && p.content.trim().is_empty())
                 .map(|p| {
                     (
@@ -2855,7 +2843,7 @@ pub fn run_daily_prefetch(app: AppHandle) -> Result<Value, String> {
                 .map(|r| {
                     (
                         r.media_type == "video" || r.post_url.contains("/video/"),
-                        r.platform == "xiaohongshu" || r.platform == "douyin",
+                        Platform::parse(&r.platform).map(|p| p.is_cdp()).unwrap_or(false),
                         r.video_status == "none",
                     )
                 })
@@ -3294,7 +3282,7 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
                 .iter()
                 .filter(|p| p.watch_id.as_deref() == Some(watch.id.as_str()))
                 .filter(|p| p.media_type == "video" || p.post_url.contains("/video/"))
-                .filter(|p| p.platform == "xiaohongshu" || p.platform == "douyin")
+                .filter(|p| Platform::parse(&p.platform).map(|x| x.is_cdp()).unwrap_or(false))
                 .filter(|p| p.video_status == "none")
                 .map(|p| p.id.clone())
                 .collect())
@@ -3317,7 +3305,7 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
                     .monitored_posts
                     .iter()
                     .filter(|p| p.watch_id.as_deref() == Some(watch.id.as_str()))
-                    .filter(|p| p.platform == "xiaohongshu" || p.platform == "douyin")
+                    .filter(|p| Platform::parse(&p.platform).map(|x| x.is_cdp()).unwrap_or(false))
                     .filter(|p| !p.detail_fetched && p.content.trim().is_empty())
                     .map(|p| (p.created_at.parse::<i64>().unwrap_or(0), p.id.clone()))
                     .collect();
