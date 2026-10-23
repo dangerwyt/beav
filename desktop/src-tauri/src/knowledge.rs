@@ -6,6 +6,7 @@ use crate::persistence::{
     ensure_store_hydrated_for_media, load_knowledge_hydration_snapshot, with_store, with_store_mut,
 };
 use crate::store::{media as media_store, settings as settings_store, spaces as spaces_store};
+use crate::platform::Platform;
 use crate::workspace_loaders::read_json_file;
 use crate::*;
 use serde::Deserialize;
@@ -2596,7 +2597,7 @@ fn plugin_platform_accounts_value(store: &crate::AppStore) -> Value {
 
 fn merge_platform_accounts(primary: Value, fallback: Value) -> Value {
     let mut result = serde_json::Map::new();
-    let platforms = ["xiaohongshu", "douyin", "bilibili"];
+    let platforms: Vec<&str> = Platform::CORE.iter().map(|p| p.as_str()).collect();
     for platform in platforms {
         let primary_account = primary.get(platform).cloned().unwrap_or(Value::Null);
         let fallback_account = fallback.get(platform).cloned().unwrap_or(Value::Null);

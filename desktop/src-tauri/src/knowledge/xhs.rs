@@ -454,7 +454,7 @@ fn persist_xhs_comments_for_entry(
     let replies = comments.len() as i64 - top_level;
     let comments_doc = json!({
         "schemaVersion": 1,
-        "platform": "xiaohongshu",
+        "platform": crate::platform::Platform::Xiaohongshu.as_str(),
         "noteId": note_id,
         "entryId": entry_id,
         "sourceLink": source_link_from_input(&request.source),
@@ -564,7 +564,7 @@ pub(crate) fn ingest_xhs_entry_v2(
         persist_xhs_comments_for_entry(app, state, &entry_id, &note_kind, &note_title, request)?;
     Ok(json!({
         "success": true,
-        "platform": "xiaohongshu",
+        "platform": crate::platform::Platform::Xiaohongshu.as_str(),
         "apiVersion": 2,
         "stub": false,
         "persisted": true,

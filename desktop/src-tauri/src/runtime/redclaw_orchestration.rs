@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 
 use crate::runtime::RedclawProjectRecord;
 use crate::store::{redclaw as redclaw_store, runtime_tasks as runtime_tasks_store};
+use crate::platform::Platform;
 use crate::{make_id, now_iso, payload_string, AppStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,16 +121,16 @@ fn includes_any(text: &str, patterns: &[&str]) -> bool {
 
 fn detect_platform(text: &str) -> Option<String> {
     if includes_any(text, &["小红书", "xiaohongshu", "rednote"]) {
-        return Some("xiaohongshu".to_string());
+        return Some(Platform::Xiaohongshu.as_str().to_string());
     }
     if includes_any(text, &["抖音", "douyin", "tiktok"]) {
-        return Some("douyin".to_string());
+        return Some(Platform::Douyin.as_str().to_string());
     }
     if includes_any(text, &["b站", "bilibili", "哔哩哔哩"]) {
-        return Some("bilibili".to_string());
+        return Some(Platform::Bilibili.as_str().to_string());
     }
     if includes_any(text, &["youtube", "油管"]) {
-        return Some("youtube".to_string());
+        return Some(Platform::Youtube.as_str().to_string());
     }
     None
 }
@@ -157,7 +158,7 @@ fn detect_format(text: &str) -> Option<String> {
 }
 
 fn is_xhs_format(content_format: Option<&str>, platform: Option<&str>) -> bool {
-    platform == Some("xiaohongshu")
+    platform == Some(Platform::Xiaohongshu.as_str())
         || matches!(
             content_format,
             Some("xhs_article") | Some("xhs_image_text") | Some("xhs_image_assets")
@@ -1570,7 +1571,10 @@ mod tests {
             .iter()
             .map(|item| item.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(graph.platform.as_deref(), Some("xiaohongshu"));
+        assert_eq!(
+            graph.platform.as_deref(),
+            Some(Platform::Xiaohongshu.as_str())
+        );
         assert_eq!(graph.content_format.as_deref(), Some("short_video"));
         assert!(node_ids.contains(&"research"));
         assert!(node_ids.contains(&"storyboard"));

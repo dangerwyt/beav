@@ -8,6 +8,7 @@ use tauri::State;
 
 use crate::json_util::{json_string, read_json_value, write_json_pretty};
 use crate::persistence::with_store;
+use crate::platform::Platform;
 use crate::store::spaces as spaces_store;
 use crate::{now_iso, storage_safe_file_stem, workspace_root, AppState};
 
@@ -714,7 +715,7 @@ fn complete_import_session(
 }
 
 fn platform_accounts_from_catalog(catalog: &AccountCatalog) -> Value {
-    let platforms = ["xiaohongshu", "douyin", "bilibili"];
+    let platforms: Vec<&str> = Platform::CORE.iter().map(|p| p.as_str()).collect();
     let mut map = serde_json::Map::new();
     for platform in platforms {
         let account = catalog

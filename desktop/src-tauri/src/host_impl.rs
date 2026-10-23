@@ -1635,7 +1635,7 @@ mod tests {
                 "forbiddenFinalPhrases": ["评论区"]
             },
             "intent": "manuscript_creation",
-            "platform": "xiaohongshu",
+            "platform": crate::platform::Platform::Xiaohongshu.as_str(),
             "taskType": "direct_write",
             "formatTarget": "markdown",
             "executionProfile": "artifact-authoring",

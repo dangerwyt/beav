@@ -1,5 +1,6 @@
 use crate::persistence::with_store_mut;
 use crate::store::types::PublishLogRecord;
+use crate::platform::Platform;
 use crate::{app_brand_display_name, make_id, now_i64, AppState};
 use serde_json::{json, Value};
 use tauri::{AppHandle, State};
@@ -152,11 +153,11 @@ fn publish_remove(state: &State<'_, AppState>, payload: &Value) -> Result<Value,
 
 fn platforms() -> Value {
     json!([
-        { "key": "xiaohongshu", "label": "小红书", "consoleUrl": "https://creator.xiaohongshu.com/" },
-        { "key": "douyin", "label": "抖音", "consoleUrl": "https://creator.douyin.com/" },
-        { "key": "bilibili", "label": "哔哩哔哩", "consoleUrl": "https://member.bilibili.com/" },
+        { "key": Platform::Xiaohongshu.as_str(), "label": "小红书", "consoleUrl": "https://creator.xiaohongshu.com/" },
+        { "key": Platform::Douyin.as_str(), "label": "抖音", "consoleUrl": "https://creator.douyin.com/" },
+        { "key": Platform::Bilibili.as_str(), "label": "哔哩哔哩", "consoleUrl": "https://member.bilibili.com/" },
         { "key": "wechat_public", "label": "微信公众号", "consoleUrl": "https://mp.weixin.qq.com/" },
-        { "key": "weibo", "label": "微博", "consoleUrl": "https://weibo.com/" },
+        { "key": Platform::Weibo.as_str(), "label": "微博", "consoleUrl": "https://weibo.com/" },
         { "key": "other", "label": "其他", "consoleUrl": "" }
     ])
 }

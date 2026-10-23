@@ -1,7 +1,10 @@
 //! 平台枚举：把散落在各处的 `"xiaohongshu"` / `"douyin"` 等字面量收敛到一处。
 //!
-//! 存储层仍用 `String`（兼容旧数据），逻辑判断统一走 `Platform::parse()`。
-//! 新增平台（如 Facebook / Twitter）时，只在这里加变体 + 能力开关，调用方不用再改字符串。
+//! 注意：项目里存在多套“平台词表”——监控抓取、账号绑定、发布控制台、创作内容类型。
+//! 本枚举覆盖**平台值本身**；像 `wechat_public`、`wechat_official_account` 这类发布/创作侧
+//! 的专有键仍保留在各自模块（语义不同，强行合并会改动存量值）。
+//!
+//! 存储层仍用 `String`（兼容旧数据），逻辑判断统一走 `Platform::parse()` / `from_host()`。
 
 #![allow(dead_code)]
 
@@ -16,6 +19,10 @@ pub enum Platform {
     Weibo,
     Zhihu,
     Weixin,
+    Youtube,
+    Kuaishou,
+    Tiktok,
+    Instagram,
     Facebook,
     Twitter,
     Web,
@@ -29,10 +36,18 @@ impl Platform {
         Platform::Weibo,
         Platform::Zhihu,
         Platform::Weixin,
+        Platform::Youtube,
+        Platform::Kuaishou,
+        Platform::Tiktok,
+        Platform::Instagram,
         Platform::Facebook,
         Platform::Twitter,
         Platform::Web,
     ];
+
+    /// 账号 / 知识库 / 发布共用的一线平台（顺序即 UI 顺序）。
+    pub const CORE: &'static [Platform] =
+        &[Platform::Xiaohongshu, Platform::Douyin, Platform::Bilibili];
 
     /// 规范化后的存储值（与历史 JSON 完全一致，不要随意改）。
     pub const fn as_str(self) -> &'static str {
@@ -43,6 +58,10 @@ impl Platform {
             Platform::Weibo => "weibo",
             Platform::Zhihu => "zhihu",
             Platform::Weixin => "weixin",
+            Platform::Youtube => "youtube",
+            Platform::Kuaishou => "kuaishou",
+            Platform::Tiktok => "tiktok",
+            Platform::Instagram => "instagram",
             Platform::Facebook => "facebook",
             Platform::Twitter => "twitter",
             Platform::Web => "web",
@@ -51,12 +70,16 @@ impl Platform {
 
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "xiaohongshu" | "xhs" | "redbook" => Some(Platform::Xiaohongshu),
+            "xiaohongshu" | "xhs" | "redbook" | "rednote" => Some(Platform::Xiaohongshu),
             "douyin" | "dy" => Some(Platform::Douyin),
             "bilibili" | "bili" => Some(Platform::Bilibili),
             "weibo" | "wb" => Some(Platform::Weibo),
             "zhihu" => Some(Platform::Zhihu),
             "weixin" | "wechat" => Some(Platform::Weixin),
+            "youtube" => Some(Platform::Youtube),
+            "kuaishou" => Some(Platform::Kuaishou),
+            "tiktok" => Some(Platform::Tiktok),
+            "instagram" | "ins" => Some(Platform::Instagram),
             "facebook" | "fb" => Some(Platform::Facebook),
             "twitter" | "x" => Some(Platform::Twitter),
             "web" => Some(Platform::Web),
@@ -79,6 +102,14 @@ impl Platform {
             Some(Platform::Zhihu)
         } else if s.contains("weixin") || s.contains("wechat") {
             Some(Platform::Weixin)
+        } else if s.contains("youtube") || s.contains("youtu.be") {
+            Some(Platform::Youtube)
+        } else if s.contains("kuaishou") {
+            Some(Platform::Kuaishou)
+        } else if s.contains("tiktok") {
+            Some(Platform::Tiktok)
+        } else if s.contains("instagram") {
+            Some(Platform::Instagram)
         } else if s.contains("facebook") || s.contains("fb.com") {
             Some(Platform::Facebook)
         } else if s.contains("twitter") || s.contains("x.com") {
@@ -107,6 +138,10 @@ impl Platform {
             Platform::Weibo => "https://weibo.com",
             Platform::Zhihu => "https://www.zhihu.com",
             Platform::Weixin => "https://channels.weixin.qq.com",
+            Platform::Youtube => "https://www.youtube.com",
+            Platform::Kuaishou => "https://www.kuaishou.com",
+            Platform::Tiktok => "https://www.tiktok.com",
+            Platform::Instagram => "https://www.instagram.com",
             Platform::Facebook => "https://www.facebook.com",
             Platform::Twitter => "https://x.com",
             Platform::Web => "https://www.google.com",
@@ -150,6 +185,10 @@ mod tests {
             Platform::from_host("https://www.douyin.com/video/1"),
             Some(Platform::Douyin)
         );
+        assert_eq!(
+            Platform::from_host("https://www.youtube.com/watch?v=1"),
+            Some(Platform::Youtube)
+        );
         assert_eq!(Platform::from_host("https://example.com"), None);
     }
 
@@ -158,5 +197,6 @@ mod tests {
         assert!(Platform::Douyin.is_cdp());
         assert!(!Platform::Facebook.is_cdp());
         assert!(!Platform::Weixin.supports_video());
+        assert_eq!(Platform::CORE.len(), 3);
     }
 }

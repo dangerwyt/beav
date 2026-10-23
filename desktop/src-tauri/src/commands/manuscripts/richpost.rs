@@ -172,7 +172,9 @@ pub(super) fn handle_richpost_channel(
                     json!({ "success": false, "error": "Only richpost packages support image export" }),
                 );
             }
-            let fallback_export_dir = full_path.join("exports").join("xiaohongshu");
+            let fallback_export_dir = full_path
+                .join("exports")
+                .join(crate::platform::Platform::Xiaohongshu.as_str());
             let export_dir = dirs::download_dir().unwrap_or(fallback_export_dir);
             let _ = fs::create_dir_all(&export_dir);
             let file_stem = full_path
