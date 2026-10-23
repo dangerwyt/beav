@@ -266,12 +266,13 @@ export function createMonitorBridge(core: BridgeCore) {
           fallback: () => ({ success: false }) as unknown as T,
         }),
       // 分析视频：抽帧 + ASR 转写 + 摘要，落库 post_video_analyses
+      // 4 分钟以上的视频（抽帧 + 长音频 ASR）可能超过 4 分钟，这里放宽到 15 分钟。
       analyzeVideo: <T = { success: boolean; note?: string; analysis?: Record<string, unknown> }>(
         id: string,
       ) =>
         core.invokeChannelGuarded<T>('monitor:analyze-video', { id }, {
-          timeoutMs: 240_000,
-          fallback: () => ({ success: false, note: '分析视频超时' }) as unknown as T,
+          timeoutMs: 900_000,
+          fallback: () => ({ success: false, note: '分析视频超时（含抽帧 + 语音转写，最长约 15 分钟）' }) as unknown as T,
         }),
       // 读取已有的视频分析结果
       videoAnalysis: <T = { success: boolean; analysis?: Record<string, unknown> | null }>(id: string) =>

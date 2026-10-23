@@ -419,6 +419,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [loadingWatches, setLoadingWatches] = useState(true);
   const [loadingPosts, setLoadingPosts] = useState(false);
   const [fetching, setFetching] = useState(false);
+  /** 正在抓取的博主 id（null=空闲；'__adhoc__'=临时抓取），只让该条目转圈。 */
+  const [fetchingWatchId, setFetchingWatchId] = useState<string | null>(null);
   /** 「补历史」进行中的博主 id（null = 空闲）。深翻要滚几十秒，按钮各自转圈。 */
   const [historyBusyId, setHistoryBusyId] = useState<string | null>(null);
   /** 补历史实时进度：watchId -> { scanned, total }，驱动「已抓 X / 共 Y」进度条。 */
@@ -693,6 +695,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
 
   const handleFetchWatch = useCallback(async (watch: CompetitorWatch) => {
     setFetching(true);
+    setFetchingWatchId(watch.id);
     setFetchNote(null);
     try {
       const result = (await window.ipcRenderer.monitor.fetch({ watchId: watch.id })) as {
@@ -710,6 +713,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       showToast('err', e instanceof Error ? e.message : '抓取失败');
     } finally {
       setFetching(false);
+      setFetchingWatchId(null);
     }
   }, [loadWatches, loadPosts, showToast]);
 
@@ -720,6 +724,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       return;
     }
     setFetching(true);
+    setFetchingWatchId('__adhoc__');
     setFetchNote(null);
     try {
       const result = (await window.ipcRenderer.monitor.fetch({ url })) as {
@@ -737,6 +742,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       showToast('err', e instanceof Error ? e.message : '抓取失败');
     } finally {
       setFetching(false);
+      setFetchingWatchId(null);
     }
   }, [adhocUrl, loadWatches, loadPosts, showToast]);
 
@@ -1521,11 +1527,24 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
+                    if (historyBusyId !== null) {
+                      showToast('err', '有补历史任务正在进行，请稍候再试');
+                      return;
+                    }
                     void handleBackfillHistory(watch.id);
                   }}
-                  disabled={historyBusyId !== null}
-                  className="absolute right-2 top-2 p-1 rounded text-text-tertiary hover:text-accent-primary hover:bg-surface-primary transition-colors disabled:opacity-40"
-                  title={`补历史：把「${watch.name}」主页更早的历史帖抓下来`}
+                  aria-disabled={historyBusyId !== null}
+                  className={clsx(
+                    'absolute right-2 top-2 p-1 rounded transition-colors',
+                    historyBusyId !== null
+                      ? 'text-text-tertiary opacity-40 cursor-not-allowed'
+                      : 'text-text-tertiary hover:text-accent-primary hover:bg-surface-primary',
+                  )}
+                  title={
+                    historyBusyId !== null
+                      ? '有补历史任务正在进行，请稍候'
+                      : `补历史：把「${watch.name}」主页更早的历史帖抓下来`
+                  }
                 >
                   {historyBusyId === watch.id ? (
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -1535,12 +1554,23 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 </button>
                 <div className="flex items-center gap-1 mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
                   <button
-                    onClick={() => void handleFetchWatch(watch)}
-                    disabled={fetching}
-                    className="flex-1 inline-flex items-center justify-center gap-1 text-[11px] px-2 py-1 rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
-                    title="抓取该博主"
+                    onClick={() => {
+                      if (fetching) {
+                        showToast('err', '有抓取任务正在进行，请稍候再试');
+                        return;
+                      }
+                      void handleFetchWatch(watch);
+                    }}
+                    aria-disabled={fetching}
+                    className={clsx(
+                      'flex-1 inline-flex items-center justify-center gap-1 text-[11px] px-2 py-1 rounded-md border border-border text-text-secondary transition-colors',
+                      fetching
+                        ? 'opacity-50 cursor-not-allowed'
+                        : 'hover:text-accent-primary hover:border-accent-primary/40',
+                    )}
+                    title={fetching ? '有抓取任务正在进行，请稍候' : '抓取该博主'}
                   >
-                    <RefreshCw className={clsx('w-3 h-3', fetching && 'animate-spin')} />
+                    <RefreshCw className={clsx('w-3 h-3', fetchingWatchId === watch.id && 'animate-spin')} />
                     抓取
                   </button>
                   <button
@@ -1630,11 +1660,20 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               className="flex-1 bg-surface-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
             />
             <button
-              onClick={() => void handleAdhocFetch()}
-              disabled={fetching || !adhocUrl.trim()}
-              className="inline-flex items-center gap-1.5 px-3 py-2 text-sm rounded-lg bg-accent-primary text-white hover:bg-accent-primary/90 transition-colors disabled:opacity-50"
+              onClick={() => {
+                if (fetching) {
+                  showToast('err', '有抓取任务正在进行，请稍候再试');
+                  return;
+                }
+                void handleAdhocFetch();
+              }}
+              aria-disabled={fetching || !adhocUrl.trim()}
+              className={clsx(
+                'inline-flex items-center gap-1.5 px-3 py-2 text-sm rounded-lg bg-accent-primary text-white transition-colors',
+                fetching || !adhocUrl.trim() ? 'opacity-50 cursor-not-allowed' : 'hover:bg-accent-primary/90',
+              )}
             >
-              {fetching ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+              {fetchingWatchId === '__adhoc__' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
               抓取
             </button>
           </div>
