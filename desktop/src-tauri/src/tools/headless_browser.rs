@@ -45,17 +45,30 @@ struct ChromeSession {
 static CHROME_SESSIONS: OnceLock<Mutex<HashMap<String, ChromeSession>>> = OnceLock::new();
 
 /// 探测系统已装的 Chrome / Edge / Chromium 路径。
-/// Windows 上按常见安装位置搜索；找不到返回 None，由调用方提示用户。
+///
+/// 各平台按自己的安装约定搜索；找不到返回 None，由调用方提示用户。
 pub fn detect_chrome_path() -> Option<PathBuf> {
     let candidates: &[&str] = &[
-        // Chrome stable
+        // Windows：Chrome stable / Chrome x86 / Edge（Win11 预装）/ Brave
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        // Edge（Win11 预装）
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        // Brave（顺带支持）
         r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+        // macOS：应用包内部的可执行文件（Chrome / Edge / Brave / Chromium）
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        // macOS：用户级安装目录
+        "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+        // Linux：发行版常见路径
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/microsoft-edge",
+        "/usr/bin/brave-browser",
     ];
     for c in candidates {
         let p = PathBuf::from(c);
@@ -64,6 +77,24 @@ pub fn detect_chrome_path() -> Option<PathBuf> {
         }
     }
     // 兜底：看 PATH 里有没有
+    if let Ok(p) = which_browser("google-chrome") {
+        return Some(p);
+    }
+    if let Ok(p) = which_browser("google-chrome-stable") {
+        return Some(p);
+    }
+    if let Ok(p) = which_browser("chromium") {
+        return Some(p);
+    }
+    if let Ok(p) = which_browser("chromium-browser") {
+        return Some(p);
+    }
+    if let Ok(p) = which_browser("microsoft-edge") {
+        return Some(p);
+    }
+    if let Ok(p) = which_browser("brave-browser") {
+        return Some(p);
+    }
     if let Ok(p) = which_browser("chrome") {
         return Some(p);
     }
@@ -126,8 +157,70 @@ fn kill_stale_profile_chrome(profile_dir: &PathBuf) {
     std::thread::sleep(Duration::from_millis(400));
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn kill_stale_profile_chrome(_profile_dir: &PathBuf) {}
+
+/// macOS / Linux：按 profile 路径精准清掉上次遗留的浏览器进程。
+///
+/// 只匹配命令行里带我们 profile 路径的 chrome/chromium/msedge/brave 进程，
+/// 绝不误伤用户自己正常打开的浏览器。
+///
+/// 为什么非 Windows 也需要：Beav 重启后会话表清空，但上次拉起的 Chrome 还活着。
+/// 再 spawn 同 user-data-dir 的 Chrome 时，新进程会把请求转交给旧进程后立即退出，
+/// stderr 里永远等不到 DevTools listening → 8s 超时，表现为「按钮点了没反应」。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn kill_stale_profile_chrome(profile_dir: &PathBuf) {
+    let dir = profile_dir.display().to_string();
+    if dir.is_empty() {
+        return;
+    }
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output();
+    let stdout = match output {
+        Ok(result) => String::from_utf8_lossy(&result.stdout).to_string(),
+        Err(_) => return,
+    };
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (pid_part, command) = match line.split_once(char::is_whitespace) {
+            Some(parts) => parts,
+            None => continue,
+        };
+        let pid: i32 = match pid_part.trim().parse() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        // 只杀浏览器进程，且命令行必须包含我们的 profile 目录
+        let is_browser = [
+            "Google Chrome",
+            "chrome",
+            "Chromium",
+            "chromium",
+            "Microsoft Edge",
+            "msedge",
+            "Brave Browser",
+            "brave",
+        ]
+        .iter()
+        .any(|name| command.contains(name));
+        if !is_browser || !command.contains(&dir) {
+            continue;
+        }
+        // 避免误杀自己
+        if pid == std::process::id() as i32 {
+            continue;
+        }
+        let _ = Command::new("kill")
+            .arg(pid.to_string())
+            .output();
+    }
+    // 给 OS 一点时间释放 profile 目录锁（进程退出后句柄释放略滞后）。
+    std::thread::sleep(Duration::from_millis(400));
+}
 
 /// 为指定平台启动 Chrome 并拉起登录页（独立 profile）。返回该平台的调试端口。
 ///
@@ -1620,6 +1713,65 @@ pub fn shutdown_chrome() {
         if let Some(mut child) = session.child {
             let _ = child.kill();
             let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// detect_chrome_path 必须能在当前平台找到已安装的浏览器。
+    ///
+    /// 回归背景：原实现只列 Windows 路径 + PATH 里找 "chrome"/"msedge"，
+    /// macOS 上 Chrome 装在 /Applications/*.app/Contents/MacOS/ 且不在 PATH，
+    /// 于是恒返回 None → chromeInstalled=false → 前端「打开 Chrome 登录小红书」
+    /// 按钮永久 disabled（点了没反应）。
+    #[test]
+    fn detect_chrome_path_finds_browser_on_current_platform() {
+        // 只在确实装了浏览器的机器上断言；CI 或干净容器里跳过。
+        let has_any = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/microsoft-edge",
+            "/usr/bin/brave-browser",
+        ]
+        .iter()
+        .any(|p| PathBuf::from(p).exists())
+            || which_browser("google-chrome").is_ok()
+            || which_browser("chromium").is_ok()
+            || which_browser("chromium-browser").is_ok()
+            || which_browser("brave-browser").is_ok()
+            || which_browser("microsoft-edge").is_ok()
+            || which_browser("chrome").is_ok()
+            || which_browser("msedge").is_ok();
+
+        if !has_any {
+            eprintln!("跳过：本机未安装任何受支持的浏览器");
+            return;
+        }
+        let found = detect_chrome_path();
+        assert!(
+            found.is_some(),
+            "本机存在浏览器但 detect_chrome_path() 返回 None —— 平台路径列表缺失"
+        );
+        let path = found.unwrap();
+        assert!(path.exists(), "detect_chrome_path() 返回了不存在的路径: {}", path.display());
+        eprintln!("detect_chrome_path() -> {}", path.display());
+    }
+
+    /// 返回的路径必须真的可执行，否则 spawn 会失败。
+    #[test]
+    fn detected_browser_is_executable() {
+        if let Some(path) = detect_chrome_path() {
+            let ok = path.exists();
+            assert!(ok, "路径不存在: {}", path.display());
         }
     }
 }
