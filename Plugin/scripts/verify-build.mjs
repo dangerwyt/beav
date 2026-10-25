@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { access, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const repositoryRoot = path.resolve(pluginRoot, '..');
@@ -206,7 +206,7 @@ for (const contractText of ['allTextContents', 'isEnabled', 'textContent', 'retu
 
 const browserClientPath = path.join(pluginRoot, 'scripts/browser-client.mjs');
 await exists(browserClientPath);
-const browserClientModule = await import(`${browserClientPath}?verify=${Date.now()}`);
+const browserClientModule = await import(`${pathToFileURL(browserClientPath).href}?verify=${Date.now()}`);
 assert.equal(typeof browserClientModule.setupBrowserRuntime, 'function', 'browser-client must export setupBrowserRuntime');
 for (const docName of ['browser-runtime.md', 'browser-playwright.md', 'browser-troubleshooting.md']) {
   const doc = await readText(path.join(pluginRoot, 'docs', docName));
