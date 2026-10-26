@@ -2330,7 +2330,7 @@ fn run_transcription(
     app: &AppHandle,
     state: &State<'_, AppState>,
     local_path: &str,
-) -> (String, String, Option<String>) {
+) -> (String, String, Option<String>, String) {
     if !video_has_audio(app, local_path) {
         return (
             String::new(),
@@ -2340,39 +2340,51 @@ fn run_transcription(
                  重新下载该视频会自动补音轨后再分析。"
                     .to_string(),
             ),
+            String::new(),
         );
     }
     match execute_media_transcribe(app, state, None, &json!({ "sourcePath": local_path })) {
         Ok(v) => {
                 let text = v
-                    .get("transcript")
-                    .and_then(Value::as_str)
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        v.get("contentPreview")
-                            .and_then(Value::as_str)
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                    })
-                    // 最后才读字幕文件：文件里是带序号和时间轴的 SRT，塞进 transcript 会让
-                    // 详情页显示一堆 `00:00:00,800 --> ...`，也会污染下游 LLM。
-                    .or_else(|| {
-                        v.get("transcriptPath")
-                            .and_then(Value::as_str)
-                            .and_then(|p| std::fs::read_to_string(p).ok())
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                    })
-                    .unwrap_or_default();
+                .get("transcript")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    v.get("contentPreview")
+                        .and_then(Value::as_str)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_default();
+            // 时间轴：单独取转写服务产出的 SRT 文件（带每句起止时间），供前端做「时间轴」展示。
+            // 与 transcript 分离，绝不把 `00:00:00,800 -->` 塞进 clean 全文（会污染 LLM / 详情页）。
+            let srt = v
+                .get("transcriptPath")
+                .and_then(Value::as_str)
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default();
             if text.is_empty() {
-                (
-                    String::new(),
-                    "failed".to_string(),
-                    Some("转写服务返回了空内容（整段无口播，或音频被判成纯音乐）。".to_string()),
-                )
+                // 没有干净全文时，从 SRT 抽掉序号 / 时间轴行作为降级全文，保证 transcript 不为空且无时间戳噪音。
+                let plain = if srt.is_empty() {
+                    String::new()
+                } else {
+                    strip_srt_timestamps(&srt)
+                };
+                if plain.is_empty() {
+                    (
+                        String::new(),
+                        "failed".to_string(),
+                        Some("转写服务返回了空内容（整段无口播，或音频被判成纯音乐）。".to_string()),
+                        srt,
+                    )
+                } else {
+                    (plain, "ok".to_string(), None, srt)
+                }
             } else {
-                (text, "ok".to_string(), None)
+                (text, "ok".to_string(), None, srt)
             }
         }
         Err(e) => {
@@ -2386,9 +2398,33 @@ fn run_transcription(
                 String::new(),
                 status.to_string(),
                 Some(e.chars().take(800).collect()),
+                String::new(),
             )
         }
     }
+}
+
+/// 把 SRT 文本去掉序号行与时间轴行（`00:00:01,200 --> 00:00:04,500`），仅保留字幕正文。
+/// 用于转写服务只回传 SRT、没有干净 `transcript` 全文时的降级处理。
+fn strip_srt_timestamps(srt: &str) -> String {
+    srt.lines()
+        .map(|l| l.trim())
+        .filter(|l| {
+            if l.is_empty() {
+                return false;
+            }
+            // 跳过纯序号行
+            if l.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            // 跳过时间轴行
+            if l.contains("-->") {
+                return false;
+            }
+            true
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 分析已下载的竞品视频：抽帧（ffmpeg）+ 语音转写（复用 media_transcribe）+ 落库。
@@ -2410,7 +2446,7 @@ fn analyze_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value) 
     let frames_dir = dir.join(&id).join("frames");
     std::fs::create_dir_all(&frames_dir).map_err(|e| format!("创建帧目录失败：{e}"))?;
 
-    // 抽帧：每 15s 一帧，最多 60 张（覆盖更长视频；短视频按时长少抽）
+    // 抽帧：每 5s 一帧（客户需求：5 秒间隔、不限制张数，长视频按真实时长全量抽）
     let ff = ffmpeg_program(Some(app))?;
     let frame_pattern = frames_dir.join("frame_%03d.jpg").display().to_string();
     let _ = Command::new(&ff)
@@ -2418,9 +2454,7 @@ fn analyze_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value) 
         .arg("-i")
         .arg(&local_path)
         .arg("-vf")
-        .arg("fps=1/15")
-        .arg("-frames:v")
-        .arg("60")
+        .arg("fps=1/5")
         .arg(&frame_pattern)
         .output();
 
@@ -2461,16 +2495,15 @@ fn analyze_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value) 
             .find(|a| a.post_id == id)
             .cloned())
     })?;
-    let existing_transcript = existing_analysis
+    let existing_opt = existing_analysis
         .as_ref()
-        .filter(|a| a.transcript_status == "ok" && !a.transcript.trim().is_empty())
-        .map(|a| (a.transcript.clone(), a.transcript_status.clone(), a.transcript_error.clone()));
+        .filter(|a| a.transcript_status == "ok" && !a.transcript.trim().is_empty());
 
-    let (transcript, transcript_status, transcript_error) = if skip_transcript {
-        (String::new(), "pending".to_string(), None)
+    let (mut transcript, mut transcript_status, mut transcript_error, mut transcript_srt) = if skip_transcript {
+        (String::new(), "pending".to_string(), None, String::new())
     } else if !force_transcript {
-        if let Some((text, status, error)) = existing_transcript.clone() {
-            (text, status, error)
+        if let Some(a) = existing_opt {
+            (a.transcript.clone(), a.transcript_status.clone(), a.transcript_error.clone(), a.transcript_srt.clone())
         } else {
             run_transcription(app, state, &local_path_str)
         }
@@ -2478,19 +2511,15 @@ fn analyze_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value) 
         run_transcription(app, state, &local_path_str)
     };
 
-    // 本次转写失败/为空、但之前有成功结果 → 保留旧结果
-    let (transcript, transcript_status, transcript_error) = if !skip_transcript
-        && transcript.trim().is_empty()
-        && transcript_status != "ok"
-    {
-        if let Some((text, status, error)) = existing_transcript {
-            (text, status, error)
-        } else {
-            (transcript, transcript_status, transcript_error)
+    // 本次转写失败/为空、但之前有成功结果 → 保留旧结果（含时间轴）
+    if !skip_transcript && transcript.trim().is_empty() && transcript_status != "ok" {
+        if let Some(a) = existing_opt {
+            transcript = a.transcript.clone();
+            transcript_status = a.transcript_status.clone();
+            transcript_error = a.transcript_error.clone();
+            transcript_srt = a.transcript_srt.clone();
         }
-    } else {
-        (transcript, transcript_status, transcript_error)
-    };
+    }
     let duration_secs = probe_duration_secs(app, &local_path_str);
 
     // 按 post_id upsert 到视频分析库
@@ -2510,6 +2539,7 @@ fn analyze_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value) 
         rec.transcript = transcript.clone();
         rec.transcript_status = transcript_status.clone();
         rec.transcript_error = transcript_error.clone();
+        rec.transcript_srt = transcript_srt.clone();
         rec.duration_secs = duration_secs;
         rec.frames = frames.clone();
         rec.created_at = if rec.created_at == 0 { now } else { rec.created_at };
@@ -2553,7 +2583,7 @@ fn transcribe_video_only(
         .clone()
         .ok_or_else(|| "该视频尚未下载，请先「下载视频」".to_string())?;
 
-    let (transcript, status, error) = run_transcription(app, state, &local_path);
+    let (transcript, status, error, srt) = run_transcription(app, state, &local_path);
     let now = now_i64();
     let analysis = with_store_mut(state, |store| {
         let Some(rec) = store.post_video_analyses.iter_mut().find(|a| a.post_id == id) else {
@@ -2562,6 +2592,7 @@ fn transcribe_video_only(
         rec.transcript = transcript.clone();
         rec.transcript_status = status.clone();
         rec.transcript_error = error.clone();
+        rec.transcript_srt = srt.clone();
         rec.updated_at = now;
         Ok(serde_json::to_value(&*rec).unwrap_or_else(|_| json!({})))
     })?;

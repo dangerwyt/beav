@@ -896,6 +896,9 @@ pub(crate) struct PostVideoAnalysisRecord {
     pub(crate) transcript_status: String,
     /// 转写失败的具体错误（`transcript_status != ok` 时填），截断到 800 字供 UI 展示。
     pub(crate) transcript_error: Option<String>,
+    /// 带时间轴的字幕原文（SRT 文本），供前端做「时间轴」展示。
+    /// 与 `transcript`（干净全文）分离存储，避免时间戳污染 LLM / 详情页纯文本。
+    pub(crate) transcript_srt: String,
     /// 抽取的关键帧图片路径（相对/绝对，存于 `monitor_videos/<post_id>/frames/`）。
     pub(crate) frames: Vec<String>,
     /// LLM 生成的视频内容摘要（选题角度 / 结构 / 钩子），可空（未跑 LLM 时）。

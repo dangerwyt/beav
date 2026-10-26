@@ -98,6 +98,8 @@ interface PostVideoAnalysis {
   localPath: string;
   durationSecs?: number | null;
   transcript: string;
+  /** 带时间轴的字幕原文（SRT 文本），供前端渲染每句时间戳。可能为空（转写失败 / 未产出 SRT）。 */
+  transcriptSrt?: string;
   /** 转写状态：ok / no-audio / not-configured / failed / pending（尚未转写）/ 空串（未知）。 */
   transcriptStatus: string;
   /** 转写失败的具体原因（status 非 ok 时后端会填），供 UI 显示真实原因。 */
@@ -273,6 +275,10 @@ function normalizeVideoAnalysis(raw: Record<string, unknown> | null | undefined)
     localPath: String(raw.localPath ?? raw.local_path ?? ''),
     durationSecs: Number.isFinite(duration) ? duration : null,
     transcript: String(raw.transcript ?? ''),
+    transcriptSrt:
+      raw.transcriptSrt != null || raw.transcript_srt != null
+        ? String(raw.transcriptSrt ?? raw.transcript_srt ?? '')
+        : '',
     transcriptStatus: String(raw.transcriptStatus ?? raw.transcript_status ?? ''),
     transcriptError:
       raw.transcriptError != null || raw.transcript_error != null
@@ -285,10 +291,54 @@ function normalizeVideoAnalysis(raw: Record<string, unknown> | null | undefined)
   };
 }
 
-/** 视频分析展示卡：时长 + 关键帧网格 + 语音转写全文 + LLM 摘要。 */
+/** 解析 SRT 时间戳（`00:01:02,300` / `00:01:02.300` / `01:02,300`）为秒数。 */
+function parseSrtTimestamp(ts: string): number {
+  const cleaned = ts.trim().replace(',', '.');
+  const parts = cleaned.split(':').map(Number);
+  let secs = 0;
+  if (parts.length === 3) secs = (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
+  else if (parts.length === 2) secs = (parts[0] || 0) * 60 + (parts[1] || 0);
+  else if (parts.length === 1) secs = parts[0] || 0;
+  return Number.isFinite(secs) ? secs : 0;
+}
+
+/** 秒数 → `mm:ss`。 */
+function formatClock(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`;
+}
+
+/** 解析 SRT 文本为带起止时间的分句列表（用于「时间轴」展示）。 */
+function parseSrt(srt: string): { start: number; text: string }[] {
+  const blocks = srt.replace(/\r/g, '').split(/\n\s*\n/);
+  const out: { start: number; text: string }[] = [];
+  for (const block of blocks) {
+    const lines = block.split('\n').map((l) => l.trim()).filter(Boolean);
+    let start = 0;
+    const textLines: string[] = [];
+    for (const line of lines) {
+      if (line.includes('-->')) {
+        start = parseSrtTimestamp(line.split('-->')[0]);
+        continue;
+      }
+      if (/^\d+$/.test(line)) continue; // 序号行
+      textLines.push(line);
+    }
+    const text = textLines.join(' ').trim();
+    if (text) out.push({ start, text });
+  }
+  return out;
+}
+
+/** 视频分析展示卡：时长 + 关键帧网格 + 语音转写（全文 / 时间轴）+ LLM 摘要。 */
 function VideoAnalysisPanel({ analysis }: { analysis: PostVideoAnalysis }) {
   const [showAll, setShowAll] = useState(false);
+  const [viewMode, setViewMode] = useState<'text' | 'timeline'>('text');
   const transcript = analysis.transcript.trim();
+  const segs = parseSrt(analysis.transcriptSrt || '');
+  const hasTimeline = segs.length > 0;
   const longTranscript = transcript.length > 600;
   return (
     <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/[0.04] p-3 space-y-3">
@@ -304,7 +354,7 @@ function VideoAnalysisPanel({ analysis }: { analysis: PostVideoAnalysis }) {
       {analysis.frames.length > 0 && (
         <div>
           <div className="text-[11px] font-medium text-text-tertiary mb-1.5">
-            关键帧（{analysis.frames.length} 张 / 每 15s 一帧）
+            关键帧（{analysis.frames.length} 张 / 每 5s 一帧）
           </div>
           <div className="grid grid-cols-4 gap-1.5">
             {analysis.frames.slice(0, 8).map((frame, i) => (
@@ -325,17 +375,56 @@ function VideoAnalysisPanel({ analysis }: { analysis: PostVideoAnalysis }) {
 
       {transcript ? (
         <div>
-          <div className="text-[11px] font-medium text-text-tertiary mb-1">语音转写（ASR）</div>
-          <p className="text-sm text-text-secondary whitespace-pre-wrap leading-relaxed">
-            {showAll || !longTranscript ? transcript : `${transcript.slice(0, 600)}…`}
-          </p>
-          {longTranscript && (
-            <button
-              onClick={() => setShowAll((v) => !v)}
-              className="mt-1 text-[11px] text-accent-primary hover:underline"
-            >
-              {showAll ? '收起' : `展开全文（共 ${transcript.length} 字）`}
-            </button>
+          <div className="flex items-center justify-between gap-2 mb-1">
+            <span className="text-[11px] font-medium text-text-tertiary">语音转写（ASR）</span>
+            {hasTimeline && (
+              <div className="inline-flex rounded-md border border-border overflow-hidden text-[11px]">
+                <button
+                  onClick={() => setViewMode('text')}
+                  className={clsx(
+                    'px-2 py-0.5 transition-colors',
+                    viewMode === 'text' ? 'bg-accent-primary text-white' : 'text-text-tertiary hover:text-accent-primary',
+                  )}
+                >
+                  全文
+                </button>
+                <button
+                  onClick={() => setViewMode('timeline')}
+                  className={clsx(
+                    'px-2 py-0.5 border-l border-border transition-colors',
+                    viewMode === 'timeline' ? 'bg-accent-primary text-white' : 'text-text-tertiary hover:text-accent-primary',
+                  )}
+                >
+                  时间轴
+                </button>
+              </div>
+            )}
+          </div>
+          {viewMode === 'timeline' && hasTimeline ? (
+            <ol className="max-h-60 overflow-auto pr-1 space-y-1.5">
+              {segs.map((seg, i) => (
+                <li key={i} className="flex gap-2 text-sm text-text-secondary leading-relaxed">
+                  <span className="shrink-0 font-mono text-[11px] text-accent-primary/80 pt-0.5 tabular-nums">
+                    {formatClock(seg.start)}
+                  </span>
+                  <span>{seg.text}</span>
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <>
+              <p className="text-sm text-text-secondary whitespace-pre-wrap leading-relaxed">
+                {showAll || !longTranscript ? transcript : `${transcript.slice(0, 600)}…`}
+              </p>
+              {longTranscript && (
+                <button
+                  onClick={() => setShowAll((v) => !v)}
+                  className="mt-1 text-[11px] text-accent-primary hover:underline"
+                >
+                  {showAll ? '收起' : `展开全文（共 ${transcript.length} 字）`}
+                </button>
+              )}
+            </>
           )}
         </div>
       ) : (
@@ -2005,9 +2094,13 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   <>
                     <button
                       onClick={() => void runDownloadVideo(detailPost)}
-                      disabled={videoBusyId === detailPost.id || detailPost.videoStatus === 'downloading'}
+                      disabled={videoBusyId === detailPost.id}
                       className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
-                      title="用已登录的小红书 / 抖音 Chrome 抽出真实视频直链并下载到本地"
+                      title={
+                        detailPost.videoStatus === 'downloading'
+                          ? '当前处于「下载中」：若卡住（如 Chrome 被关闭），点此可强制重新下载'
+                          : '用已登录的小红书 / 抖音 Chrome 抽出真实视频直链并下载到本地'
+                      }
                     >
                       <Download className={clsx('w-3 h-3', videoBusyId === detailPost.id && 'animate-bounce')} />
                       {detailPost.videoStatus === 'done' ? '重新下载' : '下载视频'}
@@ -2043,7 +2136,14 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   </button>
                 )}
                 <button
-                  onClick={() => void openDetail(detailPost, true)}
+                  onClick={async () => {
+                    await openDetail(detailPost, true);
+                    // 视频帖若还没下载完成（含卡在「下载中」/ 失败），重抓正文时一并触发视频下载，
+                    // 避免用户点「重新抓正文」后视频仍不下载的困惑。
+                    if (detailPost.mediaType === 'video' && detailPost.videoStatus !== 'done') {
+                      void runDownloadVideo(detailPost);
+                    }
+                  }}
                   disabled={detailLoading}
                   className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
                 >
