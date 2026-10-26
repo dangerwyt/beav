@@ -84,6 +84,10 @@ fn sidecar_to_main(sidecar: &Path) -> PathBuf {
 ///
 /// 即便传入的不是 WAL 库，附加的 `-wal` / `-shm` / `-journal` 后缀文件本来就不存在，
 /// `remove_file` 静默忽略，安全无副作用。
+///
+/// 目前仅被 legacy_import 的测试路径使用（生产导入只读不删用户源库），
+/// 故非测试构建下为 dead code，显式放行避免污染编译告警。
+#[allow(dead_code)]
 pub fn remove_sqlite_file_with_sidecars(main_path: &Path) {
     let _ = fs::remove_file(main_path);
     let base = main_path.to_string_lossy().to_string();
