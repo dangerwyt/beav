@@ -1539,7 +1539,62 @@ async fn scrape_post_detail_once(
                     mediaType = 'video'; // 抖音详情页是视频平台
                     title = txt('[data-e2e="video-desc"]') || txt('.video-info-detail') || txt('h1');
                     content = title;
-                    author = txt('[data-e2e="author-name"]') || txt('.author-name');
+                    // 作者昵称：**优先级** SSR(author.nickname) → 详情页限定作用域的 DOM → 裸选择器。
+                    // 之前把 `a[href*="/user/"] span` 放进裸候选，会命中外层导航「我的」，导致作者变成「我的」。
+                    // 最后再加导航词护栏，任何「我的/首页/朋友…」一律丢弃。
+                    author = '';
+                    const pickAuthor = (o) => {
+                        if (!o || typeof o !== 'object') return '';
+                        const a = o.author || o.authorInfo || null;
+                        return (a && (a.nickname || a.name)) || o.nickname || o.userName || '';
+                    };
+                    try {
+                        const im = window.__INITIAL_STATE__ && window.__INITIAL_STATE__.itemModule;
+                        if (im) {
+                            const vid = (location.pathname.match(/\/video\/(\d+)/) || [])[1];
+                            // 只按当前视频 id 取；不再 Object.values(im)[0]（会取到推荐位的其他作者）
+                            const it = (vid && im[vid]) || null;
+                            if (it) author = String(pickAuthor(it) || '').trim();
+                        }
+                    } catch (e) {}
+                    if (!author) {
+                        try {
+                            const rd = window._ROUTER_DATA;
+                            const ld = rd && (rd.loaderData || rd.loader_data);
+                            if (ld) {
+                                for (const k in ld) {
+                                    const arr = ld[k] && ld[k].videoInfoRes && ld[k].videoInfoRes.item_list;
+                                    const first = arr && arr[0];
+                                    if (first) { author = String(pickAuthor(first) || '').trim(); if (author) break; }
+                                }
+                            }
+                        } catch (e) {}
+                    }
+                    if (!author) {
+                        author = txt('[data-e2e="author-name"]')
+                            || txt('[data-e2e="video-author-name"]')
+                            || txt('.author-name')
+                            || txt('[data-e2e="user-name"]')
+                            || txt('.account-name');
+                    }
+                    if (!author) {
+                        // 只在「视频信息区」内找作者主页链接，避开侧栏/顶栏导航
+                        const scoped = document.querySelectorAll(
+                            '[data-e2e="video-detail"] a[href*="/user/"] span, '
+                            + '.video-info-detail a[href*="/user/"] span, '
+                            + '[data-e2e="video-info"] a[href*="/user/"] span'
+                        );
+                        for (const el of scoped) {
+                            const t = (el.textContent || '').trim();
+                            if (t) { author = t; break; }
+                        }
+                    }
+                    // 去掉昵称尾部「· 关注」等装饰
+                    if (author) author = author.replace(/[·\s]+$/g, '').trim();
+                    // 导航词护栏：命中即判为误抓，置空（交给上层回退平台名，不落库成垃圾作者）
+                    if (author && /^(我的|我的主页|首页|朋友|关注|推荐|搜索|消息|我|通知|私信|发布|登录|抖音|精选|商城|团购|直播)$/.test(author)) {
+                        author = '';
+                    }
                     // 发布时间：现版抖音 DOM 已不再用 `video-create-time`/`.create-time`（恒空），
                     // 改为多候选 + SSR `createTime` 兜底（见下方 formatDate）。
                     date = txt('[data-e2e="video-publish-time"]') || txt('.video-publish-time')

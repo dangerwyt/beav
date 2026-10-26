@@ -147,6 +147,25 @@ impl Platform {
             Platform::Web => "https://www.google.com",
         }
     }
+
+    /// 中文展示名（UI 标签与「帖子最终产物」目录的一级命名）。
+    pub const fn label(self) -> &'static str {
+        match self {
+            Platform::Xiaohongshu => "小红书",
+            Platform::Douyin => "抖音",
+            Platform::Bilibili => "B站",
+            Platform::Weibo => "微博",
+            Platform::Zhihu => "知乎",
+            Platform::Weixin => "微信",
+            Platform::Youtube => "YouTube",
+            Platform::Kuaishou => "快手",
+            Platform::Tiktok => "TikTok",
+            Platform::Instagram => "Instagram",
+            Platform::Facebook => "脸书",
+            Platform::Twitter => "X",
+            Platform::Web => "网页",
+        }
+    }
 }
 
 impl std::fmt::Display for Platform {

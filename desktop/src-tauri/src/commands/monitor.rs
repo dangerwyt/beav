@@ -9,10 +9,12 @@ use crate::ffmpeg_program;
 use crate::ffprobe_program;
 use crate::workspace_root;
 use crate::platform::Platform;
-use crate::store::types::PostVideoAnalysisRecord;
+use crate::store::types::{MonitoredPostRecord, PostVideoAnalysisRecord};
 use crate::commands::media_transcribe::execute_media_transcribe;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use chrono::{Local, TimeZone, Utc};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::time::interval;
@@ -64,6 +66,12 @@ pub fn handle_monitor_channel(
             "monitor:get-spike-threshold" => get_spike_threshold(state),
             "monitor:deconstruct" => deconstruct(state, payload),
             "monitor:decon-list" => decon_list(state, payload),
+            "monitor:export-post" => export_post_command(state, payload),
+            "monitor:get-export-root" => get_export_root(state),
+            "monitor:set-export-root" => set_export_root(state, payload),
+            "monitor:pick-export-root" => pick_export_root(),
+            "monitor:get-delete-original" => get_delete_original(state),
+            "monitor:set-delete-original" => set_delete_original(state, payload),
             "monitor:download-video" => download_video(app, state, payload),
             "monitor:analyze-video" => analyze_video(app, state, payload),
             "monitor:transcribe-video" => transcribe_video_only(app, state, payload),
@@ -939,6 +947,44 @@ fn fetch_monitor(
     }))
 }
 
+/// 临时抓取（无 watch）时的作者解析。
+///
+/// 优先抓一次帖子详情拿真实昵称（`scrape_post_detail` 的 `author`），失败回退平台中文名。
+/// 目标 URL：输入本身是帖子链接就用它，否则从抓到的 posts 里挑第一条帖子链接。
+fn resolve_adhoc_author(port: u16, url: &str, posts: &[Value], platform: &str) -> String {
+    let looks_like_post = |u: &str| {
+        u.contains("/video/") || u.contains("/note/") || u.contains("/explore/") || u.contains("/item/")
+    };
+    let target = if looks_like_post(url) {
+        Some(url.to_string())
+    } else {
+        posts
+            .iter()
+            .filter_map(|p| p.get("url").and_then(Value::as_str))
+            .map(str::to_string)
+            .find(|u| looks_like_post(u))
+    };
+    if let (Some(target), true) = (target, port > 0) {
+        let detail = tauri::async_runtime::block_on(async {
+            let ws_url = headless_browser::ws_url_for_port(port).await?;
+            headless_browser::scrape_post_detail(&ws_url, &target, platform).await
+        });
+        if let Ok(detail) = detail {
+            if let Some(author) = detail
+                .get("author")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return author.to_string();
+            }
+        }
+    }
+    Platform::parse(platform)
+        .map(|p| p.label().to_string())
+        .unwrap_or_else(|| "未知作者".to_string())
+}
+
 /// 通过已登录的 Chrome（CDP）抓取小红书 / 抖音博主主页，落库到 monitored_posts。
 /// 在 `spawn_blocking` 上下文（见 ipc_invoke）内，使用 `block_on` 驱动异步 CDP 调用是安全的。
 fn fetch_monitor_via_cdp(
@@ -999,9 +1045,12 @@ fn fetch_monitor_via_cdp(
         .cloned()
         .unwrap_or_default();
     let base_host = host_of(url).unwrap_or_default();
-    let author_name = watch
-        .map(|item| item.name.clone())
-        .unwrap_or_else(|| host_of(url).unwrap_or_else(|| "web".to_string()));
+    // 作者解析：绑定了对标博主就用博主名；**临时粘贴单帖（无 watch）不能拿域名当作者**
+    // （会显示成 `www.douyin.com`），改为抓一次帖子详情取真实昵称，失败再回退平台中文名。
+    let author_name = match watch {
+        Some(item) => item.name.clone(),
+        None => resolve_adhoc_author(port, url, &posts, platform),
+    };
     let now = now_i64();
     let mut created: Vec<crate::MonitoredPostRecord> = Vec::new();
     let mut updated: Vec<crate::MonitoredPostRecord> = Vec::new();
@@ -1661,6 +1710,9 @@ fn deconstruct(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
         }
         Ok(json!({ "success": true }))
     })?;
+
+    // 拆解完成后自动导出「帖子最终产物」到知识库目录树
+    export_post_product(state, &post.id);
 
     Ok(json!({ "success": true, "deconstruction": record_value }))
 }
@@ -2552,6 +2604,11 @@ fn analyze_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value) 
         Ok(serde_json::to_value(&rec).unwrap_or_else(|_| json!({})))
     })?;
 
+    // 分析完成后自动导出「帖子最终产物」到知识库目录树
+    export_post_product(state, &id);
+    // 按设置清理原片（仅当转写成功且存在独立预览）
+    maybe_delete_original_after_analysis(state, &id, &transcript_status);
+
     Ok(json!({ "success": true, "analysis": analysis }))
 }
 
@@ -2596,7 +2653,533 @@ fn transcribe_video_only(
         rec.updated_at = now;
         Ok(serde_json::to_value(&*rec).unwrap_or_else(|_| json!({})))
     })?;
+
+    // 转写补齐后自动导出「帖子最终产物」到知识库目录树
+    export_post_product(state, &id);
+    maybe_delete_original_after_analysis(state, &id, &status);
+
     Ok(json!({ "success": true, "analysis": analysis, "status": status }))
+}
+
+/// —— 帖子最终产物导出（5 级目录分类）——
+///
+/// 把一篇帖子的「最终产物」按知识库根目录落盘为物理文件夹树：
+///   知识库根 / 平台(抖音) / 日期(YYYYMMDD) / 作者 / 标题前10字[+帖子ID] / 具体内容文件
+/// 触发：视频帖 `analyze_video` 完成后、转写补齐(`transcribe_video_only`)后、以及
+///       图文/视频帖 `deconstruct` 完成后自动导出；也可经 `monitor:export-post` 手动触发
+///       （便于导出未拆解的图文帖）。
+/// 内容为：原图(`images`)、抽帧图(`frames`)、正文、转写全文、转写时间轴(SRT)、
+///         视频摘要、爆文拆解(六要素 JSON+MD)、帖子信息(JSON 溯源)。
+/// 设计为幂等：重复导出只覆盖/补齐，不会重复造目录；标题前 10 字撞名时追加帖子 ID
+/// （通过 `.beav-post-id` 标记文件识别「自己的」目录，避免重导出时产生孤儿目录）。
+
+/// 中文平台名（知识库一级目录用）。
+fn platform_label(platform: &str) -> String {
+    match Platform::parse(platform) {
+        Some(p) => p.label().to_string(),
+        None => {
+            let s = platform.trim();
+            if s.is_empty() {
+                "未知平台".to_string()
+            } else {
+                sanitize_fs_name(s)
+            }
+        }
+    }
+}
+
+/// 把文件名非法字符（Windows：`\ / : * ? " < > |` 及控制字符）替换为 `_` 并压缩连续下划线。
+fn sanitize_fs_name(s: &str) -> String {
+    const ILLEGAL: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+    let mut out: String = s
+        .chars()
+        .map(|c| {
+            if ILLEGAL.contains(&c) || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    while out.contains("__") {
+        out = out.replace("__", "_");
+    }
+    out.trim().trim_matches('_').to_string()
+}
+
+/// 标题前 `n` 个字符（按 Unicode 字符计）作为四级目录名；空标题回退「未命名」。
+fn title_export_prefix(title: &str, n: usize) -> String {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return "未命名".to_string();
+    }
+    let prefix: String = trimmed.chars().take(n).collect();
+    let sanitized = sanitize_fs_name(&prefix);
+    if sanitized.is_empty() {
+        "未命名".to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// 从文本里抠出第一个形如 `YYYY-MM-DD` / `YYYY/MM/DD` / `YYYYMMDD` 的日期，规范为 `YYYYMMDD`。
+fn first_date_in(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        if chars[i].is_ascii_digit() {
+            // YYYYMMDD
+            if i + 8 <= n && chars[i..i + 8].iter().all(|c| c.is_ascii_digit()) {
+                let s: String = chars[i..i + 8].iter().copied().collect();
+                if let (Ok(y), Ok(m), Ok(d)) = (
+                    s[0..4].parse::<u32>(),
+                    s[4..6].parse::<u32>(),
+                    s[6..8].parse::<u32>(),
+                ) {
+                    if (1..=12).contains(&m) && (1..=31).contains(&d) {
+                        return Some(s);
+                    }
+                }
+            }
+            // YYYY-MM-DD / YYYY/MM/DD
+            if i + 10 <= n {
+                let b: Vec<char> = chars[i..i + 10].iter().copied().collect();
+                if b[4] == '-' || b[4] == '/' {
+                    let y: String = b[0..4].iter().copied().collect();
+                    let m: String = b[5..7].iter().copied().collect();
+                    let d: String = b[8..10].iter().copied().collect();
+                    if let (Ok(yy), Ok(mm), Ok(dd)) =
+                        (y.parse::<u32>(), m.parse::<u32>(), d.parse::<u32>())
+                    {
+                        if (1..=12).contains(&mm) && (1..=31).contains(&dd) {
+                            return Some(format!("{yy:04}{mm:02}{dd:02}"));
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 毫秒时间戳 → 本地时区 `YYYYMMDD`。
+fn millis_to_yyyymmdd(ms: i64) -> Option<String> {
+    let secs = ms / 1000;
+    let dt = match Utc.timestamp_opt(secs, 0) {
+        chrono::LocalResult::Single(dt) => dt,
+        _ => return None,
+    };
+    let local = dt.with_timezone(&Local);
+    Some(local.format("%Y%m%d").to_string())
+}
+
+fn today_yyyymmdd() -> String {
+    Local::now().format("%Y%m%d").to_string()
+}
+
+/// 帖子产物二级目录（日期）：优先用可解析的 `published_at`，否则回退 `created_at`（抓取时间），再否则今天。
+fn export_date_yyyymmdd(post: &MonitoredPostRecord) -> String {
+    if let Some(pa) = post.published_at.as_deref() {
+        if let Some(d) = first_date_in(pa) {
+            return d;
+        }
+        if let Ok(ms) = pa.parse::<i64>() {
+            if let Some(d) = millis_to_yyyymmdd(ms) {
+                return d;
+            }
+        }
+    }
+    if let Ok(ms) = post.created_at.parse::<i64>() {
+        if let Some(d) = millis_to_yyyymmdd(ms) {
+            return d;
+        }
+    }
+    today_yyyymmdd()
+}
+
+/// 在三级目录（作者）下找「自己的」产物目录（依据 `.beav-post-id` 标记）。
+fn find_own_export_dir(l3: &Path, post_id: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(l3).ok()?;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if let Ok(content) = std::fs::read_to_string(p.join(".beav-post-id")) {
+                if content.trim() == post_id {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 仅在目标缺失或大小变化时才拷贝，避免重复导出时反复复制大文件。返回是否真的复制了。
+fn copy_if_changed(src: &Path, dst: &Path) -> bool {
+    if let (Ok(sm), Ok(dm)) = (std::fs::metadata(src), std::fs::metadata(dst)) {
+        if sm.len() == dm.len() {
+            return false;
+        }
+    }
+    match std::fs::copy(src, dst) {
+        Ok(_) => true,
+        Err(e) => {
+            println!(
+                "[monitor] export copy failed {} -> {}: {e}",
+                src.display(),
+                dst.display()
+            );
+            false
+        }
+    }
+}
+
+/// 真实落盘一篇帖子的「最终产物」到 5 级目录树。best-effort：任何失败都只记日志不阻断主流程。
+fn export_post_product(state: &State<'_, AppState>, post_id: &str) {
+    if let Err(e) = try_export_post_product(state, post_id) {
+        println!("[monitor] export_post_product failed for {post_id}: {e}");
+    }
+}
+
+/// 解析「帖子最终产物」的导出根目录（**始终跟随导出根目录**，不再按平台选知识库）。
+///
+/// - `monitor_export_root` 非空且目录存在 → 用它；
+/// - 否则回退 `workspace_root`（保留平台级一级目录）。
+fn resolve_export_target(state: &State<'_, AppState>) -> Result<PathBuf, String> {
+    let export_root = with_store(state, |store| Ok(store.monitor_export_root.clone()))?;
+    let export_root = export_root.trim().to_string();
+    if !export_root.is_empty() {
+        let root = PathBuf::from(&export_root);
+        if root.is_dir() {
+            return Ok(root);
+        }
+        println!("[monitor] monitor_export_root missing: {export_root}, fall back to workspace");
+    }
+    workspace_root(state)
+}
+
+fn try_export_post_product(
+    state: &State<'_, AppState>,
+    post_id: &str,
+) -> Result<(), String> {
+    let post = with_store(state, |store| {
+        Ok(store
+            .monitored_posts
+            .iter()
+            .find(|p| p.id == post_id)
+            .cloned())
+    })?;
+    let post = match post {
+        Some(p) => p,
+        None => return Err("动态不存在".to_string()),
+    };
+    let analysis = with_store(state, |store| {
+        Ok(store
+            .post_video_analyses
+            .iter()
+            .find(|a| a.post_id == post_id)
+            .cloned())
+    })?;
+    let decon = with_store(state, |store| {
+        Ok(store
+            .post_deconstructions
+            .iter()
+            .find(|d| d.post_id == post_id)
+            .cloned())
+    })?;
+
+    // 导出根 → 平台 → 日期 → 作者 → 标题前10字
+    let root = resolve_export_target(state)?;
+    let date = export_date_yyyymmdd(&post);
+    let author = {
+        let a = sanitize_fs_name(&post.author);
+        if a.is_empty() {
+            "未知作者".to_string()
+        } else {
+            a.chars().take(32).collect()
+        }
+    };
+    let l1 = root.join(platform_label(&post.platform));
+    let l2 = l1.join(&date);
+    let l3 = l2.join(&author);
+
+    let title_prefix = title_export_prefix(&post.title, 10);
+    let l4 = match find_own_export_dir(&l3, post_id) {
+        Some(d) => d,
+        None => {
+            let candidate = l3.join(&title_prefix);
+            if candidate.exists() {
+                l3.join(format!("{title_prefix}_{post_id}"))
+            } else {
+                candidate
+            }
+        }
+    };
+    std::fs::create_dir_all(&l4).map_err(|e| format!("创建产物目录失败：{e}"))?;
+    let _ = std::fs::write(l4.join(".beav-post-id"), post_id);
+
+    // 原图
+    for (idx, img) in post.images.iter().enumerate() {
+        let src = Path::new(img);
+        if !src.exists() {
+            continue;
+        }
+        let ext = src
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg")
+            .to_lowercase();
+        let dst = l4.join(format!("图片_{}.{}", idx + 1, ext));
+        copy_if_changed(src, &dst);
+    }
+
+    // 抽帧图 + 视频分析文本
+    if let Some(a) = &analysis {
+        for (idx, fr) in a.frames.iter().enumerate() {
+            let src = Path::new(fr);
+            if !src.exists() {
+                continue;
+            }
+            let ext = src
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("jpg")
+                .to_lowercase();
+            let dst = l4.join(format!("抽帧_{:03}.{}", idx + 1, ext));
+            copy_if_changed(src, &dst);
+        }
+        if !a.transcript.trim().is_empty() {
+            let _ = std::fs::write(l4.join("转写全文.txt"), &a.transcript);
+        }
+        if !a.transcript_srt.trim().is_empty() {
+            let _ = std::fs::write(l4.join("转写时间轴.srt"), &a.transcript_srt);
+        }
+        if !a.summary.trim().is_empty() {
+            let _ = std::fs::write(l4.join("视频摘要.txt"), &a.summary);
+        }
+    }
+
+    // 正文
+    if !post.content.trim().is_empty() {
+        let _ = std::fs::write(l4.join("正文.txt"), &post.content);
+    }
+
+    // 视频本体：只导出一份 `视频.mp4`。
+    // 优先轻量预览（720p/H.264/faststart）；但**预览只在需要转码时才生成**——
+    // H.264 ≤1080p 的原片直接可播，`video_preview_path` 为空，此时回退原片，
+    // 否则这类帖子会导出成「没有视频」。
+    let video_src = post
+        .video_preview_path
+        .as_ref()
+        .filter(|p| Path::new(p).exists())
+        .or(post.video_local_path.as_ref());
+    if let Some(vp) = video_src {
+        let src = Path::new(vp);
+        if src.exists() {
+            let ext = src
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("mp4")
+                .to_lowercase();
+            copy_if_changed(src, &l4.join(format!("视频.{ext}")));
+        }
+    }
+
+    // 爆文拆解（六要素）
+    if let Some(d) = &decon {
+        let json = serde_json::to_string_pretty(d).unwrap_or_default();
+        let _ = std::fs::write(l4.join("爆文拆解.json"), json);
+        let md = format!(
+            "# 爆文拆解 · {}\n\n作者：{}\n\n## 选题角度\n{}\n\n## 文案结构\n{}\n\n## 开场白 / 前3秒钩子\n{}\n\n## 标题句式\n{}\n\n## 金句 / 钩子\n{}\n\n## 可复用方法论\n{}\n\n---\n\n### 拆解所用原文\n{}\n",
+            d.post_title,
+            d.author,
+            d.topic_angle,
+            d.copy_structure,
+            d.opening,
+            d.title_patterns
+                .iter()
+                .map(|s| format!("- {s}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            d.hooks
+                .iter()
+                .map(|s| format!("- {s}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            d.reusable_takeaway,
+            d.raw_content
+        );
+        let _ = std::fs::write(l4.join("爆文拆解.md"), md);
+    }
+
+    // 帖子信息（溯源）
+    let meta = json!({
+        "postId": post.id,
+        "platform": post.platform,
+        "author": post.author,
+        "title": post.title,
+        "postUrl": post.post_url,
+        "mediaType": post.media_type,
+        "publishedAt": post.published_at,
+        "createdAt": post.created_at,
+        "likes": post.likes,
+        "comments": post.comments,
+        "collects": post.collects,
+        "deconstructed": post.deconstructed,
+        "videoLocalPath": post.video_local_path,
+        "videoPreviewPath": post.video_preview_path,
+        "hasVideoAnalysis": analysis.is_some(),
+        "hasDeconstruction": decon.is_some(),
+        "exportedAt": now_i64(),
+    });
+    let _ = std::fs::write(
+        l4.join("帖子信息.json"),
+        serde_json::to_string_pretty(&meta).unwrap_or_default(),
+    );
+
+    println!("[monitor] exported post product -> {}", l4.display());
+    Ok(())
+}
+
+/// 读取全局「导出根目录」（`monitor:get-export-root`）。
+///
+/// 返回 `{ success, root }`；`root` 为空表示跟随工作区根。
+fn get_export_root(state: &State<'_, AppState>) -> Result<Value, String> {
+    with_store(state, |store| {
+        Ok(json!({ "success": true, "root": store.monitor_export_root.clone() }))
+    })
+}
+
+/// 设置全局「导出根目录」（`monitor:set-export-root`）。
+///
+/// 入参：`root`（绝对目录；空串 / null 表示清空、回退工作区根）。
+fn set_export_root(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
+    let root = str_field(payload, "root")
+        .or_else(|| str_field(payload, "dir"))
+        .unwrap_or_default();
+    let root = root.trim().to_string();
+    if !root.is_empty() && !Path::new(&root).is_dir() {
+        return Err(format!("导出根目录不存在：{root}"));
+    }
+    with_store_mut(state, |store| {
+        store.monitor_export_root = root.clone();
+        Ok(json!({ "success": true, "root": root }))
+    })
+}
+
+/// 弹出系统目录选择器，返回所选目录（`monitor:pick-export-root`）。
+fn pick_export_root() -> Result<Value, String> {
+    let selected = crate::pick_files_native("选择监控导出根目录", true, false)?;
+    let path = selected.first().map(|item| item.display().to_string());
+    Ok(json!({
+        "success": path.is_some(),
+        "canceled": path.is_none(),
+        "path": path,
+    }))
+}
+
+/// 「分析成功」后按设置删除 monitor-videos 里的原片（仅保留预览）。
+///
+/// 触发条件（全部满足才删）：
+/// 1. 设置 `monitor_delete_original_after_analysis` 开启；
+/// 2. 转写状态为 `ok`（抽帧此时也已落库）；
+/// 3. **存在独立预览文件**且与原片不是同一路径 —— 否则删掉就没视频了
+///    （H.264 ≤1080p 的帖子不生成预览，直接复用原片播放）。
+///
+/// 删后把 `video_local_path` 与分析的 `local_path` 都改指预览，保证播放与「重新分析」仍可用。
+fn maybe_delete_original_after_analysis(
+    state: &State<'_, AppState>,
+    post_id: &str,
+    transcript_status: &str,
+) {
+    if transcript_status != "ok" {
+        return;
+    }
+    let enabled = with_store(state, |store| Ok(store.monitor_delete_original_after_analysis))
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+    let post = match with_store(state, |store| {
+        Ok(store
+            .monitored_posts
+            .iter()
+            .find(|p| p.id == post_id)
+            .cloned())
+    }) {
+        Ok(Some(p)) => p,
+        _ => return,
+    };
+    let (Some(local), Some(preview)) = (
+        post.video_local_path.clone(),
+        post.video_preview_path.clone(),
+    ) else {
+        return;
+    };
+    if local == preview {
+        return;
+    }
+    let (lp, pp) = (Path::new(&local), Path::new(&preview));
+    if !lp.exists() || !pp.exists() {
+        return;
+    }
+    let preview_size = std::fs::metadata(pp).map(|m| m.len() as i64).unwrap_or(0);
+    match std::fs::remove_file(lp) {
+        Ok(()) => {
+            let _ = with_store_mut(state, |store| {
+                if let Some(slot) = store.monitored_posts.iter_mut().find(|p| p.id == post_id) {
+                    slot.video_local_path = Some(preview.clone());
+                    if preview_size > 0 {
+                        slot.video_size = Some(preview_size);
+                    }
+                    slot.updated_at = now_i64().to_string();
+                }
+                if let Some(rec) = store
+                    .post_video_analyses
+                    .iter_mut()
+                    .find(|a| a.post_id == post_id)
+                {
+                    rec.local_path = preview.clone();
+                    rec.updated_at = now_i64();
+                }
+                Ok(())
+            });
+            println!("[monitor] deleted original video for {post_id}, kept preview: {preview}");
+        }
+        Err(e) => println!("[monitor] delete original video failed for {post_id}: {e}"),
+    }
+}
+
+/// 读取「分析后删除原片」开关（`monitor:get-delete-original`）。
+fn get_delete_original(state: &State<'_, AppState>) -> Result<Value, String> {
+    with_store(state, |store| {
+        Ok(json!({ "success": true, "enabled": store.monitor_delete_original_after_analysis }))
+    })
+}
+
+/// 设置「分析后删除原片」开关（`monitor:set-delete-original`）。
+fn set_delete_original(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
+    let enabled = payload
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "缺少 enabled".to_string())?;
+    with_store_mut(state, |store| {
+        store.monitor_delete_original_after_analysis = enabled;
+        Ok(json!({ "success": true, "enabled": enabled }))
+    })
+}
+
+/// 手动触发单篇帖子产物导出（`monitor:export-post`）。
+fn export_post_command(
+    state: &State<'_, AppState>,
+    payload: &Value,
+) -> Result<Value, String> {
+    let post_id = str_field(payload, "postId")
+        .or_else(|| str_field(payload, "post_id"))
+        .ok_or_else(|| "缺少 postId".to_string())?;
+    export_post_product(state, &post_id);
+    Ok(json!({ "success": true, "postId": post_id }))
 }
 
 /// 读取某帖的视频分析沉淀（字幕 + 抽帧 + 摘要）。

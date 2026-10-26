@@ -224,6 +224,11 @@ pub(crate) fn run_setup_restore_sequence(
     }
     let _ = app.emit("indexing:status", default_indexing_stats());
     let state = app.state::<AppState>();
+    // 用户自选工作目录不在 tauri.conf.json 静态 asset scope 内 → 视频/抽帧图会 404。
+    // 启动时把当前工作区根递归加入白名单（覆盖上次已切换过的自定义目录）。
+    if let Ok(root) = workspace_root(&state) {
+        allow_workspace_in_asset_scope(app.handle(), &root);
+    }
     if let Ok(Some(report)) = logging::create_startup_recovery_report_if_needed(&state) {
         let uploaded = logging::upload_report_if_allowed(&state, &report.id)
             .ok()

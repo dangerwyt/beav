@@ -232,6 +232,34 @@ export function createMonitorBridge(core: BridgeCore) {
           timeoutMs: READ_TIMEOUT_MS,
           fallback: () => ({ success: false, threshold: 3 }) as unknown as T,
         }),
+      // 全局「导出根目录」（与工作区解耦）：空 = 跟随工作区根
+      getExportRoot: <T = { success: boolean; root: string }>() =>
+        core.invokeChannelGuarded<T>('monitor:get-export-root', {}, {
+          timeoutMs: READ_TIMEOUT_MS,
+          fallback: () => ({ success: false, root: '' }) as unknown as T,
+        }),
+      setExportRoot: <T = { success: boolean; root: string }>(root: string) =>
+        core.invokeChannelGuarded<T>('monitor:set-export-root', { root }, {
+          timeoutMs: READ_TIMEOUT_MS,
+          fallback: () => ({ success: false, root }) as unknown as T,
+        }),
+      // 弹系统目录选择器选「导出根目录」
+      pickExportRoot: <T = { success: boolean; canceled?: boolean; path?: string | null }>() =>
+        core.invokeChannelGuarded<T>('monitor:pick-export-root', {}, {
+          timeoutMs: 120_000,
+          fallback: () => ({ success: false, canceled: true }) as unknown as T,
+        }),
+      // 「视频分析成功后删除原片」开关（仅保留预览）
+      getDeleteOriginal: <T = { success: boolean; enabled: boolean }>() =>
+        core.invokeChannelGuarded<T>('monitor:get-delete-original', {}, {
+          timeoutMs: READ_TIMEOUT_MS,
+          fallback: () => ({ success: false, enabled: false }) as unknown as T,
+        }),
+      setDeleteOriginal: <T = { success: boolean; enabled: boolean }>(enabled: boolean) =>
+        core.invokeChannelGuarded<T>('monitor:set-delete-original', { enabled }, {
+          timeoutMs: READ_TIMEOUT_MS,
+          fallback: () => ({ success: false, enabled }) as unknown as T,
+        }),
       // 爆文拆解：把一篇对标帖文案交给 LLM 拆成方法论要素，落库到 post_deconstructions
       deconstruct: <T = { success: boolean; deconstruction?: Record<string, unknown> }>(postId: string) =>
         core.invokeChannelGuarded<T>('monitor:deconstruct', { postId }, {

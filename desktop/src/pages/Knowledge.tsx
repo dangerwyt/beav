@@ -165,6 +165,11 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
     const [isAllTagsDrawerOpen, setIsAllTagsDrawerOpen] = useState(false);
     const [isLoading, setIsLoading] = useState(true);
     const [isVisualIndexEnabled, setIsVisualIndexEnabled] = useState(false);
+    // 全局「导出根目录」（与工作区解耦）；空 = 跟随工作区根
+    const [exportRoot, setExportRoot] = useState('');
+    // 「视频分析成功后删除原片」开关（仅保留预览）
+    const [deleteOriginalAfterAnalysis, setDeleteOriginalAfterAnalysis] = useState(false);
+    const [isExportKbSaving, setIsExportKbSaving] = useState(false);
     const [isVisualIndexSettingLoading, setIsVisualIndexSettingLoading] = useState(true);
     const [isVisualIndexSettingSaving, setIsVisualIndexSettingSaving] = useState(false);
     const [showSubtitle, setShowSubtitle] = useState(false);
@@ -608,6 +613,70 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
             setIsVisualIndexSettingLoading(false);
         }
     }, [isVisualIndexEnabled, isVisualIndexSettingSaving, refreshIndexStatus]);
+
+    // 加载监控导出配置：全局导出根目录
+    useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+            try {
+                const [rootRes, delRes] = await Promise.all([
+                    window.ipcRenderer.monitor.getExportRoot(),
+                    window.ipcRenderer.monitor.getDeleteOriginal(),
+                ]);
+                if (cancelled) return;
+                if (rootRes?.success) setExportRoot(String(rootRes.root || ''));
+                if (delRes?.success) setDeleteOriginalAfterAnalysis(Boolean(delRes.enabled));
+            } catch (error) {
+                console.error('Failed to load monitor export config:', error);
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, []);
+
+    const handlePickExportRoot = useCallback(async () => {
+        setIsExportKbSaving(true);
+        try {
+            const picked = await window.ipcRenderer.monitor.pickExportRoot();
+            if (!picked?.success || !String(picked.path || '').trim()) return;
+            const dir = String(picked.path).trim();
+            const res = await window.ipcRenderer.monitor.setExportRoot(dir);
+            if (res?.success) setExportRoot(dir);
+            else void appAlert('保存导出根目录失败');
+        } catch (error) {
+            console.error('Failed to pick export root:', error);
+            void appAlert('选择导出根目录失败');
+        } finally {
+            setIsExportKbSaving(false);
+        }
+    }, []);
+
+    const handleToggleDeleteOriginal = useCallback(async (next: boolean) => {
+        setDeleteOriginalAfterAnalysis(next);
+        try {
+            const res = await window.ipcRenderer.monitor.setDeleteOriginal(next);
+            if (!res?.success) {
+                setDeleteOriginalAfterAnalysis(!next);
+                void appAlert('保存设置失败');
+            }
+        } catch (error) {
+            console.error('Failed to set delete-original:', error);
+            setDeleteOriginalAfterAnalysis(!next);
+        }
+    }, []);
+
+    const handleClearExportRoot = useCallback(async () => {
+        setIsExportKbSaving(true);
+        try {
+            const res = await window.ipcRenderer.monitor.setExportRoot('');
+            if (res?.success) setExportRoot('');
+        } catch (error) {
+            console.error('Failed to clear export root:', error);
+        } finally {
+            setIsExportKbSaving(false);
+        }
+    }, []);
 
     const applyCatalogPage = useCallback((items: KnowledgeCatalogSummary[], append: boolean) => {
         const { notes: nextNotes, videos: nextVideos, docs: nextDocs } = projectCatalogPage(items);
@@ -2601,6 +2670,65 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
                     <div className="text-center text-text-tertiary text-xs py-16">加载中...</div>
                 ) : (
                     <div className="space-y-4">
+                        {/* 竞品监控「帖子最终产物」按平台导出目标知识库 */}
+                        <div className="rounded-2xl border border-border/70 bg-surface-secondary/50 p-4">
+                            <div className="min-w-0">
+                                <div className="text-[13px] font-extrabold tracking-tight text-text-primary">
+                                    监控导出目标
+                                </div>
+                                <div className="mt-0.5 text-[11px] font-medium text-text-tertiary/80">
+                                    所有平台的产物统一落到「导出根目录 / 平台 / 日期 / 作者 / 标题前10字」；未设置则跟随工作区根
+                                </div>
+                            </div>
+
+                            {/* 全局导出根目录（与工作区解耦） */}
+                            <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-border/60 bg-surface-elevated/60 px-3 py-2">
+                                <span className="shrink-0 text-[12px] font-bold text-text-primary">导出根目录</span>
+                                <span
+                                    className="min-w-0 flex-1 truncate text-[11px] font-medium text-text-tertiary"
+                                    title={exportRoot || '跟随工作区根'}
+                                >
+                                    {exportRoot || '跟随工作区根'}
+                                </span>
+                                <button
+                                    type="button"
+                                    onClick={() => void handlePickExportRoot()}
+                                    disabled={isExportKbSaving}
+                                    className="shrink-0 rounded-lg border border-border px-2.5 py-1 text-[11px] font-bold text-text-primary transition-colors hover:bg-surface-secondary disabled:opacity-50"
+                                >
+                                    选择文件夹
+                                </button>
+                                {exportRoot && (
+                                    <button
+                                        type="button"
+                                        onClick={() => void handleClearExportRoot()}
+                                        disabled={isExportKbSaving}
+                                        className="shrink-0 rounded-lg border border-border px-2.5 py-1 text-[11px] font-bold text-text-tertiary transition-colors hover:bg-surface-secondary disabled:opacity-50"
+                                    >
+                                        恢复默认
+                                    </button>
+                                )}
+                            </div>
+
+                            {/* 存储：分析成功后删除原片 */}
+                            <label className="mt-2 flex cursor-pointer items-start gap-2 rounded-xl border border-border/60 bg-surface-elevated/60 px-3 py-2">
+                                <input
+                                    type="checkbox"
+                                    checked={deleteOriginalAfterAnalysis}
+                                    onChange={(event) => void handleToggleDeleteOriginal(event.target.checked)}
+                                    className="mt-0.5 h-3.5 w-3.5 shrink-0 cursor-pointer accent-[var(--accent-primary)]"
+                                />
+                                <span className="min-w-0">
+                                    <span className="block text-[12px] font-bold text-text-primary">
+                                        分析成功后删除原片
+                                    </span>
+                                    <span className="mt-0.5 block text-[11px] font-medium text-text-tertiary/80">
+                                        仅保留预览（720p）；无独立预览的帖子不删。关闭时原片保留
+                                    </span>
+                                </span>
+                            </label>
+
+                        </div>
                         {filteredKnowledgeItems.length === 0 ? (
                             isKnowledgeLibraryEmpty && !isEmbedded ? (
                                 <div className="mx-auto flex min-h-[360px] max-w-[560px] flex-col items-center justify-center px-4 py-12 text-center">

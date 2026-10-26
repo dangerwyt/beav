@@ -522,6 +522,14 @@ pub(crate) struct AppStore {
     /// 0 / 缺失视为默认 3.0（对齐竞品「互动≥平时3倍」）。
     #[serde(default)]
     pub(crate) monitor_spike_threshold: f64,
+    /// 对标监控「帖子最终产物」的**全局导出根目录**（与工作区解耦）。
+    /// 空 = 跟随工作区根；非空且目录存在 = 导出到 `<该目录>/<平台>/<日期>/<作者>/<标题前10字>`。
+    #[serde(default)]
+    pub(crate) monitor_export_root: String,
+    /// 视频「分析成功」（抽帧已落库且转写 `ok`）后是否删除 monitor-videos 里的原片。
+    /// 默认关；仅在「存在独立预览文件（与原片不同路径）」时才删，删后播放/再分析改用预览。
+    #[serde(default)]
+    pub(crate) monitor_delete_original_after_analysis: bool,
     /// 爆文拆解沉淀库：每篇被拆解的对标帖结构化出的方法论要素（角度/结构/开场白/标题句式/钩子）。
     #[serde(default)]
     pub(crate) post_deconstructions: Vec<PostDeconstructionRecord>,

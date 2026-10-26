@@ -5,7 +5,7 @@ use crate::{
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 const CURRENT_WORKSPACE_DIR_NAME: &str = ".beav";
 const LEGACY_REDBOX_WORKSPACE_DIR_NAME: &str = ".redbox";
@@ -149,6 +149,22 @@ pub(crate) fn workspace_root(state: &State<'_, AppState>) -> Result<PathBuf, Str
     })?;
     let root = update_workspace_root_cache(state, &settings_snapshot, &active_space_id)?;
     Ok(root)
+}
+
+/// 把工作区根递归加入 asset 协议白名单。
+///
+/// `tauri.conf.json` 的 `assetProtocol.scope` 是**静态**白名单（只含 `~/.beav` 等固定目录）。
+/// 用户通过左下角文件夹选择器把工作区换到任意目录（如 `D:\beav_workspace`）后，
+/// 该目录不在白名单 → 视频 / 抽帧图的 `asset://` / `convertFileSrc` 全部 404。
+/// 这里在启动与切换目录时动态放行，避免媒体预览失效。
+pub(crate) fn allow_workspace_in_asset_scope(app: &AppHandle, root: &Path) {
+    match app.asset_protocol_scope().allow_directory(root, true) {
+        Ok(()) => {}
+        Err(error) => eprintln!(
+            "[workspace] allow asset dir {} failed: {error}",
+            root.display()
+        ),
+    }
 }
 
 pub(crate) fn ensure_workspace_dirs(root: &Path) -> Result<(), String> {

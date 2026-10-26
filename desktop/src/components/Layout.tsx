@@ -319,6 +319,61 @@ export function Layout({ children, currentView, onNavigate, immersiveMode = fals
     canCreateSpace: true,
     openMembershipModal: () => setFounderSponsorOpen(true),
   });
+
+  // —— 工作目录（文件夹选择器，替换原「默认空间」下拉）——
+  // 点击即弹系统目录选择；选完后工作区根 == 所选目录（切到 default 空间，不带 spaces/<id> 后缀）。
+  const [workspaceFolder, setWorkspaceFolder] = useState('');
+  const [isPickingWorkspaceFolder, setIsPickingWorkspaceFolder] = useState(false);
+  const workspaceFolderLabel = useMemo(() => {
+    const trimmed = workspaceFolder.replace(/[\\/]+$/, '');
+    if (!trimmed) return '';
+    const parts = trimmed.split(/[\\/]/);
+    return parts[parts.length - 1] || trimmed;
+  }, [workspaceFolder]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const settings = await window.ipcRenderer.getSettings();
+        const dir = String(settings?.workspace_dir || '').trim();
+        if (!cancelled && dir) setWorkspaceFolder(dir);
+      } catch (error) {
+        console.error('Failed to read workspace_dir:', error);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handlePickWorkspaceFolder = useCallback(async () => {
+    if (isPickingWorkspaceFolder) return;
+    setIsPickingWorkspaceFolder(true);
+    try {
+      const picked = await window.ipcRenderer.pickWorkspaceDir();
+      if (!picked?.success || !String(picked.path || '').trim()) {
+        if (!picked?.canceled && picked?.error) {
+          console.error('选择工作目录失败:', picked.error);
+        }
+        return;
+      }
+      const dir = String(picked.path).trim();
+      // 先切到 default 空间，使工作区根精确等于所选目录；再写入 workspace_dir（saveSettings 内部会刷新根缓存并重新 hydrate）。
+      try {
+        await window.ipcRenderer.spaces.switch('default');
+      } catch (error) {
+        console.error('切换到默认空间失败:', error);
+      }
+      await window.ipcRenderer.saveSettings({ workspace_dir: dir });
+      setWorkspaceFolder(dir);
+    } catch (error) {
+      console.error('Failed to pick workspace folder:', error);
+    } finally {
+      setIsPickingWorkspaceFolder(false);
+    }
+  }, [isPickingWorkspaceFolder]);
+
   const visibleGlobalSidebarContent = !sidebarVisualCollapsed ? globalSidebarContent : null;
   const {
     updateNotice,
@@ -546,102 +601,22 @@ export function Layout({ children, currentView, onNavigate, immersiveMode = fals
                   </button>
                 </>
               )}
-              <div ref={spaceMenuRef} className="relative min-w-0">
+              <div className="relative min-w-0">
                 <button
                   type="button"
-                  onClick={() => setIsSpaceMenuOpen((prev) => !prev)}
-                  disabled={isSwitchingSpace}
-                  className="h-7 w-[118px] px-2.5 text-[12px] flex items-center justify-between gap-1 rounded-lg border border-border bg-surface-primary text-text-primary disabled:opacity-50"
+                  onClick={() => void handlePickWorkspaceFolder()}
+                  disabled={isPickingWorkspaceFolder}
+                  className="h-7 max-w-[160px] px-2.5 text-[12px] flex items-center justify-between gap-1 rounded-lg border border-border bg-surface-primary text-text-primary hover:bg-surface-secondary transition-colors disabled:opacity-50"
+                  title={workspaceFolder || t('settings.general.workspaceRoot')}
                 >
-                  <span className="min-w-0 truncate">{activeSpaceName}</span>
-                  <ChevronDown className={clsx('w-[13px] h-[13px] shrink-0 text-text-tertiary transition-transform', isSpaceMenuOpen && 'rotate-180')} strokeWidth={1.75} />
+                  <span className="inline-flex min-w-0 items-center gap-1.5">
+                    <Folder className="w-[13px] h-[13px] shrink-0 text-text-tertiary" strokeWidth={1.75} />
+                    <span className="min-w-0 truncate">
+                      {isPickingWorkspaceFolder ? '选择中…' : (workspaceFolderLabel || t('settings.general.pickFolder'))}
+                    </span>
+                  </span>
+                  <Pencil className="w-[11px] h-[11px] shrink-0 text-text-tertiary" strokeWidth={1.75} />
                 </button>
-
-                {isSpaceMenuOpen && (
-                  <div
-                    className="app-space-menu absolute right-0 bottom-full z-[1] mb-1.5 w-[172px] overflow-hidden rounded-lg border border-border shadow-lg"
-                  >
-                    <div className="max-h-44 overflow-y-auto">
-                      {spaces.length === 0 ? (
-                        <div className="h-9 px-2.5 text-[12px] text-text-tertiary flex items-center">
-                          {t('layout.noSpace')}
-                        </div>
-                      ) : (
-                        spaces.map((space) => {
-                          const isActive = space.id === activeSpaceId;
-                          const showEdit = hoveredSpaceId === space.id;
-                          const canDelete = space.id !== 'default';
-                          const isDeleting = deletingSpaceId === space.id;
-                          return (
-                            <div
-                              key={space.id}
-                              className={clsx(
-                                'h-9 px-2.5 flex items-center gap-1.5',
-                                isActive ? 'bg-accent-primary/10' : 'hover:bg-surface-secondary'
-                              )}
-                              onMouseEnter={() => setHoveredSpaceId(space.id)}
-                              onMouseLeave={() => setHoveredSpaceId((prev) => (prev === space.id ? null : prev))}
-                            >
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  void handleSwitchSpace(space.id);
-                                }}
-                                className={clsx('flex-1 text-left text-[12px] truncate', isActive ? 'text-accent-primary' : 'text-text-primary')}
-                              >
-                                {space.name}
-                              </button>
-                              <button
-                                type="button"
-                                onMouseDown={(event) => {
-                                  event.preventDefault();
-                                  event.stopPropagation();
-                                  openRenameSpaceDialog(space);
-                                }}
-                                className={clsx(
-                                  'w-5 h-5 inline-flex items-center justify-center rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-primary transition-opacity',
-                                  showEdit ? 'opacity-100' : 'opacity-0 pointer-events-none'
-                                )}
-                                title={t('layout.renameSpace')}
-                              >
-                                <Pencil className="w-[12px] h-[12px]" strokeWidth={1.75} />
-                              </button>
-                              {canDelete && (
-                                <button
-                                  type="button"
-                                  disabled={isDeleting}
-                                  onMouseDown={(event) => {
-                                    event.preventDefault();
-                                    event.stopPropagation();
-                                    void handleDeleteSpace(space);
-                                  }}
-                                  className={clsx(
-                                    'w-5 h-5 inline-flex items-center justify-center rounded-md text-text-secondary hover:text-red-500 hover:bg-surface-primary disabled:opacity-50 transition-opacity',
-                                    showEdit ? 'opacity-100' : 'opacity-0 pointer-events-none'
-                                  )}
-                                  title={t('layout.deleteSpace')}
-                                >
-                                  <Trash2 className="w-[12px] h-[12px]" strokeWidth={1.75} />
-                                </button>
-                              )}
-                            </div>
-                          );
-                        })
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        openCreateSpaceDialog();
-                      }}
-                      className="h-9 w-full border-t border-border px-2.5 text-[12px] text-accent-primary hover:bg-surface-secondary flex items-center gap-1.5"
-                    >
-                      <span className="text-[15px] leading-none">+</span>
-                      <span className="truncate">{t('layout.createSpace')}</span>
-                    </button>
-
-                  </div>
-                )}
               </div>
             </div>
           </div>

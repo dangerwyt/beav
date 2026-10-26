@@ -384,6 +384,8 @@ pub(super) fn save_settings(
         "settings-model-defaults-repair",
     );
     let workspace_root = update_workspace_root_cache(state, &settings_snapshot, &active_space_id)?;
+    // 切换工作目录后立即放行 asset 协议（否则新目录下的视频/抽帧图 404）
+    crate::allow_workspace_in_asset_scope(app, &workspace_root);
     let workspace_changed = previous_workspace_root
         .as_ref()
         .map(|previous| !is_same_path(previous, &workspace_root))
