@@ -2738,6 +2738,8 @@ fn recover_stuck_downloading(state: &State<'_, AppState>) -> Result<i64, String>
 pub fn run_daily_prefetch(app: AppHandle) -> Result<Value, String> {
     let state = app.state::<AppState>();
     let now = crate::now_i64();
+    // 顺手清理上轮残留的孤儿 SQLite WAL/回滚副文件（贴合「每日」节奏，保证垃圾不积累）。
+    let _ = crate::sqlite_cleanup::cleanup_orphaned_sqlite_sidecars(&app);
     let mut stats = MonitorFetchStats::default();
 
     // 先回收上次残留的僵尸 downloading 状态，否则那批视频永远不会被自动重试

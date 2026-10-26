@@ -1615,7 +1615,7 @@ mod tests {
         }
 
         let rows = legacy_settings_rows(&db_path).expect("legacy settings should import");
-        let _ = fs::remove_file(&db_path);
+        let _ = crate::sqlite_cleanup::remove_sqlite_file_with_sidecars(&db_path);
 
         let first = rows.first().expect("settings row should be returned");
         assert_eq!(
@@ -1660,7 +1660,7 @@ mod tests {
         }
 
         let rows = legacy_archive_samples_rows(&db_path).expect("archive samples should import");
-        let _ = fs::remove_file(&db_path);
+        let _ = crate::sqlite_cleanup::remove_sqlite_file_with_sidecars(&db_path);
 
         let first = rows.first().expect("archive sample row should be returned");
         assert_eq!(
@@ -1715,7 +1715,7 @@ mod tests {
         let mut store = default_store();
         import_legacy_store_from_db(&mut store, &store_path, &db_path)
             .expect("partial legacy db should import");
-        let _ = fs::remove_file(&db_path);
+        let _ = crate::sqlite_cleanup::remove_sqlite_file_with_sidecars(&db_path);
         let _ = fs::remove_dir_all(&workspace_dir);
         if let Some(parent) = store_path.parent() {
             let _ = fs::remove_dir_all(parent);
@@ -1788,7 +1788,7 @@ mod tests {
         let mut store = default_store();
         import_legacy_store_from_db(&mut store, &store_path, &db_path)
             .expect("partial schemas should not abort legacy import");
-        let _ = fs::remove_file(&db_path);
+        let _ = crate::sqlite_cleanup::remove_sqlite_file_with_sidecars(&db_path);
         let _ = fs::remove_dir_all(&workspace_dir);
         if let Some(parent) = store_path.parent() {
             let _ = fs::remove_dir_all(parent);

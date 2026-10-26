@@ -390,6 +390,8 @@ fn run_official_auth_bootstrap_once(app: AppHandle) {
 }
 
 fn run_startup_background_housekeeping(app: AppHandle) {
+    // 启动即清理上轮残留的孤儿 SQLite WAL/回滚副文件（主库已被删、但 -wal/-shm 还在的垃圾）。
+    let _ = sqlite_cleanup::cleanup_orphaned_sqlite_sidecars(&app);
     tauri::async_runtime::spawn(async move {
         let bootstrap_app = app.clone();
         let _ = tauri::async_runtime::spawn_blocking(move || {

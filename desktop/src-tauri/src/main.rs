@@ -39,6 +39,7 @@ mod manuscript_package;
 mod mcp;
 mod media_generation;
 mod media_runtime;
+mod sqlite_cleanup;
 mod media_task_context;
 mod member_skill;
 mod membership;
