@@ -40,6 +40,10 @@ export interface AppUpdateInstallState {
 
 const UPDATE_NOTICE_SHOWN_VERSION_STORAGE_KEY = 'redbox:update-notice-shown-version:v1';
 
+// 是否启用启动时的自动更新检查与弹窗。设为 false 后应用不再在启动时自动弹出更新提示，
+// 但仍保留通过「查看更新日志」手动触发（SHOW_CURRENT_RELEASE_NOTES_EVENT）的能力。
+const AUTO_UPDATE_NOTICE_ENABLED = false;
+
 const initialInstallState: AppUpdateInstallState = {
   status: 'idle',
   version: '',
@@ -110,6 +114,7 @@ export function useAppUpdateNotice(openDownloadFailedLabel: string) {
       setInstallState(initialInstallState);
     };
     const updateCheckTimer = window.setTimeout(() => {
+      if (!AUTO_UPDATE_NOTICE_ENABLED) return;
       void window.ipcRenderer.checkAppUpdate(false).then((result) => {
         if (result?.hasUpdate && result.notice) {
           if (!shouldShowAppUpdateNotice(result.notice)) return;
@@ -120,7 +125,9 @@ export function useAppUpdateNotice(openDownloadFailedLabel: string) {
         console.warn('[AppUpdate] check failed:', error);
       });
     }, 1800);
-    const unsubscribeAppUpdateAvailable = subscribeAppUpdateAvailable(handleUpdateNotice);
+    const unsubscribeAppUpdateAvailable = AUTO_UPDATE_NOTICE_ENABLED
+      ? subscribeAppUpdateAvailable(handleUpdateNotice)
+      : () => {};
     const unsubscribeAppUpdateInstallProgress = subscribeAppUpdateInstallProgress(handleInstallProgress);
     window.addEventListener(SHOW_CURRENT_RELEASE_NOTES_EVENT, handleCurrentReleaseNotes);
     return () => {
