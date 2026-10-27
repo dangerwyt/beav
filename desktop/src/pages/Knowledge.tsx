@@ -167,8 +167,6 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
     const [isVisualIndexEnabled, setIsVisualIndexEnabled] = useState(false);
     // 全局「导出根目录」（与工作区解耦）；空 = 跟随工作区根
     const [exportRoot, setExportRoot] = useState('');
-    // 可选「Obsidian 资料库路径」：导出时在该库内生成聚合笔记
-    const [obsidianVault, setObsidianVault] = useState('');
     const [isExportKbSaving, setIsExportKbSaving] = useState(false);
     const [isVisualIndexSettingLoading, setIsVisualIndexSettingLoading] = useState(true);
     const [isVisualIndexSettingSaving, setIsVisualIndexSettingSaving] = useState(false);
@@ -619,13 +617,9 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
         let cancelled = false;
         void (async () => {
             try {
-                const [rootRes, vaultRes] = await Promise.all([
-                    window.ipcRenderer.monitor.getExportRoot(),
-                    window.ipcRenderer.monitor.getObsidianVault(),
-                ]);
+                const rootRes = await window.ipcRenderer.monitor.getExportRoot();
                 if (cancelled) return;
                 if (rootRes?.success) setExportRoot(String(rootRes.root || ''));
-                if (vaultRes?.success) setObsidianVault(String(vaultRes.vault || ''));
             } catch (error) {
                 console.error('Failed to load monitor export config:', error);
             }
@@ -647,37 +641,6 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
         } catch (error) {
             console.error('Failed to pick export root:', error);
             void appAlert('选择导出根目录失败');
-        } finally {
-            setIsExportKbSaving(false);
-        }
-    }, []);
-
-    const handlePickObsidianVault = useCallback(async () => {
-        setIsExportKbSaving(true);
-        try {
-            const picked = await window.ipcRenderer.monitor.pickObsidianVault();
-            if (!picked?.success || !String(picked.path || '').trim()) return;
-            const dir = String(picked.path).trim();
-            const res = await window.ipcRenderer.monitor.setObsidianVault(dir);
-            if (res?.success) setObsidianVault(dir);
-            else void appAlert('保存 Obsidian 资料库路径失败');
-        } catch (error) {
-            console.error('Failed to pick obsidian vault:', error);
-            void appAlert('选择 Obsidian 资料库失败');
-        } finally {
-            setIsExportKbSaving(false);
-        }
-    }, []);
-
-    const handleClearObsidianVault = useCallback(async () => {
-        setIsExportKbSaving(true);
-        try {
-            const res = await window.ipcRenderer.monitor.setObsidianVault('');
-            if (res?.success) setObsidianVault('');
-            else void appAlert('清除 Obsidian 资料库路径失败');
-        } catch (error) {
-            console.error('Failed to clear obsidian vault:', error);
-            void appAlert('清除 Obsidian 资料库路径失败');
         } finally {
             setIsExportKbSaving(false);
         }
@@ -2726,45 +2689,6 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
                                     </button>
                                 )}
                             </div>
-
-                            {/* 存储：分析后自动删除原片（固定行为，不提供开关） */}
-                            <div className="mt-2 rounded-xl border border-border/60 bg-surface-elevated/60 px-3 py-2">
-                                <span className="block text-[12px] font-bold text-text-primary">
-                                    分析完成后自动删除原片
-                                </span>
-                                <span className="mt-0.5 block text-[11px] font-medium text-text-tertiary/80">
-                                    仅保留预览（720p）；无独立预览的帖子保留原片
-                                </span>
-                            </div>
-
-                        {/* 可选：Obsidian 资料库路径（导出时生成聚合笔记） */}
-                        <div className="mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-border/60 bg-surface-elevated/60 px-3 py-2">
-                            <span className="shrink-0 text-[12px] font-bold text-text-primary">Obsidian 资料库</span>
-                            <span
-                                className="min-w-0 flex-1 truncate text-[11px] font-medium text-text-tertiary"
-                                title={obsidianVault || '未设置（导出只生成可移植笔记，拖进 vault 即关联）'}
-                            >
-                                {obsidianVault || '未设置（导出只生成可移植笔记，拖进 vault 即关联）'}
-                            </span>
-                            <button
-                                type="button"
-                                onClick={() => void handlePickObsidianVault()}
-                                disabled={isExportKbSaving}
-                                className="shrink-0 rounded-lg border border-border px-2.5 py-1 text-[11px] font-bold text-text-primary transition-colors hover:bg-surface-secondary disabled:opacity-50"
-                            >
-                                选择文件夹
-                            </button>
-                            {obsidianVault && (
-                                <button
-                                    type="button"
-                                    onClick={() => void handleClearObsidianVault()}
-                                    disabled={isExportKbSaving}
-                                    className="shrink-0 rounded-lg border border-border px-2.5 py-1 text-[11px] font-bold text-text-tertiary transition-colors hover:bg-surface-secondary disabled:opacity-50"
-                                >
-                                    清除
-                                </button>
-                            )}
-                        </div>
 
                         </div>
                         {filteredKnowledgeItems.length === 0 ? (
