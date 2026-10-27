@@ -167,8 +167,6 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
     const [isVisualIndexEnabled, setIsVisualIndexEnabled] = useState(false);
     // 全局「导出根目录」（与工作区解耦）；空 = 跟随工作区根
     const [exportRoot, setExportRoot] = useState('');
-    // 「视频分析成功后删除原片」开关（仅保留预览）
-    const [deleteOriginalAfterAnalysis, setDeleteOriginalAfterAnalysis] = useState(false);
     // 可选「Obsidian 资料库路径」：导出时在该库内生成聚合笔记
     const [obsidianVault, setObsidianVault] = useState('');
     const [isExportKbSaving, setIsExportKbSaving] = useState(false);
@@ -621,14 +619,12 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
         let cancelled = false;
         void (async () => {
             try {
-                const [rootRes, delRes, vaultRes] = await Promise.all([
+                const [rootRes, vaultRes] = await Promise.all([
                     window.ipcRenderer.monitor.getExportRoot(),
-                    window.ipcRenderer.monitor.getDeleteOriginal(),
                     window.ipcRenderer.monitor.getObsidianVault(),
                 ]);
                 if (cancelled) return;
                 if (rootRes?.success) setExportRoot(String(rootRes.root || ''));
-                if (delRes?.success) setDeleteOriginalAfterAnalysis(Boolean(delRes.enabled));
                 if (vaultRes?.success) setObsidianVault(String(vaultRes.vault || ''));
             } catch (error) {
                 console.error('Failed to load monitor export config:', error);
@@ -653,20 +649,6 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
             void appAlert('选择导出根目录失败');
         } finally {
             setIsExportKbSaving(false);
-        }
-    }, []);
-
-    const handleToggleDeleteOriginal = useCallback(async (next: boolean) => {
-        setDeleteOriginalAfterAnalysis(next);
-        try {
-            const res = await window.ipcRenderer.monitor.setDeleteOriginal(next);
-            if (!res?.success) {
-                setDeleteOriginalAfterAnalysis(!next);
-                void appAlert('保存设置失败');
-            }
-        } catch (error) {
-            console.error('Failed to set delete-original:', error);
-            setDeleteOriginalAfterAnalysis(!next);
         }
     }, []);
 
@@ -2745,23 +2727,15 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
                                 )}
                             </div>
 
-                            {/* 存储：分析成功后删除原片 */}
-                            <label className="mt-2 flex cursor-pointer items-start gap-2 rounded-xl border border-border/60 bg-surface-elevated/60 px-3 py-2">
-                                <input
-                                    type="checkbox"
-                                    checked={deleteOriginalAfterAnalysis}
-                                    onChange={(event) => void handleToggleDeleteOriginal(event.target.checked)}
-                                    className="mt-0.5 h-3.5 w-3.5 shrink-0 cursor-pointer accent-[var(--accent-primary)]"
-                                />
-                                <span className="min-w-0">
-                                    <span className="block text-[12px] font-bold text-text-primary">
-                                        分析成功后删除原片
-                                    </span>
-                                <span className="mt-0.5 block text-[11px] font-medium text-text-tertiary/80">
-                                    仅保留预览（720p）；无独立预览的帖子不删。关闭时原片保留
+                            {/* 存储：分析后自动删除原片（固定行为，不提供开关） */}
+                            <div className="mt-2 rounded-xl border border-border/60 bg-surface-elevated/60 px-3 py-2">
+                                <span className="block text-[12px] font-bold text-text-primary">
+                                    分析完成后自动删除原片
                                 </span>
-                            </span>
-                        </label>
+                                <span className="mt-0.5 block text-[11px] font-medium text-text-tertiary/80">
+                                    仅保留预览（720p）；无独立预览的帖子保留原片
+                                </span>
+                            </div>
 
                         {/* 可选：Obsidian 资料库路径（导出时生成聚合笔记） */}
                         <div className="mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-border/60 bg-surface-elevated/60 px-3 py-2">

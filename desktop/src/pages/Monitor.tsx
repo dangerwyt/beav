@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Radar, Plus, RefreshCw, Trash2, ExternalLink, Zap, Sparkles, Check, X, Eye, Loader2, Link2, Lock, LogOut, ChevronDown, ChevronLeft, ChevronRight, FlaskConical, BookOpen, Copy, Download, Video, Film, History, AudioLines } from 'lucide-react';
+import { createPortal } from 'react-dom';
 import { clsx } from 'clsx';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { MonitorChromeStatus, MonitorChromeLaunchResult, MonitorChromeTestResult } from '../bridge/domains/monitorBridge';
@@ -460,6 +461,9 @@ function VideoAnalysisPanel({ analysis }: { analysis: PostVideoAnalysis }) {
  * 本地视频播放器：优先播 720p/H.264 轻量代理（WebView 对 4K/HEVC 原片往往放不出来）；
  * 代理缺失时从原片路径派生 `<id>.preview.mp4` 试探（已下载的原片可能已有代理）；
  * 派生也 404 → onError 回退到原片（H.264 ≤1080p + faststart 在 asset 协议下可播）。
+ *
+ * 提示只在**回退原片后仍播放失败**时出现：H.264 ≤1080p 的原片本就不生成代理，
+ * 若按「有没有代理路径」判断会误报成「旧版本下载」。
  */
 function VideoPlayerWithFallback({
   localPath,
@@ -474,11 +478,22 @@ function VideoPlayerWithFallback({
       : null);
   const [src, setSrc] = useState<string | null>(derivedPreview);
   const [triedFallback, setTriedFallback] = useState(false);
+  const [playbackFailed, setPlaybackFailed] = useState(false);
+
+  // 详情弹窗内是同一个组件实例，切换帖子时必须重置播放状态
+  useEffect(() => {
+    setSrc(derivedPreview);
+    setTriedFallback(false);
+    setPlaybackFailed(false);
+  }, [derivedPreview, localPath]);
+
   const onError = () => {
     if (!triedFallback && src && src !== localPath) {
       setTriedFallback(true);
       setSrc(localPath);
+      return;
     }
+    setPlaybackFailed(true);
   };
   if (!src) return null;
   return (
@@ -491,9 +506,9 @@ function VideoPlayerWithFallback({
         onError={onError}
         className="w-full max-h-80 rounded-lg border border-border bg-black"
       />
-      {!previewPath && (
+      {playbackFailed && (
         <p className="text-[11px] text-amber-600 dark:text-amber-400">
-          该视频为旧版本下载（无轻量代理文件），正在尝试本地代理；若内置播放器仍放不出，可点「重新下载」生成可播放版，或用系统播放器打开原片。
+          内置播放器无法播放该视频（多为 4K / HEVC 等 WebView 不支持的编码）。可点「重新下载」生成 720p 可播放版，或用系统播放器打开原片。
         </p>
       )}
     </>
@@ -2181,19 +2196,26 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
         </div>
       )}
 
-      {/* 大图预览 —— 点缩略图打开：背景关闭 / ESC / 左右切换，多图显示「当前/总数」 */}
-      {lightboxIndex !== null && detailImages[lightboxIndex] && (
+      {/* 大图预览 —— 点缩略图打开：背景关闭 / ESC / 左右切换，多图显示「当前/总数」
+          Portal 到 body：`.app-main-shell--layered` 带 `isolation:isolate; z-index:1`，
+          会把页面内任何 z-index 封在 z=1 的上下文里，压不住根级 z-70 的标题栏
+          （表现为预览期间仍能点到窗口「关闭」按钮）。 */}
+      {lightboxIndex !== null && detailImages[lightboxIndex] && createPortal(
         <div
-          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-sm"
+          className="fixed inset-0 z-[80] flex items-center justify-center bg-black/90 backdrop-blur-sm"
           onClick={() => setLightboxIndex(null)}
         >
+          {/* 关闭按钮下移到标题栏之下：避免与窗口右上角的「关闭程序」按钮重叠误触 */}
           <button
             type="button"
-            onClick={() => setLightboxIndex(null)}
-            className="absolute top-4 right-4 text-white/80 hover:text-white transition-colors"
-            title="关闭"
+            onClick={(e) => {
+              e.stopPropagation();
+              setLightboxIndex(null);
+            }}
+            className="absolute right-3 top-[calc(var(--app-titlebar-height)+0.5rem)] flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-white/85 transition-colors hover:bg-white/20 hover:text-white"
+            title="关闭预览（ESC）"
           >
-            <X className="w-6 h-6" />
+            <X className="w-5 h-5" />
           </button>
           {detailImages.length > 1 && (
             <button
@@ -2232,7 +2254,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               {lightboxIndex + 1} / {detailImages.length}
             </span>
           )}
-        </div>
+        </div>,
+        document.body,
       )}
 
       {/* 方法论库 —— 已沉淀的爆文拆解列表，可按作者 / 平台过滤，点开看六要素，一键加入选题 */}

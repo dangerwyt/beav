@@ -249,17 +249,6 @@ export function createMonitorBridge(core: BridgeCore) {
           timeoutMs: 120_000,
           fallback: () => ({ success: false, canceled: true }) as unknown as T,
         }),
-      // 「视频分析成功后删除原片」开关（仅保留预览）
-      getDeleteOriginal: <T = { success: boolean; enabled: boolean }>() =>
-        core.invokeChannelGuarded<T>('monitor:get-delete-original', {}, {
-          timeoutMs: READ_TIMEOUT_MS,
-          fallback: () => ({ success: false, enabled: false }) as unknown as T,
-        }),
-      setDeleteOriginal: <T = { success: boolean; enabled: boolean }>(enabled: boolean) =>
-        core.invokeChannelGuarded<T>('monitor:set-delete-original', { enabled }, {
-          timeoutMs: READ_TIMEOUT_MS,
-          fallback: () => ({ success: false, enabled }) as unknown as T,
-        }),
       // Obsidian 资料库路径（可选）：导出时在该库内生成聚合笔记
       getObsidianVault: <T = { success: boolean; vault: string }>() =>
         core.invokeChannelGuarded<T>('monitor:get-obsidian-vault', {}, {

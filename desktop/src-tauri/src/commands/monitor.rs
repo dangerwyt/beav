@@ -73,8 +73,6 @@ pub fn handle_monitor_channel(
             "monitor:get-obsidian-vault" => get_obsidian_vault(state),
             "monitor:set-obsidian-vault" => set_obsidian_vault(state, payload),
             "monitor:pick-obsidian-vault" => pick_obsidian_vault(),
-            "monitor:get-delete-original" => get_delete_original(state),
-            "monitor:set-delete-original" => set_delete_original(state, payload),
             "monitor:download-video" => download_video(app, state, payload),
             "monitor:analyze-video" => analyze_video(app, state, payload),
             "monitor:transcribe-video" => transcribe_video_only(app, state, payload),
@@ -2609,8 +2607,8 @@ fn analyze_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value) 
 
     // 分析完成后自动导出「帖子最终产物」到知识库目录树
     export_post_product(state, &id);
-    // 按设置清理原片（仅当转写成功且存在独立预览）
-    maybe_delete_original_after_analysis(state, &id, &transcript_status);
+    // 清理原片，仅保留预览（存在独立预览时才删）
+    delete_original_after_analysis(state, &id);
 
     Ok(json!({ "success": true, "analysis": analysis }))
 }
@@ -2659,7 +2657,7 @@ fn transcribe_video_only(
 
     // 转写补齐后自动导出「帖子最终产物」到知识库目录树
     export_post_product(state, &id);
-    maybe_delete_original_after_analysis(state, &id, &status);
+    delete_original_after_analysis(state, &id);
 
     Ok(json!({ "success": true, "analysis": analysis, "status": status }))
 }
@@ -2861,14 +2859,58 @@ fn resolve_export_target(state: &State<'_, AppState>) -> Result<PathBuf, String>
     workspace_root(state)
 }
 
-/// 生成 Obsidian 聚合笔记（「知识卡」）：用 `![[内联嵌入]]` / `[[wikilink]]` 把本帖所有产物聚成一张笔记。
+/// 拆出标题尾部的 hashtag（抖音标题常把话题直接贴在末尾，如 `…决策者#财务 #cfo`）。
 ///
-/// - 始终在产物目录 `l4` 写 `Beav知识卡.md`，引用用**同目录 basename**（如 `![[转写全文]]`），
-///   因此该笔记可移植：一旦 `l4` 落在某个 Obsidian 资料库内，Obsidian 即自动索引并产生图谱边。
-/// - 若配置了 `monitor_obsidian_vault` 且产物目录在其内：额外在库内
-///   `<vault>/Beav导出/<l4 相对导出根的路径>/Beav知识卡.md` 再写一份，引用用**vault 相对路径**，
-///   这样即便笔记放在库内的独立 hub 目录，也能正确链接到产物。
-/// - 若配置了 vault 但产物目录不在其内：给出告警（Obsidian 无法解析库外文件）。
+/// 返回（清洗后标题, 标签列表）。只有末尾形如 `#token`（token 内无空白）才会被剥离，
+/// 因此不会误伤正文中出现的 `#`。
+fn split_title_tags(raw: &str) -> (String, Vec<String>) {
+    let mut tags: Vec<String> = Vec::new();
+    let mut head = raw.trim().to_string();
+    while let Some(pos) = head.rfind('#') {
+        let tail = &head[pos + 1..];
+        if tail.is_empty() || tail.contains(char::is_whitespace) || tail.contains('#') {
+            break;
+        }
+        let tag = tail.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'));
+        if tag.is_empty() {
+            break;
+        }
+        tags.push(tag.to_string());
+        head.truncate(pos);
+        head = head.trim_end().to_string();
+    }
+    tags.reverse();
+    (head.trim().to_string(), tags)
+}
+
+/// 生成 YAML 双引号标量（转义 `"` 与 `\`，换行压成空格）。
+fn yaml_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' | '\r' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// 生成 Obsidian 知识卡 `Beav知识卡.md`。
+///
+/// 设计要点（2026-10-27 重写）：
+/// - **正文 / 语音转写直接内联**：Obsidian 不渲染 `.txt` / `.srt` / `.json`，
+///   早期用 `![[转写全文]]` 会变成死链，因此改为把文本写进笔记本身。
+/// - **关键帧用 `![](文件)` 图片引用而非 `![[...]]`**：只显示、不生成图谱边，
+///   避免一篇帖子往图谱里连出上百条边。
+/// - 元数据进 YAML frontmatter（作者/平台/赞藏评/来源/标签），hashtag 从标题剥离后转成 `tags`。
+///
+/// - 始终在产物目录 `l4` 写一份（prefix 为空，同目录相对引用，整包可移植）。
+/// - 若配置了 `monitor_obsidian_vault` 且产物目录在其内，另在
+///   `<vault>/Beav导出/<l4 相对导出根的路径>/` 写一份（prefix 为 vault 相对路径）。
 ///
 /// best-effort：任何失败只记日志，不阻断导出主流程。
 fn write_obsidian_card(
@@ -2879,127 +2921,192 @@ fn write_obsidian_card(
     analysis: &Option<PostVideoAnalysisRecord>,
     decon: &Option<crate::PostDeconstructionRecord>,
 ) {
-    let title = post.title.trim();
-    let title = if title.is_empty() { "未命名" } else { title };
+    let (title, tags) = split_title_tags(post.title.trim());
+    let title = if title.is_empty() { "未命名".to_string() } else { title };
 
-    // 收集产物（basename，不带扩展名；Obsidian 会自动匹配扩展名）
-    let mut inline: Vec<String> = Vec::new(); // ![[...]] 内联（媒体 / 文本预览）
-    let mut link_only: Vec<String> = Vec::new(); // [[...]] 仅链接（不产生内联）
+    let ext_of = |p: &str| -> String {
+        Path::new(p)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg")
+            .to_lowercase()
+    };
 
-    if !post.content.trim().is_empty() {
-        inline.push("正文".to_string());
-    }
-    if let Some(a) = analysis {
-        if !a.transcript.trim().is_empty() {
-            inline.push("转写全文".to_string());
-        }
-        if !a.transcript_srt.trim().is_empty() {
-            link_only.push("转写时间轴".to_string());
-        }
-        if !a.summary.trim().is_empty() {
-            inline.push("视频摘要".to_string());
-        }
-        // 只列实际存在的帧（导出时对缺失源会 continue），避免嵌入断链
-        for (idx, fr) in a.frames.iter().enumerate() {
-            if Path::new(fr).exists() {
-                inline.push(format!("抽帧_{:03}", idx + 1));
-            }
-        }
-    }
-    // 只列实际存在的原图（与导出编号一致）
+    // 只列实际存在的产物（导出时对缺失源会 continue），避免断链
+    let mut images: Vec<String> = Vec::new();
     for (idx, img) in post.images.iter().enumerate() {
         if Path::new(img).exists() {
-            inline.push(format!("图片_{}", idx + 1));
+            images.push(format!("图片_{}.{}", idx + 1, ext_of(img)));
         }
     }
-    if decon.is_some() {
-        inline.push("爆文拆解".to_string());
-        link_only.push("爆文拆解.json".to_string());
+    let mut frames: Vec<String> = Vec::new();
+    if let Some(a) = analysis {
+        for (idx, fr) in a.frames.iter().enumerate() {
+            if Path::new(fr).exists() {
+                frames.push(format!("抽帧_{:03}.{}", idx + 1, ext_of(fr)));
+            }
+        }
     }
     let video_src = post
         .video_preview_path
         .as_ref()
         .filter(|p| Path::new(p).exists())
         .or_else(|| post.video_local_path.as_ref().filter(|p| Path::new(p).exists()));
-    let video_ext = video_src
-        .and_then(|p| Path::new(p).extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()));
-    if let Some(ext) = &video_ext {
-        inline.push(format!("视频.{}", ext));
-    }
-    link_only.push("帖子信息".to_string());
+    let video_name = video_src.map(|p| format!("视频.{}", ext_of(p)));
 
-    if inline.is_empty() && link_only.is_empty() {
+    let body = post.content.trim();
+    let transcript = analysis
+        .as_ref()
+        .map(|a| a.transcript.trim().to_string())
+        .unwrap_or_default();
+    let summary = analysis
+        .as_ref()
+        .map(|a| a.summary.trim().to_string())
+        .unwrap_or_default();
+    let srt = analysis
+        .as_ref()
+        .map(|a| a.transcript_srt.trim().to_string())
+        .unwrap_or_default();
+
+    if body.is_empty()
+        && transcript.is_empty()
+        && frames.is_empty()
+        && images.is_empty()
+        && decon.is_none()
+        && video_name.is_none()
+    {
         return;
     }
 
     let platform = platform_label(&post.platform);
-    let published = post.published_at.as_deref().unwrap_or("").trim();
-    let url = post.post_url.trim();
+    let published = post.published_at.as_deref().unwrap_or("").trim().to_string();
+    let url = post.post_url.trim().to_string();
 
-    // 按给定前缀渲染整篇笔记：prefix="" 用 basename（同目录），prefix="<vault 相对目录>/" 用库内路径
-    let render = |prefix: &str| -> String {
-        let emb = |base: &str| format!("![[{}{}]]", prefix, base);
-        let lnk = |base: &str| format!("[[{}{}]]", prefix, base);
+    // `rel`：相对当前笔记所在目录的路径前缀（HTML `<img>` / Markdown 链接用）
+    // `vault`：vault 根相对路径前缀（`![[wikilink]]` 用，Obsidian 的 wikilink 始终从库根解析）
+    // 产物目录那份两者都是空串；库内 hub 那份 `rel` 是 `../../…/`、`vault` 是库内路径。
+    let render = |rel: &str, vault: &str| -> String {
+        let path_of = |name: &str| format!("{rel}{name}");
+        let img_tag = |name: &str| format!("<img src=\"{}\" width=\"200\">", path_of(name));
+
         let mut md = String::new();
-        md.push_str(&format!("# {}\n\n", title));
-        md.push_str("> 由 Beav 对标监控导出 · 知识卡\n\n");
+
+        // ---- YAML frontmatter ----
+        md.push_str("---\n");
+        md.push_str(&format!("title: {}\n", yaml_str(&title)));
         md.push_str(&format!(
-            "> 作者：**{}** · 平台：{} · 帖子ID：`{}`\n",
+            "author: {}\n",
+            yaml_str(&sanitize_fs_name(&post.author))
+        ));
+        md.push_str(&format!("platform: {}\n", yaml_str(&platform)));
+        md.push_str(&format!("post_id: {}\n", yaml_str(&post.id)));
+        if !url.is_empty() {
+            md.push_str(&format!("url: {}\n", yaml_str(&url)));
+        }
+        if !published.is_empty() {
+            md.push_str(&format!("published: {}\n", yaml_str(&published)));
+        }
+        md.push_str(&format!("likes: {}\n", post.likes));
+        md.push_str(&format!("collects: {}\n", post.collects));
+        md.push_str(&format!("comments: {}\n", post.comments));
+        if !tags.is_empty() {
+            let list: Vec<String> = tags.iter().map(|t| yaml_str(t)).collect();
+            md.push_str(&format!("tags: [{}]\n", list.join(", ")));
+        }
+        md.push_str("source: beav-monitor\n");
+        md.push_str("---\n\n");
+
+        // ---- 摘要行 ----
+        md.push_str(&format!("# {title}\n\n"));
+        md.push_str(&format!(
+            "> **{}** · {} · 赞 {} / 藏 {} / 评 {}\n",
             sanitize_fs_name(&post.author),
             platform,
-            post.id
-        ));
-        if !published.is_empty() {
-            md.push_str(&format!("> 发布：{}\n", published));
-        }
-        md.push_str(&format!(
-            "> 赞 {} · 藏 {} · 评 {}\n",
-            post.likes, post.collects, post.comments
+            post.likes,
+            post.collects,
+            post.comments
         ));
         if !url.is_empty() {
-            md.push_str(&format!("> 来源：{}\n", url));
+            md.push_str(&format!("> [查看原帖]({url})\n"));
         }
         md.push('\n');
 
-        if inline.iter().any(|x| x == "正文") {
-            md.push_str(&format!("## 正文\n\n{}\n\n", emb("正文")));
+        // ---- 正文（内联） ----
+        if !body.is_empty() {
+            md.push_str("## 正文\n\n");
+            md.push_str(body);
+            md.push_str("\n\n");
         }
-        if inline.iter().any(|x| x == "转写全文") || link_only.iter().any(|x| x == "转写时间轴") {
+
+        // ---- 语音转写（内联，折叠） ----
+        if !transcript.is_empty() {
             md.push_str("## 语音转写\n\n");
-            if inline.iter().any(|x| x == "转写全文") {
-                md.push_str(&format!("{}\n\n", emb("转写全文")));
-            }
-            if link_only.iter().any(|x| x == "转写时间轴") {
-                md.push_str(&format!("（逐句时间轴：{}）\n\n", lnk("转写时间轴")));
-            }
+            md.push_str(&format!(
+                "<details>\n<summary>展开全文（{} 字）</summary>\n\n",
+                transcript.chars().count()
+            ));
+            md.push_str(&transcript);
+            md.push_str("\n\n</details>\n\n");
         }
-        let frames: Vec<&String> = inline.iter().filter(|x| x.starts_with("抽帧_")).collect();
+        if !srt.is_empty() {
+            md.push_str(&format!(
+                "时间轴文件：[转写时间轴.srt]({})\n\n",
+                path_of("转写时间轴.srt")
+            ));
+        }
+        if !summary.is_empty() {
+            md.push_str("## 视频摘要\n\n");
+            md.push_str(&summary);
+            md.push_str("\n\n");
+        }
+
+        // ---- 关键帧（折叠 + 图片引用，不产生图谱边） ----
         if !frames.is_empty() {
-            md.push_str("## 关键帧\n\n");
-            for f in &frames {
-                md.push_str(&format!("{}\n\n", emb(f)));
+            md.push_str(&format!("## 关键帧（{} 张）\n\n", frames.len()));
+            md.push_str("<details>\n<summary>展开全部关键帧</summary>\n\n");
+            for chunk in frames.chunks(4) {
+                let row: Vec<String> = chunk.iter().map(|f| img_tag(f)).collect();
+                md.push_str(&row.join(" "));
+                md.push_str("\n\n");
             }
+            md.push_str("</details>\n\n");
         }
-        let imgs: Vec<&String> = inline.iter().filter(|x| x.starts_with("图片_")).collect();
-        if !imgs.is_empty() {
+
+        // ---- 配图 ----
+        if !images.is_empty() {
             md.push_str("## 配图\n\n");
-            for im in &imgs {
-                md.push_str(&format!("{}\n\n", emb(im)));
+            for chunk in images.chunks(4) {
+                let row: Vec<String> = chunk.iter().map(|f| img_tag(f)).collect();
+                md.push_str(&row.join(" "));
+                md.push_str("\n\n");
             }
         }
-        if inline.iter().any(|x| x == "爆文拆解") {
-            md.push_str(&format!("## 爆文拆解\n\n{}\n\n", emb("爆文拆解")));
+
+        // ---- 爆文拆解（.md，wikilink 可正常嵌入） ----
+        if decon.is_some() {
+            md.push_str("## 爆文拆解\n\n");
+            md.push_str(&format!("![[{vault}爆文拆解]]\n\n"));
         }
-        if let Some(ext) = &video_ext {
-            md.push_str(&format!("## 视频\n\n{}\n\n", emb(&format!("视频.{}", ext))));
+
+        // ---- 视频（折叠，避免一开笔记就加载大文件） ----
+        if let Some(v) = &video_name {
+            md.push_str("## 视频\n\n");
+            md.push_str("<details>\n<summary>展开视频</summary>\n\n");
+            md.push_str(&format!("![[{vault}{v}]]\n\n"));
+            md.push_str("</details>\n\n");
         }
-        md.push_str(&format!("---\n\n- 帖子信息：{}\n", lnk("帖子信息")));
+
+        md.push_str("---\n\n");
+        md.push_str(&format!(
+            "- 完整字段：[帖子信息.json]({})\n",
+            path_of("帖子信息.json")
+        ));
         md
     };
 
-    // 1) 始终写在产物目录（portable，basename 引用）
+    // 1) 始终写在产物目录（portable，同目录相对引用）
     let note_path = l4.join("Beav知识卡.md");
-    if let Err(e) = std::fs::write(&note_path, render("")) {
+    if let Err(e) = std::fs::write(&note_path, render("", "")) {
         println!("[monitor] write obsidian card failed: {e}");
     }
 
@@ -3031,9 +3138,18 @@ fn write_obsidian_card(
         println!("[monitor] create obsidian hub dir failed: {e}");
         return;
     }
-    let prefix = format!("{}/", l4_vault_rel.to_string_lossy().replace('\\', "/"));
+    // hub 笔记在 <vault>/Beav导出/<相对路径>/，产物在 <vault>/<导出根相对路径>/<相对路径>/
+    // wikilink 用库根相对路径；HTML/Markdown 相对引用要回退到库根再下去
+    let vault_prefix = format!("{}/", l4_vault_rel.to_string_lossy().replace('\\', "/"));
+    let rel_prefix = {
+        let depth = 1 + l4_root_rel.components().count();
+        let mut p = "../".repeat(depth);
+        p.push_str(&l4_vault_rel.to_string_lossy().replace('\\', "/"));
+        p.push('/');
+        p
+    };
     let hub_note = hub_dir.join("Beav知识卡.md");
-    match std::fs::write(&hub_note, render(&prefix)) {
+    match std::fs::write(&hub_note, render(&rel_prefix, &vault_prefix)) {
         Ok(_) => println!("[monitor] obsidian hub card -> {}", hub_note.display()),
         Err(e) => println!("[monitor] write obsidian hub card failed: {e}"),
     }
@@ -3302,28 +3418,13 @@ fn pick_obsidian_vault() -> Result<Value, String> {
     }))
 }
 
-/// 「分析成功」后按设置删除 monitor-videos 里的原片（仅保留预览）。
+/// 「分析/转写」完成后删除 monitor-videos 里的原片，仅保留预览。**默认行为，不再提供开关**。
 ///
-/// 触发条件（全部满足才删）：
-/// 1. 设置 `monitor_delete_original_after_analysis` 开启；
-/// 2. 转写状态为 `ok`（抽帧此时也已落库）；
-/// 3. **存在独立预览文件**且与原片不是同一路径 —— 否则删掉就没视频了
-///    （H.264 ≤1080p 的帖子不生成预览，直接复用原片播放）。
+/// 唯一守卫：**必须存在独立预览文件**且与原片不是同一路径 —— 否则删掉就没视频了
+/// （H.264 ≤1080p 的帖子不生成预览，直接复用原片播放）。
 ///
 /// 删后把 `video_local_path` 与分析的 `local_path` 都改指预览，保证播放与「重新分析」仍可用。
-fn maybe_delete_original_after_analysis(
-    state: &State<'_, AppState>,
-    post_id: &str,
-    transcript_status: &str,
-) {
-    if transcript_status != "ok" {
-        return;
-    }
-    let enabled = with_store(state, |store| Ok(store.monitor_delete_original_after_analysis))
-        .unwrap_or(false);
-    if !enabled {
-        return;
-    }
+fn delete_original_after_analysis(state: &State<'_, AppState>, post_id: &str) {
     let post = match with_store(state, |store| {
         Ok(store
             .monitored_posts
@@ -3372,25 +3473,6 @@ fn maybe_delete_original_after_analysis(
         }
         Err(e) => println!("[monitor] delete original video failed for {post_id}: {e}"),
     }
-}
-
-/// 读取「分析后删除原片」开关（`monitor:get-delete-original`）。
-fn get_delete_original(state: &State<'_, AppState>) -> Result<Value, String> {
-    with_store(state, |store| {
-        Ok(json!({ "success": true, "enabled": store.monitor_delete_original_after_analysis }))
-    })
-}
-
-/// 设置「分析后删除原片」开关（`monitor:set-delete-original`）。
-fn set_delete_original(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
-    let enabled = payload
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| "缺少 enabled".to_string())?;
-    with_store_mut(state, |store| {
-        store.monitor_delete_original_after_analysis = enabled;
-        Ok(json!({ "success": true, "enabled": enabled }))
-    })
 }
 
 /// 手动触发单篇帖子产物导出（`monitor:export-post`）。

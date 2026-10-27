@@ -44,7 +44,12 @@ type SidebarNavItem = {
   primary?: boolean;
 };
 
-const NAV_ITEMS: SidebarNavItem[] = [
+/** 暂时隐藏的侧边栏入口：定义保留在 NAV_ITEMS 里，删掉 key 即可恢复显示。 */
+const HIDDEN_NAV_KEYS = new Set<string>(['automation', 'publish']);
+/** 侧边栏底部「运营工作流」入口开关。 */
+const SHOW_WORKFLOW_ENTRY = false;
+
+const ALL_NAV_ITEMS: SidebarNavItem[] = [
   { key: 'new-chat', view: 'redclaw', labelKey: 'nav.newChat', icon: Edit, redclawAction: 'new', primary: true },
   { key: 'search', view: 'knowledge', labelKey: 'nav.search', icon: BookOpenText, primary: true },
   { key: 'assets', view: 'subjects', labelKey: 'nav.assets', icon: Folder, primary: true },
@@ -57,6 +62,8 @@ const NAV_ITEMS: SidebarNavItem[] = [
   // { id: 'archives', label: '档案', icon: Archive },
   // { id: 'skills', label: '技能库', icon: Lightbulb },
 ];
+
+const NAV_ITEMS = ALL_NAV_ITEMS.filter((item) => !HIDDEN_NAV_KEYS.has(item.key));
 
 const FOUNDER_SPONSOR_PRODUCT_ID = '827c5de5-c7b2-44df-b5c5-2b8b53eeb6ab';
 const FOUNDER_SPONSOR_POLL_INTERVAL_MS = 3000;
@@ -558,20 +565,23 @@ export function Layout({ children, currentView, onNavigate, immersiveMode = fals
                 <SettingsIcon className="w-[19px] h-[19px]" strokeWidth={1.75} />
                 <span className="text-xs font-medium">{t('nav.settings')}</span>
               </button>
-              <button
-                type="button"
-                onClick={toggleWorkflowDrawer}
-                className={clsx(
-                  'h-8 rounded-md px-2 text-text-tertiary hover:text-text-primary hover:bg-surface-primary transition-colors inline-flex items-center justify-center gap-1.5 shrink-0',
-                  workflowDrawerOpen && 'text-accent-primary bg-accent-primary/10',
-                )}
-                title={t('workflow.open')}
-                aria-label={t('workflow.open')}
-                aria-pressed={workflowDrawerOpen}
-              >
-                <Compass className="w-[19px] h-[19px]" strokeWidth={1.75} />
-                <span className="text-xs font-medium">{t('workflow.open')}</span>
-              </button>
+              {/* 「运营工作流」入口暂时隐藏：改 SHOW_WORKFLOW_ENTRY 为 true 即可恢复 */}
+              {SHOW_WORKFLOW_ENTRY && (
+                <button
+                  type="button"
+                  onClick={toggleWorkflowDrawer}
+                  className={clsx(
+                    'h-8 rounded-md px-2 text-text-tertiary hover:text-text-primary hover:bg-surface-primary transition-colors inline-flex items-center justify-center gap-1.5 shrink-0',
+                    workflowDrawerOpen && 'text-accent-primary bg-accent-primary/10',
+                  )}
+                  title={t('workflow.open')}
+                  aria-label={t('workflow.open')}
+                  aria-pressed={workflowDrawerOpen}
+                >
+                  <Compass className="w-[19px] h-[19px]" strokeWidth={1.75} />
+                  <span className="text-xs font-medium">{t('workflow.open')}</span>
+                </button>
+              )}
               {!usesAppTitleBar && (
                 <>
                   <button
