@@ -530,6 +530,11 @@ pub(crate) struct AppStore {
     /// 默认关；仅在「存在独立预览文件（与原片不同路径）」时才删，删后播放/再分析改用预览。
     #[serde(default)]
     pub(crate) monitor_delete_original_after_analysis: bool,
+    /// 可选「Obsidian 资料库路径」。非空且为现存目录时，导出帖子产物会额外在该库内
+    /// 生成一张用 `![[嵌入]]` 聚合所有产物的 Obsidian 笔记（直接产生图谱边，无需手动拖入）。
+    /// 空 = 不配置：导出只在产物目录里生成可移植的聚合笔记，用户把目录拖进 vault 即关联。
+    #[serde(default)]
+    pub(crate) monitor_obsidian_vault: String,
     /// 爆文拆解沉淀库：每篇被拆解的对标帖结构化出的方法论要素（角度/结构/开场白/标题句式/钩子）。
     #[serde(default)]
     pub(crate) post_deconstructions: Vec<PostDeconstructionRecord>,

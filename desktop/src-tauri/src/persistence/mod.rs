@@ -1003,6 +1003,7 @@ pub fn default_store() -> AppStore {
         monitor_spike_threshold: 3.0,
         monitor_export_root: String::new(),
         monitor_delete_original_after_analysis: false,
+        monitor_obsidian_vault: String::new(),
         post_deconstructions: Vec::new(),
         post_video_analyses: Vec::new(),
     }

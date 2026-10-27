@@ -260,6 +260,22 @@ export function createMonitorBridge(core: BridgeCore) {
           timeoutMs: READ_TIMEOUT_MS,
           fallback: () => ({ success: false, enabled }) as unknown as T,
         }),
+      // Obsidian 资料库路径（可选）：导出时在该库内生成聚合笔记
+      getObsidianVault: <T = { success: boolean; vault: string }>() =>
+        core.invokeChannelGuarded<T>('monitor:get-obsidian-vault', {}, {
+          timeoutMs: READ_TIMEOUT_MS,
+          fallback: () => ({ success: false, vault: '' }) as unknown as T,
+        }),
+      setObsidianVault: <T = { success: boolean; vault: string }>(vault: string) =>
+        core.invokeChannelGuarded<T>('monitor:set-obsidian-vault', { vault }, {
+          timeoutMs: READ_TIMEOUT_MS,
+          fallback: () => ({ success: false, vault }) as unknown as T,
+        }),
+      pickObsidianVault: <T = { success: boolean; canceled?: boolean; path?: string | null }>() =>
+        core.invokeChannelGuarded<T>('monitor:pick-obsidian-vault', {}, {
+          timeoutMs: 120_000,
+          fallback: () => ({ success: false, canceled: true }) as unknown as T,
+        }),
       // 爆文拆解：把一篇对标帖文案交给 LLM 拆成方法论要素，落库到 post_deconstructions
       deconstruct: <T = { success: boolean; deconstruction?: Record<string, unknown> }>(postId: string) =>
         core.invokeChannelGuarded<T>('monitor:deconstruct', { postId }, {
@@ -297,7 +313,7 @@ export function createMonitorBridge(core: BridgeCore) {
       // 4 分钟以上的视频（抽帧 + 长音频 ASR）可能超过 4 分钟，这里放宽到 15 分钟。
       analyzeVideo: <T = { success: boolean; note?: string; analysis?: Record<string, unknown> }>(
         id: string,
-        options?: { force?: boolean },
+        options?: { force?: boolean; skipTranscript?: boolean },
       ) =>
         core.invokeChannelGuarded<T>('monitor:analyze-video', { id, ...(options ?? {}) }, {
           timeoutMs: 900_000,

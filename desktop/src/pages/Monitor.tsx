@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { Radar, Plus, RefreshCw, Trash2, ExternalLink, Zap, Sparkles, Check, X, Eye, Loader2, Link2, Lock, LogOut, ChevronDown, ChevronLeft, ChevronRight, FlaskConical, BookOpen, Copy, Download, Video, Film, History } from 'lucide-react';
+import { Radar, Plus, RefreshCw, Trash2, ExternalLink, Zap, Sparkles, Check, X, Eye, Loader2, Link2, Lock, LogOut, ChevronDown, ChevronLeft, ChevronRight, FlaskConical, BookOpen, Copy, Download, Video, Film, History, AudioLines } from 'lucide-react';
 import { clsx } from 'clsx';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { MonitorChromeStatus, MonitorChromeLaunchResult, MonitorChromeTestResult } from '../bridge/domains/monitorBridge';
@@ -566,6 +566,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [videoAnalyzingId, setVideoAnalyzingId] = useState<string | null>(null);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [videoAnalysis, setVideoAnalysis] = useState<PostVideoAnalysis | null>(null);
+  // 分析视频时是否顺带做语音转写（关闭则只抽帧，不产出转写全文/时间轴）。
+  const [transcribeOnAnalyze, setTranscribeOnAnalyze] = useState(true);
 
   const watchesRef = useRef<CompetitorWatch[]>([]);
   const selectedRef = useRef<string | null>(null);
@@ -1323,11 +1325,11 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   }, [showToast]);
 
   // 分析已下载的视频：抽帧 + ASR 转写（+ 预留 LLM 摘要），结果写回 videoAnalysis。
-  const runAnalyzeVideo = useCallback(async (post: MonitoredPost) => {
+  const runAnalyzeVideo = useCallback(async (post: MonitoredPost, skipTranscript = false) => {
     setVideoAnalyzingId(post.id);
     setVideoError(null);
     try {
-      const result = (await window.ipcRenderer.monitor.analyzeVideo(post.id)) as {
+      const result = (await window.ipcRenderer.monitor.analyzeVideo(post.id, { skipTranscript })) as {
         success?: boolean;
         analysis?: Record<string, unknown>;
         error?: string;
@@ -1889,7 +1891,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                     ) : (
                       <button
                         onClick={() => void handleInject(post)}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors whitespace-nowrap"
                         title="加入选题中心"
                       >
                         <Sparkles className="w-3.5 h-3.5" />加入选题
@@ -1932,7 +1934,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
           onClick={() => setDetailOpen(false)}
         >
           <div
-            className="w-full max-w-2xl max-h-[80vh] mx-4 bg-surface-primary rounded-xl border border-border shadow-2xl overflow-hidden flex flex-col"
+            className="w-full max-w-3xl max-h-[88vh] mx-4 bg-surface-primary rounded-xl border border-border shadow-2xl overflow-hidden flex flex-col"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-6 py-4 border-b border-border flex items-center justify-between gap-3 shrink-0">
@@ -2083,19 +2085,19 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               )}
             </div>
 
-            <div className="px-6 py-3 border-t border-border flex items-center justify-between gap-3 shrink-0">
-              <div className="flex items-center gap-4 text-xs text-text-tertiary">
+            <div className="px-6 py-3 border-t border-border flex flex-wrap items-center justify-between gap-3 shrink-0">
+              <div className="flex items-center gap-4 text-xs text-text-tertiary shrink-0">
                 <span>赞 {detailPost.likes}</span>
                 <span>藏 {detailPost.collects}</span>
                 <span>评 {detailPost.comments}</span>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 {detailPost.mediaType === 'video' && (
                   <>
                     <button
                       onClick={() => void runDownloadVideo(detailPost)}
                       disabled={videoBusyId === detailPost.id}
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors whitespace-nowrap disabled:opacity-50"
                       title={
                         detailPost.videoStatus === 'downloading'
                           ? '当前处于「下载中」：若卡住（如 Chrome 被关闭），点此可强制重新下载'
@@ -2106,20 +2108,37 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                       {detailPost.videoStatus === 'done' ? '重新下载' : '下载视频'}
                     </button>
                     <button
-                      onClick={() => void runAnalyzeVideo(detailPost)}
+                      onClick={() => void runAnalyzeVideo(detailPost, !transcribeOnAnalyze)}
                       disabled={videoAnalyzingId === detailPost.id || detailPost.videoStatus !== 'done'}
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors whitespace-nowrap disabled:opacity-50"
                       title={detailPost.videoStatus === 'done' ? '抽关键帧 + 语音转写' : '请先下载视频本体'}
                     >
                       <Video className={clsx('w-3 h-3', videoAnalyzingId === detailPost.id && 'animate-pulse')} />
                       分析视频
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTranscribeOnAnalyze((v) => !v)}
+                      className={clsx(
+                        'inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border transition-colors whitespace-nowrap',
+                        transcribeOnAnalyze
+                          ? 'border-accent-primary/50 bg-accent-primary/10 text-accent-primary'
+                          : 'border-border text-text-tertiary hover:text-text-secondary',
+                      )}
+                      title={transcribeOnAnalyze ? '分析时会做语音转写（产出转写全文/时间轴）' : '分析时只抽帧，不做语音转写'}
+                    >
+                      <AudioLines className={clsx('w-3 h-3', transcribeOnAnalyze && 'text-accent-primary')} />
+                      语音转写
+                      <span className={clsx('text-[10px] font-semibold', transcribeOnAnalyze ? 'text-accent-primary' : 'text-text-tertiary')}>
+                        {transcribeOnAnalyze ? '开' : '关'}
+                      </span>
                     </button>
                   </>
                 )}
                 <button
                   onClick={() => void runDeconstruct(detailPost)}
                   disabled={deconLoading || !detailPost.content || !detailPost.content.trim()}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors whitespace-nowrap disabled:opacity-50"
                   title={detailPost.content?.trim() ? '用 AI 拆解这篇爆文的方法论' : '请先抓到正文再拆解'}
                 >
                   <FlaskConical className={clsx('w-3 h-3', deconLoading && 'animate-spin')} />
@@ -2145,14 +2164,14 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                     }
                   }}
                   disabled={detailLoading}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors whitespace-nowrap disabled:opacity-50"
                 >
                   <RefreshCw className={clsx('w-3 h-3', detailLoading && 'animate-spin')} />
                   重新抓正文
                 </button>
                 <button
                   onClick={() => void openExternal(detailPost.postUrl)}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors whitespace-nowrap"
                 >
                   <ExternalLink className="w-3 h-3" />原文
                 </button>

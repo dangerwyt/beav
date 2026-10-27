@@ -70,6 +70,9 @@ pub fn handle_monitor_channel(
             "monitor:get-export-root" => get_export_root(state),
             "monitor:set-export-root" => set_export_root(state, payload),
             "monitor:pick-export-root" => pick_export_root(),
+            "monitor:get-obsidian-vault" => get_obsidian_vault(state),
+            "monitor:set-obsidian-vault" => set_obsidian_vault(state, payload),
+            "monitor:pick-obsidian-vault" => pick_obsidian_vault(),
             "monitor:get-delete-original" => get_delete_original(state),
             "monitor:set-delete-original" => set_delete_original(state, payload),
             "monitor:download-video" => download_video(app, state, payload),
@@ -2844,19 +2847,196 @@ fn export_post_product(state: &State<'_, AppState>, post_id: &str) {
 
 /// 解析「帖子最终产物」的导出根目录（**始终跟随导出根目录**，不再按平台选知识库）。
 ///
-/// - `monitor_export_root` 非空且目录存在 → 用它；
+/// - `monitor_export_root` 非空 → 用它（**不要求目录已存在**，导出时会 `create_dir_all`）；
 /// - 否则回退 `workspace_root`（保留平台级一级目录）。
+///
+/// 注意：早期实现用 `is_dir()` 判断，用户清理过导出目录后（目录被删）会**静默回退到工作区**，
+/// 表现为「设置了导出根目录但产物仍落在工作区」。这里改为只认配置值，目录由导出流程按需创建。
 fn resolve_export_target(state: &State<'_, AppState>) -> Result<PathBuf, String> {
     let export_root = with_store(state, |store| Ok(store.monitor_export_root.clone()))?;
     let export_root = export_root.trim().to_string();
     if !export_root.is_empty() {
-        let root = PathBuf::from(&export_root);
-        if root.is_dir() {
-            return Ok(root);
-        }
-        println!("[monitor] monitor_export_root missing: {export_root}, fall back to workspace");
+        return Ok(PathBuf::from(&export_root));
     }
     workspace_root(state)
+}
+
+/// 生成 Obsidian 聚合笔记（「知识卡」）：用 `![[内联嵌入]]` / `[[wikilink]]` 把本帖所有产物聚成一张笔记。
+///
+/// - 始终在产物目录 `l4` 写 `Beav知识卡.md`，引用用**同目录 basename**（如 `![[转写全文]]`），
+///   因此该笔记可移植：一旦 `l4` 落在某个 Obsidian 资料库内，Obsidian 即自动索引并产生图谱边。
+/// - 若配置了 `monitor_obsidian_vault` 且产物目录在其内：额外在库内
+///   `<vault>/Beav导出/<l4 相对导出根的路径>/Beav知识卡.md` 再写一份，引用用**vault 相对路径**，
+///   这样即便笔记放在库内的独立 hub 目录，也能正确链接到产物。
+/// - 若配置了 vault 但产物目录不在其内：给出告警（Obsidian 无法解析库外文件）。
+///
+/// best-effort：任何失败只记日志，不阻断导出主流程。
+fn write_obsidian_card(
+    state: &State<'_, AppState>,
+    root: &Path,
+    l4: &Path,
+    post: &MonitoredPostRecord,
+    analysis: &Option<PostVideoAnalysisRecord>,
+    decon: &Option<crate::PostDeconstructionRecord>,
+) {
+    let title = post.title.trim();
+    let title = if title.is_empty() { "未命名" } else { title };
+
+    // 收集产物（basename，不带扩展名；Obsidian 会自动匹配扩展名）
+    let mut inline: Vec<String> = Vec::new(); // ![[...]] 内联（媒体 / 文本预览）
+    let mut link_only: Vec<String> = Vec::new(); // [[...]] 仅链接（不产生内联）
+
+    if !post.content.trim().is_empty() {
+        inline.push("正文".to_string());
+    }
+    if let Some(a) = analysis {
+        if !a.transcript.trim().is_empty() {
+            inline.push("转写全文".to_string());
+        }
+        if !a.transcript_srt.trim().is_empty() {
+            link_only.push("转写时间轴".to_string());
+        }
+        if !a.summary.trim().is_empty() {
+            inline.push("视频摘要".to_string());
+        }
+        // 只列实际存在的帧（导出时对缺失源会 continue），避免嵌入断链
+        for (idx, fr) in a.frames.iter().enumerate() {
+            if Path::new(fr).exists() {
+                inline.push(format!("抽帧_{:03}", idx + 1));
+            }
+        }
+    }
+    // 只列实际存在的原图（与导出编号一致）
+    for (idx, img) in post.images.iter().enumerate() {
+        if Path::new(img).exists() {
+            inline.push(format!("图片_{}", idx + 1));
+        }
+    }
+    if decon.is_some() {
+        inline.push("爆文拆解".to_string());
+        link_only.push("爆文拆解.json".to_string());
+    }
+    let video_src = post
+        .video_preview_path
+        .as_ref()
+        .filter(|p| Path::new(p).exists())
+        .or_else(|| post.video_local_path.as_ref().filter(|p| Path::new(p).exists()));
+    let video_ext = video_src
+        .and_then(|p| Path::new(p).extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()));
+    if let Some(ext) = &video_ext {
+        inline.push(format!("视频.{}", ext));
+    }
+    link_only.push("帖子信息".to_string());
+
+    if inline.is_empty() && link_only.is_empty() {
+        return;
+    }
+
+    let platform = platform_label(&post.platform);
+    let published = post.published_at.as_deref().unwrap_or("").trim();
+    let url = post.post_url.trim();
+
+    // 按给定前缀渲染整篇笔记：prefix="" 用 basename（同目录），prefix="<vault 相对目录>/" 用库内路径
+    let render = |prefix: &str| -> String {
+        let emb = |base: &str| format!("![[{}{}]]", prefix, base);
+        let lnk = |base: &str| format!("[[{}{}]]", prefix, base);
+        let mut md = String::new();
+        md.push_str(&format!("# {}\n\n", title));
+        md.push_str("> 由 Beav 对标监控导出 · 知识卡\n\n");
+        md.push_str(&format!(
+            "> 作者：**{}** · 平台：{} · 帖子ID：`{}`\n",
+            sanitize_fs_name(&post.author),
+            platform,
+            post.id
+        ));
+        if !published.is_empty() {
+            md.push_str(&format!("> 发布：{}\n", published));
+        }
+        md.push_str(&format!(
+            "> 赞 {} · 藏 {} · 评 {}\n",
+            post.likes, post.collects, post.comments
+        ));
+        if !url.is_empty() {
+            md.push_str(&format!("> 来源：{}\n", url));
+        }
+        md.push('\n');
+
+        if inline.iter().any(|x| x == "正文") {
+            md.push_str(&format!("## 正文\n\n{}\n\n", emb("正文")));
+        }
+        if inline.iter().any(|x| x == "转写全文") || link_only.iter().any(|x| x == "转写时间轴") {
+            md.push_str("## 语音转写\n\n");
+            if inline.iter().any(|x| x == "转写全文") {
+                md.push_str(&format!("{}\n\n", emb("转写全文")));
+            }
+            if link_only.iter().any(|x| x == "转写时间轴") {
+                md.push_str(&format!("（逐句时间轴：{}）\n\n", lnk("转写时间轴")));
+            }
+        }
+        let frames: Vec<&String> = inline.iter().filter(|x| x.starts_with("抽帧_")).collect();
+        if !frames.is_empty() {
+            md.push_str("## 关键帧\n\n");
+            for f in &frames {
+                md.push_str(&format!("{}\n\n", emb(f)));
+            }
+        }
+        let imgs: Vec<&String> = inline.iter().filter(|x| x.starts_with("图片_")).collect();
+        if !imgs.is_empty() {
+            md.push_str("## 配图\n\n");
+            for im in &imgs {
+                md.push_str(&format!("{}\n\n", emb(im)));
+            }
+        }
+        if inline.iter().any(|x| x == "爆文拆解") {
+            md.push_str(&format!("## 爆文拆解\n\n{}\n\n", emb("爆文拆解")));
+        }
+        if let Some(ext) = &video_ext {
+            md.push_str(&format!("## 视频\n\n{}\n\n", emb(&format!("视频.{}", ext))));
+        }
+        md.push_str(&format!("---\n\n- 帖子信息：{}\n", lnk("帖子信息")));
+        md
+    };
+
+    // 1) 始终写在产物目录（portable，basename 引用）
+    let note_path = l4.join("Beav知识卡.md");
+    if let Err(e) = std::fs::write(&note_path, render("")) {
+        println!("[monitor] write obsidian card failed: {e}");
+    }
+
+    // 2) 配置了资料库：产物在库内 → 额外在库内 hub 再写一份（vault 相对引用）
+    let vault = with_store(state, |s| Ok(s.monitor_obsidian_vault.clone()))
+        .unwrap_or_default();
+    let vault = vault.trim().to_string();
+    if vault.is_empty() {
+        return;
+    }
+    let vault_path = PathBuf::from(&vault);
+    if !vault_path.is_dir() {
+        println!("[monitor] monitor_obsidian_vault 不是有效目录：{vault}");
+        return;
+    }
+    let (l4_vault_rel, l4_root_rel) =
+        match (l4.strip_prefix(&vault_path), l4.strip_prefix(root)) {
+            (Ok(v), Ok(r)) => (v, r),
+            _ => {
+                println!(
+                    "[monitor] 导出目录不在 Obsidian 资料库内（vault={vault}），无法在库内生成可解析的笔记；\
+                     建议把「监控导出目标」设为该资料库内的目录。"
+                );
+                return;
+            }
+        };
+    let hub_dir = vault_path.join("Beav导出").join(l4_root_rel);
+    if let Err(e) = std::fs::create_dir_all(&hub_dir) {
+        println!("[monitor] create obsidian hub dir failed: {e}");
+        return;
+    }
+    let prefix = format!("{}/", l4_vault_rel.to_string_lossy().replace('\\', "/"));
+    let hub_note = hub_dir.join("Beav知识卡.md");
+    match std::fs::write(&hub_note, render(&prefix)) {
+        Ok(_) => println!("[monitor] obsidian hub card -> {}", hub_note.display()),
+        Err(e) => println!("[monitor] write obsidian hub card failed: {e}"),
+    }
 }
 
 fn try_export_post_product(
@@ -3038,6 +3218,9 @@ fn try_export_post_product(
         serde_json::to_string_pretty(&meta).unwrap_or_default(),
     );
 
+    // 生成 Obsidian 聚合笔记（「知识卡」），用 ![[嵌入]] 关联所有产物
+    write_obsidian_card(state, &root, &l4, &post, &analysis, &decon);
+
     println!("[monitor] exported post product -> {}", l4.display());
     Ok(())
 }
@@ -3059,8 +3242,10 @@ fn set_export_root(state: &State<'_, AppState>, payload: &Value) -> Result<Value
         .or_else(|| str_field(payload, "dir"))
         .unwrap_or_default();
     let root = root.trim().to_string();
-    if !root.is_empty() && !Path::new(&root).is_dir() {
-        return Err(format!("导出根目录不存在：{root}"));
+    // 目录不存在时直接创建（用户可能选了一个稍后被删掉/尚未创建的目录），
+    // 创建失败才报错，避免「存了设置但导出静默回退工作区」。
+    if !root.is_empty() {
+        std::fs::create_dir_all(&root).map_err(|e| format!("创建导出根目录失败：{root}（{e}）"))?;
     }
     with_store_mut(state, |store| {
         store.monitor_export_root = root.clone();
@@ -3071,6 +3256,44 @@ fn set_export_root(state: &State<'_, AppState>, payload: &Value) -> Result<Value
 /// 弹出系统目录选择器，返回所选目录（`monitor:pick-export-root`）。
 fn pick_export_root() -> Result<Value, String> {
     let selected = crate::pick_files_native("选择监控导出根目录", true, false)?;
+    let path = selected.first().map(|item| item.display().to_string());
+    Ok(json!({
+        "success": path.is_some(),
+        "canceled": path.is_none(),
+        "path": path,
+    }))
+}
+
+/// 读取全局「Obsidian 资料库路径」（`monitor:get-obsidian-vault`）。
+///
+/// 返回 `{ success, vault }`；`vault` 为空表示未配置（导出只生成可移植的聚合笔记，
+/// 需用户自行把导出目录拖进 vault 才会产生图谱边）。
+fn get_obsidian_vault(state: &State<'_, AppState>) -> Result<Value, String> {
+    with_store(state, |store| {
+        Ok(json!({ "success": true, "vault": store.monitor_obsidian_vault.clone() }))
+    })
+}
+
+/// 设置全局「Obsidian 资料库路径」（`monitor:set-obsidian-vault`）。
+///
+/// 入参：`vault`（绝对目录；空串 / null 表示清空）。非空时必须存在且为目录。
+fn set_obsidian_vault(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
+    let vault = str_field(payload, "vault")
+        .or_else(|| str_field(payload, "dir"))
+        .unwrap_or_default();
+    let vault = vault.trim().to_string();
+    if !vault.is_empty() && !Path::new(&vault).is_dir() {
+        return Err(format!("Obsidian 资料库路径不存在：{vault}"));
+    }
+    with_store_mut(state, |store| {
+        store.monitor_obsidian_vault = vault.clone();
+        Ok(json!({ "success": true, "vault": vault }))
+    })
+}
+
+/// 弹出系统目录选择器，返回所选 Obsidian 资料库目录（`monitor:pick-obsidian-vault`）。
+fn pick_obsidian_vault() -> Result<Value, String> {
+    let selected = crate::pick_files_native("选择 Obsidian 资料库（.obsidian 所在目录）", true, false)?;
     let path = selected.first().map(|item| item.display().to_string());
     Ok(json!({
         "success": path.is_some(),
