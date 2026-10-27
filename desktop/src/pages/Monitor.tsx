@@ -111,10 +111,9 @@ interface PostVideoAnalysis {
   updatedAt: number;
 }
 
-const PLATFORM_OPTIONS = [
-  { value: '', label: '自动识别' },
-  ...PLATFORMS,
-];
+// 平台改为必填：「自动识别」靠 host 猜，遇到 b23.tv 短链 / 分享链接经常猜错，
+// 干脆去掉，由用户显式选择。
+const PLATFORM_OPTIONS = PLATFORMS;
 
 const platformLabel = (code: string): string => {
   const found = PLATFORM_OPTIONS.find((opt) => opt.value === code);
@@ -536,13 +535,17 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [postsError, setPostsError] = useState<string | null>(null);
 
   const [addOpen, setAddOpen] = useState(false);
-  const [addForm, setAddForm] = useState({
+  const [addForm, setAddForm] = useState<{
+    name: string;
+    platform: string;
+    profileUrl: string;
+    note: string;
+  }>({
     name: '',
+    // 平台必填但**不给默认值**：下拉显示「请选择平台」占位，用户必须显式选
     platform: '',
     profileUrl: '',
     note: '',
-    intervalHours: 24,
-    enabled: true,
   });
   const [addError, setAddError] = useState('');
 
@@ -1048,17 +1051,25 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       setAddError('请输入博主名称');
       return;
     }
+    if (!addForm.platform) {
+      setAddError('请选择平台');
+      return;
+    }
+    const profileUrl = addForm.profileUrl.trim();
+    if (!profileUrl) {
+      setAddError('请输入主页链接');
+      return;
+    }
     try {
       await window.ipcRenderer.monitor.watchAdd({
         name,
-        platform: addForm.platform || undefined,
-        profileUrl: addForm.profileUrl.trim() || undefined,
+        platform: addForm.platform,
+        profileUrl,
         note: addForm.note.trim() || undefined,
-        enabled: addForm.enabled,
-        intervalHours: addForm.intervalHours,
+        // 监控统一由凌晨增量任务跑：enabled / interval_hours 取后端默认值（true / 24）
       });
       setAddOpen(false);
-      setAddForm({ name: '', platform: '', profileUrl: '', note: '', intervalHours: 24, enabled: true });
+      setAddForm({ name: '', platform: '', profileUrl: '', note: '' });
       setAddError('');
       await loadWatches();
       showToast('ok', `已添加监控「${name}」`);
@@ -2418,22 +2429,27 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-text-secondary mb-1.5">平台</label>
+                <label className="block text-xs font-medium text-text-secondary mb-1.5">平台 *</label>
                 <select
                   value={addForm.platform}
-                  onChange={(e) => setAddForm((f) => ({ ...f, platform: e.target.value }))}
-                  className="w-full bg-surface-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
+                  onChange={(e) => { setAddForm((f) => ({ ...f, platform: e.target.value })); setAddError(''); }}
+                  className={clsx(
+                    'w-full bg-surface-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary',
+                    !addForm.platform && 'text-text-tertiary',
+                  )}
                 >
+                  {/* 无默认值：未选时显示占位，且不可选中 */}
+                  <option value="" disabled>请选择平台</option>
                   {PLATFORM_OPTIONS.map((opt) => (
                     <option key={opt.value} value={opt.value}>{opt.label}</option>
                   ))}
                 </select>
               </div>
               <div>
-                <label className="block text-xs font-medium text-text-secondary mb-1.5">主页链接</label>
+                <label className="block text-xs font-medium text-text-secondary mb-1.5">主页链接 *</label>
                 <input
                   value={addForm.profileUrl}
-                  onChange={(e) => setAddForm((f) => ({ ...f, profileUrl: e.target.value }))}
+                  onChange={(e) => { setAddForm((f) => ({ ...f, profileUrl: e.target.value })); setAddError(''); }}
                   placeholder="https://space.bilibili.com/xxxx"
                   className="w-full bg-surface-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
                 />
@@ -2453,28 +2469,6 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   className="w-full bg-surface-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
                 />
               </div>
-              <div>
-                <label className="block text-xs font-medium text-text-secondary mb-1.5">
-                  抓取间隔（小时）：{addForm.intervalHours}
-                </label>
-                <input
-                  type="range"
-                  min={1}
-                  max={168}
-                  value={addForm.intervalHours}
-                  onChange={(e) => setAddForm((f) => ({ ...f, intervalHours: Number(e.target.value) }))}
-                  className="w-full accent-[color:var(--accent-primary,#6366f1)]"
-                />
-              </div>
-              <label className="flex items-center gap-2 text-sm text-text-secondary cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={addForm.enabled}
-                  onChange={(e) => setAddForm((f) => ({ ...f, enabled: e.target.checked }))}
-                  className="accent-[color:var(--accent-primary,#6366f1)]"
-                />
-                启用监控
-              </label>
               {addError && <p className="text-xs text-red-500">{addError}</p>}
             </div>
 

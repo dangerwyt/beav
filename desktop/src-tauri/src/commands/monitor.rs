@@ -3372,7 +3372,10 @@ fn write_obsidian_card(
     // 产物目录那份两者都是空串；库内 hub 那份 `rel` 是 `../../…/`、`vault` 是库内路径。
     let render = |rel: &str, vault: &str| -> String {
         let path_of = |name: &str| format!("{rel}{name}");
-        let img_tag = |name: &str| format!("<img src=\"{}\" width=\"200\">", path_of(name));
+        // 配图 / 关键帧都走原生 `![|200](path)`：Live Preview 下点击只打开预览、不露源码
+        // （旧的内联 HTML `<img>` 会露源码）；附件默认不进图谱，不产生图谱边。
+        // 关键帧用「默认折叠的 callout」承载，替代 `<details>`（HTML 块内 markdown 不解析）。
+        let md_img = |name: &str| format!("![|200]({})", path_of(name));
 
         let mut md = String::new();
 
@@ -3452,22 +3455,27 @@ fn write_obsidian_card(
         }
 
         // ---- 关键帧（折叠 + 图片引用，不产生图谱边） ----
+        // 用「默认折叠的 callout」而非 `<details>`：callout 内容仍是 markdown，图片走原生
+        // `![|200]()`（Live Preview 点击只开预览、不露源码）；`<details>` 是 HTML 块，块内
+        // markdown 不解析，只能用 HTML `<img>`，点开即露源码。折叠 = 默认不展开，保持轻量。
         if !frames.is_empty() {
             md.push_str(&format!("## 关键帧（{} 张）\n\n", frames.len()));
-            md.push_str("<details>\n<summary>展开全部关键帧</summary>\n\n");
+            md.push_str(&format!(
+                "> [!abstract]- 展开全部关键帧（{} 张）\n",
+                frames.len()
+            ));
             for chunk in frames.chunks(4) {
-                let row: Vec<String> = chunk.iter().map(|f| img_tag(f)).collect();
-                md.push_str(&row.join(" "));
-                md.push_str("\n\n");
+                let row: Vec<String> = chunk.iter().map(|f| md_img(f)).collect();
+                md.push_str(&format!("> {}\n", row.join(" ")));
             }
-            md.push_str("</details>\n\n");
+            md.push('\n');
         }
 
         // ---- 配图 ----
         if !images.is_empty() {
             md.push_str("## 配图\n\n");
             for chunk in images.chunks(4) {
-                let row: Vec<String> = chunk.iter().map(|f| img_tag(f)).collect();
+                let row: Vec<String> = chunk.iter().map(|f| md_img(f)).collect();
                 md.push_str(&row.join(" "));
                 md.push_str("\n\n");
             }
