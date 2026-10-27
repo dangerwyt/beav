@@ -3284,7 +3284,7 @@ fn yaml_str(s: &str) -> String {
     out
 }
 
-/// 生成 Obsidian 知识卡 `Beav知识卡.md`。
+/// 生成 Obsidian 知识卡 `knowledge.md`（旧名 `Beav知识卡.md`，写新版时会顺手删掉旧的）。
 ///
 /// 设计要点（2026-10-27 重写）：
 /// - **正文 / 语音转写直接内联**：Obsidian 不渲染 `.txt` / `.srt` / `.json`，
@@ -3433,11 +3433,17 @@ fn write_obsidian_card(
             md.push_str(&transcript);
             md.push_str("\n\n</details>\n\n");
         }
+        // ---- 逐句时间轴：直接展开显示 ----
+        // `.srt` 不是 Obsidian 支持的嵌入格式，原来的链接点开只会甩给外部播放器；
+        // 这里把文本内联进代码块（折叠），一眼能看，也不产生图谱边。
         if !srt.is_empty() {
+            let cues = srt.lines().filter(|line| line.contains("-->")).count();
+            md.push_str("### 逐句时间轴\n\n");
             md.push_str(&format!(
-                "时间轴文件：[转写时间轴.srt]({})\n\n",
-                path_of("转写时间轴.srt")
+                "<details>\n<summary>展开全文（{cues} 条）</summary>\n\n```\n"
             ));
+            md.push_str(&srt);
+            md.push_str("\n```\n\n</details>\n\n");
         }
         if !summary.is_empty() {
             md.push_str("## 视频摘要\n\n");
@@ -3491,7 +3497,12 @@ fn write_obsidian_card(
     };
 
     // 1) 始终写在产物目录（portable，同目录相对引用）
-    let note_path = l4.join("Beav知识卡.md");
+    let note_path = l4.join("knowledge.md");
+    // 旧版本叫 `Beav知识卡.md`：改名后清掉旧文件，避免同一目录出现两张卡（都是生成物，可安全删）
+    let legacy_note = l4.join("Beav知识卡.md");
+    if legacy_note.is_file() {
+        let _ = std::fs::remove_file(&legacy_note);
+    }
     if let Err(e) = std::fs::write(&note_path, render("", "")) {
         println!("[monitor] write obsidian card failed: {e}");
     }
@@ -3534,7 +3545,11 @@ fn write_obsidian_card(
         p.push('/');
         p
     };
-    let hub_note = hub_dir.join("Beav知识卡.md");
+    let legacy_hub = hub_dir.join("Beav知识卡.md");
+    if legacy_hub.is_file() {
+        let _ = std::fs::remove_file(&legacy_hub);
+    }
+    let hub_note = hub_dir.join("knowledge.md");
     match std::fs::write(&hub_note, render(&rel_prefix, &vault_prefix)) {
         Ok(_) => println!("[monitor] obsidian hub card -> {}", hub_note.display()),
         Err(e) => println!("[monitor] write obsidian hub card failed: {e}"),
