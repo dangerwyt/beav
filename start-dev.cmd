@@ -1,11 +1,19 @@
 @echo off
-chcp 65001 >nul
+setlocal
+title Beav ¿ª·¢Æô¶¯Æ÷
 cd /d "%~dp0desktop"
+if not exist "package.json" (
+    echo [´íÎó] Î´ÕÒµ½ desktop\package.json£¬ÇëÈ·ÈÏ±¾½Å±¾Î»ÓÚÏîÄ¿¸ùÄ¿Â¼¡£
+    echo.
+    pause
+    exit /b 1
+)
 echo ============================================
-echo   Beav å¼€å‘å¯åŠ¨å™¨  (pnpm tauri:dev:beav)
-echo   å…³é—­æ­¤çª—å£æˆ–æŒ‰ Ctrl+C å¯åœæ­¢åº”ç”¨
+echo   Beav ¿ª·¢Æô¶¯Æ÷  (pnpm tauri:dev:beav)
+echo   ¹Ø±Õ´Ë´°¿Ú»ò°´ Ctrl+C ¿ÉÍ£Ö¹Ó¦ÓÃ
 echo ============================================
 call pnpm tauri:dev:beav
 echo.
-echo [Beav å·²é€€å‡º] æŒ‰ä»»æ„é”®å…³é—­çª—å£...
+echo [Beav ÒÑÍË³ö] °´ÈÎÒâ¼ü¹Ø±Õ´°¿Ú...
 pause >nul
+endlocal

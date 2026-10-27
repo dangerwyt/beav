@@ -1,0 +1,10 @@
+# Windows 批处理必须是 CRLF，否则 cmd.exe 可能解析异常（LF-only 会让 chcp/pause/多行块行为不可控）
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 常规源码统一按文本处理
+*.rs   text eol=lf
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
