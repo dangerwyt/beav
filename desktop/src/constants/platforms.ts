@@ -26,13 +26,14 @@ export const PLATFORM_LABELS: Record<Platform, string> = {
 };
 
 /** 当前走无头浏览器（CDP）登录 / 抓取的平台；新增平台时在此放开。 */
-export const CDP_PLATFORMS = ['xiaohongshu', 'douyin'] as const;
+export const CDP_PLATFORMS = ['xiaohongshu', 'douyin', 'bilibili'] as const;
 export type CdpPlatform = (typeof CDP_PLATFORMS)[number];
 
 /** CDP 平台的登录主页（Referer / 打开登录页用）。 */
 export const PLATFORM_HOME: Record<CdpPlatform, string> = {
   xiaohongshu: 'https://www.xiaohongshu.com',
   douyin: 'https://www.douyin.com',
+  bilibili: 'https://www.bilibili.com',
 };
 
 export function platformLabel(value: string): string {

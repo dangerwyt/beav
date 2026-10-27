@@ -59,14 +59,36 @@ impl PlatformAdapter for DouyinAdapter {
     }
 }
 
+/// B 站：UP 主空间视频页（space.bilibili.com/<mid>/video）。
+///
+/// 列表卡片锚点是 `/video/BV1xx…`；标题在 `.bili-video-card__info--tit`（带 title 属性），
+/// 播放量/时长在 `.bili-video-card__stats`。详情页标题 `h1.video-title`，简介 `.desc-info-text`。
+pub struct BilibiliAdapter;
+impl PlatformAdapter for BilibiliAdapter {
+    fn platform(&self) -> Platform {
+        Platform::Bilibili
+    }
+    fn list_wait_selector(&self) -> &'static str {
+        "a[href*=\"/video/BV\"]"
+    }
+    fn detail_wait_selector(&self) -> &'static str {
+        "h1.video-title, .video-title, .desc-info-text"
+    }
+    fn content_wait_selector(&self) -> &'static str {
+        ".desc-info-text, .basic-desc-info, .video-desc"
+    }
+}
+
 static XIAOHONGSHU: XiaohongshuAdapter = XiaohongshuAdapter;
 static DOUYIN: DouyinAdapter = DouyinAdapter;
+static BILIBILI: BilibiliAdapter = BilibiliAdapter;
 
 /// 按枚举取适配器；未接入的平台返回 `None`（调用方走默认/引导）。
 pub fn adapter_for(platform: Platform) -> Option<&'static dyn PlatformAdapter> {
     match platform {
         Platform::Xiaohongshu => Some(&XIAOHONGSHU),
         Platform::Douyin => Some(&DOUYIN),
+        Platform::Bilibili => Some(&BILIBILI),
         _ => None,
     }
 }
@@ -84,7 +106,14 @@ mod tests {
     fn adapters_registered_for_cdp_platforms() {
         assert!(adapter_for(Platform::Xiaohongshu).is_some());
         assert!(adapter_for(Platform::Douyin).is_some());
+        assert!(adapter_for(Platform::Bilibili).is_some());
         assert!(adapter_for(Platform::Facebook).is_none());
+    }
+
+    #[test]
+    fn bilibili_uses_bv_selector() {
+        let adapter = adapter_for_str("bilibili").expect("bilibili adapter");
+        assert!(adapter.list_wait_selector().contains("BV"));
     }
 
     #[test]

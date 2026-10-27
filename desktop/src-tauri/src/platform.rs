@@ -121,12 +121,18 @@ impl Platform {
 
     /// 当前由无头浏览器（CDP）采集的站。新增站时在这里开闸。
     pub const fn is_cdp(self) -> bool {
-        matches!(self, Platform::Xiaohongshu | Platform::Douyin)
+        matches!(
+            self,
+            Platform::Xiaohongshu | Platform::Douyin | Platform::Bilibili
+        )
     }
 
     /// 是否支持「下载视频 → 抽帧 → 语音转写」这一套。
     pub const fn supports_video(self) -> bool {
-        matches!(self, Platform::Xiaohongshu | Platform::Douyin)
+        matches!(
+            self,
+            Platform::Xiaohongshu | Platform::Douyin | Platform::Bilibili
+        )
     }
 
     /// 登录 / Referer 用的站点主域。

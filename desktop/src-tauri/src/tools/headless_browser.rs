@@ -633,18 +633,22 @@ pub async fn navigate_and_eval(
     target_url: &str,
     expression: &str,
 ) -> Result<Value, String> {
-    navigate_and_eval_settle(ws_url, target_url, expression, 2_000).await
+    navigate_and_eval_settle(ws_url, target_url, expression, 2_000, false).await
 }
 
 /// 同 `navigate_and_eval`，但可自定义「页面加载后、JS 求值前」的静置毫秒数。
 ///
 /// SPA（抖音 / 小红书）在 body 出现后还要异步拉 XHR；静置太短会在数据到达前就求值，
 /// 表现为「明明页面有数据，却一个都没抓到」。抽视频直链这类依赖运行时请求的场景必须放宽。
+///
+/// `await_promise=true` 用于「表达式本身是 async IIFE」的场景（B 站要先 fetch playurl
+/// 才能拿到 DASH 直链，是异步的）；其余平台保持 false，求值结果直接是对象。
 pub async fn navigate_and_eval_settle(
     ws_url: &str,
     target_url: &str,
     expression: &str,
     settle_ms: u64,
+    await_promise: bool,
 ) -> Result<Value, String> {
     let client = CdpClient::connect(ws_url).await?;
     let target_id = client.create_target("about:blank").await?;
@@ -679,7 +683,7 @@ pub async fn navigate_and_eval_settle(
     }
     // readyState 到位后再给 SPA 异步渲染/注流留静置时间
     tokio::time::sleep(Duration::from_millis(settle_ms)).await;
-    client.evaluate(&session_id, expression, false).await
+    client.evaluate(&session_id, expression, await_promise).await
 }
 
 /// 剥掉 URL 里的 `modal_id` 查询参数（抖音视频弹窗）。
@@ -897,8 +901,11 @@ pub async fn scrape_profile_posts(
             };
             const idOf = (href) => {
                 const me = href.match(/\/explore\/([A-Za-z0-9]+)/);
+                // B 站视频是 /video/BV1xx…（字母开头），抖音是 /video/<纯数字>，先判 BV。
+                const mb = href.match(/\/video\/(BV[0-9A-Za-z]+)/);
                 const mv = href.match(/\/video\/(\d+)/);
                 if (me) return { id: me[1], kind: 'xiaohongshu' };
+                if (mb) return { id: mb[1], kind: 'bilibili' };
                 if (mv) return { id: mv[1], kind: 'douyin' };
                 return null;
             };
@@ -915,7 +922,17 @@ pub async fn scrape_profile_posts(
             for (const [id, group] of groups) {
                 const first = group.anchors[0];
                 // 卡片容器：往上找包含标题/互动数的最近祖先
-                const card = first.closest('section.note-item, [class*="note-item"], [class*="note-card"], li, article') || first.parentElement;
+                let card = first.closest('section.note-item, [class*="note-item"], [class*="note-card"], li, article') || first.parentElement;
+                if (group.kind === 'bilibili') {
+                    // 坑：B 站封面 <a> 自身 class 是 `bili-video-card__image--link`（含 bili-video-card 子串），
+                    // 用 `[class*="bili-video-card"]` 会命中锚点本身 → 卡内找不到标题，
+                    // 标题退化成锚点的 textContent =「播放量+弹幕+时长」（如 251.2万574224:50）。
+                    // 必须向上找到**真正含有标题节点**的祖先。
+                    let node = first;
+                    for (let i = 0; i < 6 && node; i++, node = node.parentElement) {
+                        if (node.querySelector && node.querySelector('[class*="info--tit"], h3')) { card = node; break; }
+                    }
+                }
                 let title = '';
                 // 1) 同组锚点里 class 含 title 的（xhs 标题本身就是 a.title）
                 for (const a of group.anchors) {
@@ -937,6 +954,11 @@ pub async fn scrape_profile_posts(
                     const descEl = scope && scope.querySelector('[data-e2e="user-post-item-desc"], [data-e2e="video-desc"]');
                     const desc = descEl ? (descEl.textContent || '').trim() : '';
                     title = cleanTitle(desc || title);
+                }
+                // B 站：标题在 .bili-video-card__info--tit（带完整 title 属性，避免 ellipsis 截断）
+                if (group.kind === 'bilibili') {
+                    const t = card && card.querySelector('.bili-video-card__info--tit, [class*="info--tit"], h3');
+                    if (t) title = (t.getAttribute('title') || t.textContent || '').trim();
                 }
                 let likes = 0;
                 if (card) {
@@ -984,6 +1006,140 @@ pub async fn scrape_profile_posts(
         .await;
     client.close().await;
     extracted
+}
+
+/// B 站补全抽取器：在页面上下文调公开 API，把「合集 / 收藏夹 / 空间全部合集」拉齐。
+///
+/// 为什么不滚 DOM：合集页是虚拟列表 + 分页，滚动既慢又容易漏；
+/// `seasons_archives_list`（100 条/页）、`fav/resource/list`（20 条/页）翻页即可拿全。
+/// 返回 `{ posts: [{url,title,likes,platform,publishedAt}], debug }`；
+/// 接口失败/未登录时返回空数组，由调用方回退到 DOM 抓取。
+const BILI_EXTRAS_EXPRESSION: &str = r#"
+(async () => {
+    const out = { posts: [], debug: '' };
+    // likes 留 0：合集/收藏夹接口只给播放量，点赞要另走 archive/stat 补（见 BILI_STATS_EXPRESSION）。
+    const push = (bv, title, view, pubdate) => {
+        if (!bv) return;
+        out.posts.push({
+            url: 'https://www.bilibili.com/video/' + bv,
+            title: String(title || '').trim(),
+            likes: 0,
+            platform: 'bilibili',
+            publishedAt: pubdate ? new Date(pubdate * 1000).toISOString().slice(0, 10) : '',
+        });
+    };
+    const getJson = async (p) => {
+        try {
+            const r = await fetch(p, { credentials: 'include' });
+            return await r.json();
+        } catch (e) { return null; }
+    };
+    const u = new URL(location.href);
+    const seg = u.pathname.split('/').filter(Boolean);
+    const mid = /^\d+$/.test(seg[0] || '') ? seg[0] : '';
+    const sid = u.searchParams.get('sid') || (seg[1] === 'lists' ? (seg[2] || '') : '');
+    const fid = u.searchParams.get('fid') || u.searchParams.get('media_id') || '';
+
+    // 单个合集：page_size=100，翻到空页或超上限为止
+    const fetchSeason = async (seasonId) => {
+        for (let pn = 1; pn <= 40; pn++) {
+            const r = await getJson('https://api.bilibili.com/x/polymer/web-space/seasons_archives_list?mid=' + mid + '&season_id=' + seasonId + '&page_num=' + pn + '&page_size=100');
+            const arr = r && r.code === 0 && r.data && r.data.archives;
+            if (!arr || !arr.length) break;
+            for (const a of arr) push(a.bvid, a.title, a.stat && a.stat.view, a.pubdate);
+            const total = (r.data.page && r.data.page.total) || 0;
+            if (arr.length < 100 || pn * 100 >= total) break;
+        }
+    };
+    // 收藏夹：20 条/页
+    const fetchFav = async (mediaId) => {
+        for (let pn = 1; pn <= 50; pn++) {
+            const r = await getJson('https://api.bilibili.com/x/v3/fav/resource/list?media_id=' + mediaId + '&pn=' + pn + '&ps=20&platform=web');
+            const arr = r && r.code === 0 && r.data && r.data.medias;
+            if (!arr || !arr.length) break;
+            for (const m of arr) {
+                if (!m || m.type !== 2) continue; // 2 = 视频
+                push(m.bvid, m.title, m.cnt_info && m.cnt_info.play, m.pubtime);
+            }
+            if (arr.length < 20) break;
+        }
+    };
+    // 空间页：枚举该 UP 的全部合集，再逐个拉全
+    const fetchAllSeasons = async () => {
+        const sids = [];
+        for (let pn = 1; pn <= 10; pn++) {
+            const r = await getJson('https://api.bilibili.com/x/polymer/web-space/seasons_series_list?mid=' + mid + '&page_num=' + pn + '&page_size=20');
+            const box = r && r.code === 0 && r.data && r.data.items_lists;
+            const list = box && box.seasons_list;
+            if (!list || !list.length) break;
+            for (const s of list) {
+                const meta = s && s.meta;
+                if (meta && meta.season_id) sids.push(meta.season_id);
+            }
+            const total = (box.page && box.page.total) || 0;
+            if (pn * 20 >= total) break;
+        }
+        for (const s of sids) await fetchSeason(s);
+    };
+
+    if (sid) await fetchSeason(sid);
+    else if (fid) await fetchFav(fid);
+    else if (mid) await fetchAllSeasons();
+    out.debug = JSON.stringify({ mid: mid, sid: sid, fid: fid, found: out.posts.length });
+    return out;
+})()
+"#;
+
+/// 抓 B 站合集 / 收藏夹 / 空间全部合集（页面内调公开 API，异步）。
+pub async fn scrape_bilibili_extras(ws_url: &str, page_url: &str) -> Result<Value, String> {
+    navigate_and_eval_settle(ws_url, page_url, BILI_EXTRAS_EXPRESSION, 2_500, true).await
+}
+
+/// B 站互动数补全：批量查 `archive/stat`（列表卡片只有播放量，没有点赞）。
+///
+/// 在页面上下文里跑（带 cookie），返回 `{ "<BV>": { like, reply, favorite, view } }`。
+/// 一次 CDP 调用内部并发 6 路，避免把 B 站风控惹毛（-412）。
+const BILI_STATS_EXPRESSION: &str = r#"
+(async () => {
+    const ids = __BVIDS__;
+    const out = {};
+    const getJson = async (u) => {
+        try {
+            const r = await fetch(u, { credentials: 'include' });
+            return await r.json();
+        } catch (e) { return null; }
+    };
+    for (let i = 0; i < ids.length; i += 6) {
+        const batch = ids.slice(i, i + 6);
+        await Promise.all(batch.map(async (bv) => {
+            const r = await getJson('https://api.bilibili.com/x/web-interface/archive/stat?bvid=' + bv);
+            if (r && r.code === 0 && r.data) {
+                out[bv] = {
+                    like: r.data.like || 0,
+                    reply: r.data.reply || 0,
+                    favorite: r.data.favorite || 0,
+                    view: r.data.view || 0,
+                };
+            }
+        }));
+        await new Promise((res) => setTimeout(res, 120));
+    }
+    return out;
+})()
+"#;
+
+/// 批量补 B 站互动数（点赞/评论/收藏）。
+pub async fn fetch_bilibili_stats(
+    ws_url: &str,
+    page_url: &str,
+    bvids: &[String],
+) -> Result<Value, String> {
+    if bvids.is_empty() {
+        return Ok(json!({}));
+    }
+    let ids = serde_json::to_string(bvids).unwrap_or_else(|_| "[]".to_string());
+    let expression = BILI_STATS_EXPRESSION.replace("__BVIDS__", &ids);
+    navigate_and_eval_settle(ws_url, page_url, &expression, 1_200, true).await
 }
 
 /// 补历史专用「深翻」抓取：滚动由 **Rust 侧循环**驱动（而非一次性 JS IIFE），
@@ -1143,8 +1299,11 @@ pub async fn scrape_profile_posts_paged(
             };
             const idOf = (href) => {
                 const me = href.match(/\/explore\/([A-Za-z0-9]+)/);
+                // B 站视频是 /video/BV1xx…（字母开头），抖音是 /video/<纯数字>，先判 BV。
+                const mb = href.match(/\/video\/(BV[0-9A-Za-z]+)/);
                 const mv = href.match(/\/video\/(\d+)/);
                 if (me) return { id: me[1], kind: 'xiaohongshu' };
+                if (mb) return { id: mb[1], kind: 'bilibili' };
                 if (mv) return { id: mv[1], kind: 'douyin' };
                 return null;
             };
@@ -1187,7 +1346,15 @@ pub async fn scrape_profile_posts_paged(
             const results = [];
             for (const [id, group] of groups) {
                 const first = group.anchors[0];
-                const card = first.closest('section.note-item, [class*="note-item"], [class*="note-card"], li, article') || first.parentElement;
+                let card = first.closest('section.note-item, [class*="note-item"], [class*="note-card"], li, article') || first.parentElement;
+                if (group.kind === 'bilibili') {
+                    // 同 scrape_profile_posts：封面 <a> 自身 class 含 bili-video-card 子串，
+                    // 必须向上找真正含标题节点的祖先，否则标题会变成「播放量+弹幕+时长」。
+                    let node = first;
+                    for (let i = 0; i < 6 && node; i++, node = node.parentElement) {
+                        if (node.querySelector && node.querySelector('[class*="info--tit"], h3')) { card = node; break; }
+                    }
+                }
                 let title = '';
                 for (const a of group.anchors) { if (/title/i.test(a.className || '')) { title = (a.getAttribute('title') || a.textContent || '').trim(); break; } }
                 if (!title && card) { const t = card.querySelector('[class*="title"]'); if (t) title = (t.getAttribute('title') || t.textContent || '').trim(); }
@@ -1198,6 +1365,11 @@ pub async fn scrape_profile_posts_paged(
                     const descEl = scope && scope.querySelector('[data-e2e="user-post-item-desc"], [data-e2e="video-desc"]');
                     const desc = descEl ? (descEl.textContent || '').trim() : '';
                     title = cleanTitle(desc || title);
+                }
+                // B 站：标题在 .bili-video-card__info--tit（带完整 title 属性）
+                if (group.kind === 'bilibili') {
+                    const t = card && card.querySelector('.bili-video-card__info--tit, [class*="info--tit"], h3');
+                    if (t) title = (t.getAttribute('title') || t.textContent || '').trim();
                 }
                 let likes = 0;
                 if (card) { const likeEl = card.querySelector('.like-wrapper .count, [class*="like"] [class*="count"], [class*="count"]'); if (likeEl) likes = parseCount(likeEl.textContent); }
@@ -1473,12 +1645,46 @@ async fn scrape_post_detail_once(
                     if (u === 'k' || u === 'K') return Math.round(n * 1000);
                     return Math.round(n);
                 };
-                const isXhs = !!document.querySelector('#detail-title, .note-content, #detail-desc');
+                const isBili = /bilibili\.com/i.test(location.hostname);
+                const isXhs = !isBili && !!document.querySelector('#detail-title, .note-content, #detail-desc');
                 let title = '', content = '', author = '', date = '';
                 let likes = 0, collects = 0, comments = 0;
                 let mediaType = 'image', cover = '';
                 const images = [];
-                if (isXhs) {
+                if (isBili) {
+                    mediaType = 'video';
+                    // B 站视频页自带 SSR 状态：__INITIAL_STATE__.videoData 里有标题/简介/UP 主/发布时间/统计。
+                    let vd = null;
+                    try { vd = window.__INITIAL_STATE__ && window.__INITIAL_STATE__.videoData; } catch (e) {}
+                    if (vd) {
+                        title = String(vd.title || '').trim();
+                        content = String(vd.desc || '').trim();
+                        author = String((vd.owner && vd.owner.name) || '').trim();
+                        const st = vd.stat || {};
+                        // 与其它平台统一口径：likes = 点赞数（不是播放量）。
+                        likes = Number(st.like || 0);
+                        comments = Number(st.reply || 0);
+                        collects = Number(st.favorite || 0);
+                        if (vd.pubdate) {
+                            const d = new Date(vd.pubdate * 1000);
+                            if (!isNaN(d.getTime())) date = d.toISOString().slice(0, 10);
+                        }
+                        cover = String(vd.pic || '');
+                        // B 站封面常是协议相对地址（//i0.hdslb.com/...），补成 https 再落库
+                        if (cover.indexOf('//') === 0) cover = 'https:' + cover;
+                        if (cover) images.push(cover);
+                    }
+                    if (!title) {
+                        title = txt('h1.video-title') || txt('.video-title');
+                        if (!title) {
+                            const m = document.querySelector('meta[property="og:title"]');
+                            if (m) title = (m.getAttribute('content') || '').trim();
+                        }
+                    }
+                    if (!content) content = txt('.desc-info-text');
+                    if (!author) author = txt('.up-name') || txt('.up-info--name a');
+                    if (!date) date = txt('[class*="pubdate"]');
+                } else if (isXhs) {
                     title = txt('#detail-title') || txt('.title');
                     content = txt('#detail-desc') || txt('.note-text') || txt('.desc');
                     author = txt('.author .name') || txt('.username');

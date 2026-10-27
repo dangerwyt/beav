@@ -1452,7 +1452,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               </div>
 
               <p className="text-[11px] leading-relaxed text-text-tertiary">
-                小红书 / 抖音需要登录态抓取。先选平台点「打开登录页」，在弹出的 Chrome 内完成登录（cookie 仅存于本机独立 profile）。之后 Beav 复用登录态抓取。
+                小红书 / 抖音 / B 站需要登录态抓取。先选平台点「打开登录页」，在弹出的 Chrome 内完成登录（cookie 仅存于本机独立 profile）。之后 Beav 复用登录态抓取。
               </p>
 
               <div className="flex gap-1.5">
@@ -1785,7 +1785,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
           </div>
           {/* 抓取条数已固定，不再开放配置（后端 SCAN_LIMIT=30） */}
           <div className="mt-2 text-[11px] text-text-tertiary">
-            单次抓取固定 30 条（web / 小红书 / 抖音统一生效）；补历史另走深翻，不受此限制。
+            单次抓取固定 30 条（web / 小红书 / 抖音 / B 站统一生效）；「补历史」走深翻不受此限制，B 站还会在补历史时额外补全该 UP 的全部合集与收藏夹。
           </div>
           {fetchNote && (
             <div className="mt-2 text-[12px] text-text-tertiary bg-surface-secondary/60 border border-border rounded-lg px-3 py-2">
@@ -1986,9 +1986,13 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
 
               {detailPost.coverUrl && (
                 <img
-                  src={detailPost.coverUrl}
+                  src={resolveAssetUrl(detailPost.coverUrl)}
                   alt="封面"
                   className="w-full max-h-80 object-cover rounded-lg border border-border"
+                  // 本地缓存缺失 / 加载失败就整块隐藏，不要留一个裂图占位
+                  onError={(e) => {
+                    e.currentTarget.style.display = 'none';
+                  }}
                 />
               )}
               {detailPost.mediaType === 'video' && (
@@ -2068,9 +2072,13 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                       className="relative overflow-hidden rounded-lg border border-border cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-accent-primary/40"
                     >
                       <img
-                        src={src}
+                        src={resolveAssetUrl(src)}
                         alt={`配图 ${index + 1}`}
                         className="w-full h-28 object-cover transition-transform duration-150 hover:scale-105"
+                        // 加载失败的图直接移出列表（本地缓存丢了/老数据残留），不显示裂图
+                        onError={() => {
+                          setDetailImages((prev) => prev.filter((item) => item !== src));
+                        }}
                       />
                     </button>
                   ))}
@@ -2116,7 +2124,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                       title={
                         detailPost.videoStatus === 'downloading'
                           ? '当前处于「下载中」：若卡住（如 Chrome 被关闭），点此可强制重新下载'
-                          : '用已登录的小红书 / 抖音 Chrome 抽出真实视频直链并下载到本地'
+                          : '用已登录的小红书 / 抖音 / B 站 Chrome 抽出真实视频直链并下载到本地'
                       }
                     >
                       <Download className={clsx('w-3 h-3', videoBusyId === detailPost.id && 'animate-bounce')} />
@@ -2244,7 +2252,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
             </button>
           )}
           <img
-            src={detailImages[lightboxIndex]}
+            src={resolveAssetUrl(detailImages[lightboxIndex])}
             alt={`配图 ${lightboxIndex + 1}`}
             className="max-w-[92vw] max-h-[88vh] object-contain rounded-lg shadow-2xl"
             onClick={(e) => e.stopPropagation()}
@@ -2429,6 +2437,12 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   placeholder="https://space.bilibili.com/xxxx"
                   className="w-full bg-surface-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
                 />
+                {addForm.platform === 'bilibili' && (
+                  <p className="mt-1.5 text-[11px] leading-relaxed text-text-tertiary">
+                    B 站支持三种链接：UP 主空间（…/&lt;mid&gt;，会自动补全该 UP 的全部合集）、
+                    单个合集（…/lists/&lt;sid&gt;）、收藏夹（…/favlist?fid=&lt;fid&gt;）。
+                  </p>
+                )}
               </div>
               <div>
                 <label className="block text-xs font-medium text-text-secondary mb-1.5">备注</label>

@@ -371,6 +371,43 @@ fn post_detail(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
         }));
     }
     if !refresh && (record.detail_fetched || !record.content.is_empty()) {
+        // 存量记录自愈：老数据里的图片还是远程 URL（CDN 校验 Referer → WebView 裂图、导出也复制不到），
+        // 打开详情时就地本地化一次，不必等用户点「重新抓正文」。
+        // 含 `//host/...` 这种协议相对地址：老数据里常见，同样要本地化
+        let has_remote = record
+            .images
+            .iter()
+            .any(|u| u.starts_with("http") || u.starts_with("//"))
+            || record
+                .cover_url
+                .as_deref()
+                .map(|u| u.starts_with("http") || u.starts_with("//"))
+                .unwrap_or(false);
+        if has_remote {
+            let (imgs, cover) = cache_post_images(
+                state,
+                &record.id,
+                &record.platform,
+                &record.images,
+                record.cover_url.as_deref(),
+            );
+            let mut healed = record.clone();
+            healed.images = imgs;
+            if cover.is_some() {
+                healed.cover_url = cover;
+            }
+            let _ = with_store_mut(state, |store| {
+                if let Some(slot) = store.monitored_posts.iter_mut().find(|p| p.id == healed.id) {
+                    slot.images = healed.images.clone();
+                    slot.cover_url = healed.cover_url.clone();
+                }
+                Ok(())
+            });
+            return Ok(json!({
+                "success": true, "post": healed,
+                "fetched": !healed.content.is_empty(), "note": "",
+            }));
+        }
         return Ok(json!({ "success": true, "post": record, "fetched": !record.content.is_empty(), "note": "" }));
     }
     let port = headless_browser::active_chrome_port(&record.platform);
@@ -413,6 +450,26 @@ fn post_detail(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
                         .and_then(Value::as_array)
                         .map(|arr| !arr.is_empty())
                         .unwrap_or(false));
+            // 远程图片本地化（CDN 校验 Referer，WebView 直连必 403 → 裂图）。
+            let remote_images: Vec<String> = detail
+                .get("images")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::trim))
+                        .filter(|s| !s.is_empty())
+                        .map(ToString::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let remote_cover = detail
+                .get("cover")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let (cached_images, cached_cover) =
+                cache_post_images(state, &record.id, &record.platform, &remote_images, remote_cover);
+
             let updated = with_store_mut(state, |store| {
                 let Some(item) = store
                     .monitored_posts
@@ -433,13 +490,8 @@ fn post_detail(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
                 {
                     item.media_type = mt.to_string();
                 }
-                if let Some(cover) = detail
-                    .get("cover")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    item.cover_url = Some(cover.to_string());
+                if let Some(cover) = cached_cover.as_ref() {
+                    item.cover_url = Some(cover.clone());
                 }
                 if let Some(author) = detail
                     .get("author")
@@ -469,16 +521,9 @@ fn post_detail(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
                     .get("comments")
                     .and_then(Value::as_i64)
                     .unwrap_or(item.comments);
-                // 详情页图片列表落库：二次打开（缓存路径）才有缩略图可显示
-                if let Some(imgs) = detail.get("images").and_then(Value::as_array) {
-                    let list: Vec<String> = imgs
-                        .iter()
-                        .filter_map(|value| value.as_str().map(String::from))
-                        .filter(|value| !value.is_empty())
-                        .collect();
-                    if !list.is_empty() {
-                        item.images = list;
-                    }
+                // 详情页图片列表落库：**已本地化**，二次打开才有缩略图可显示（也才能导出）
+                if !cached_images.is_empty() {
+                    item.images = cached_images.clone();
                 }
                 // 详情页成功解析即标记已抓取（图/标题抓到即可，纯图/无正文笔记不算失败），
                 // 二次打开据此秒开，不再因 content 空而反复重抓。
@@ -502,6 +547,13 @@ fn post_detail(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
                 );
                 Ok(updated_item)
             })?;
+
+            // 图文帖没有「分析视频」这个触发点 —— 详情抓取成功就直接导出产物，
+            // 否则图文帖永远进不了导出库（实测：小红书图文抓下来没有产物目录）。
+            // 视频帖仍由 analyze_video / transcribe 之后导出，避免这里多导一份。
+            if updated.media_type != "video" && updated.detail_fetched {
+                export_post_product(state, &updated.id);
+            }
             Ok(json!({
                 "success": true,
                 "post": updated,
@@ -574,6 +626,42 @@ fn host_of(url: &str) -> Option<String> {
     url::Url::parse(url)
         .ok()
         .and_then(|parsed| parsed.host_str().map(|host| host.to_string()))
+}
+
+/// 从 B 站视频链接里取 BV 号（`…/video/BV1xx411c7mD/?p=1` → `BV1xx411c7mD`）。
+fn bv_of_url(url: &str) -> Option<String> {
+    let rest = url.split_once("/video/")?.1;
+    let bv = rest
+        .split(|c| c == '?' || c == '#' || c == '/')
+        .next()
+        .unwrap_or("");
+    if bv.starts_with("BV") && bv.len() > 4 {
+        Some(bv.to_string())
+    } else {
+        None
+    }
+}
+
+/// 两个主机是否同属一个可注册域（`space.bilibili.com` ≈ `www.bilibili.com`）。
+///
+/// B 站主页在 `space.bilibili.com`、视频在 `www.bilibili.com`、部分活动页在 `m.bilibili.com`，
+/// 用精确 host 相等会把合集/API 补全的结果全部过滤掉。
+fn same_registrable_domain(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let root = |h: &str| -> String {
+        let parts: Vec<&str> = h.split('.').filter(|p| !p.is_empty()).collect();
+        if parts.len() >= 2 {
+            format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
+        } else {
+            h.to_string()
+        }
+    };
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    root(a) == root(b)
 }
 
 fn platform_of(url: &str) -> String {
@@ -711,7 +799,7 @@ fn fetch_monitor(
                 "created": [],
                 "updated": [],
                 "capturedVia": "chrome-cdp",
-                "note": "小红书 / 抖音需要登录态抓取。请先在左侧「登录管理」点「打开 Chrome 登录」完成登录，再回来抓取。",
+                "note": "小红书 / 抖音 / B 站需要登录态抓取。请先在左侧「登录管理」点「打开 Chrome 登录」完成登录，再回来抓取。",
             }));
         }
         return fetch_monitor_via_cdp(state, watch.as_ref(), &url, &platform_hint, payload, app, emit_progress);
@@ -842,7 +930,16 @@ fn fetch_monitor(
                 .or(Some(excerpt)),
             published_at: existing
                 .as_ref()
-                .and_then(|previous| previous.published_at.clone()),
+                .and_then(|previous| previous.published_at.clone())
+                // 合集/收藏夹 API 直接给发布日期（yyyy-mm-dd），新帖落库时用它，
+                // 省掉「打开详情才补时间」的一次往返。
+                .or_else(|| {
+                    post.get("publishedAt")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToString::to_string)
+                }),
             likes: existing.as_ref().map(|previous| previous.likes).unwrap_or(0),
             comments: existing
                 .as_ref()
@@ -1040,11 +1137,90 @@ fn fetch_monitor_via_cdp(
         .get("profileTotal")
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    let posts = scraped
+    let mut posts = scraped
         .get("posts")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+
+    // B 站：DOM 只覆盖当前页签（投稿列表）；合集 / 收藏夹 / 空间下全部合集走公开 API 补全，
+    // 否则「合集里的视频」永远抓不到（诉求：博主数据要拿全）。失败只记日志，不影响 DOM 结果。
+    let is_bili = Platform::parse(platform) == Some(Platform::Bilibili);
+    let mut extras_added = 0usize;
+    // 合集/收藏夹补全只属于「补历史」（emit_progress=true）：
+    // 普通「抓取」是日增量，只该拿滚动窗口里的 30 条；否则点一次抓取就灌进几百条老视频。
+    if is_bili && emit_progress {
+        let extra = tauri::async_runtime::block_on(async {
+            let ws = headless_browser::ws_url_for_port(port).await?;
+            headless_browser::scrape_bilibili_extras(&ws, url).await
+        })
+        .unwrap_or_else(|e| {
+            println!("[monitor] bilibili extras failed: {e}");
+            json!({ "posts": [] })
+        });
+        if let Some(arr) = extra.get("posts").and_then(Value::as_array) {
+            let mut seen: std::collections::HashSet<String> = posts
+                .iter()
+                .filter_map(|p| p.get("url").and_then(Value::as_str))
+                .map(|s| s.split('?').next().unwrap_or(s).to_string())
+                .collect();
+            let before = posts.len();
+            for item in arr {
+                if let Some(u) = item.get("url").and_then(Value::as_str) {
+                    let key = u.split('?').next().unwrap_or(u).to_string();
+                    if seen.insert(key) {
+                        posts.push(item.clone());
+                    }
+                }
+            }
+            extras_added = posts.len() - before;
+            println!(
+                "[monitor] bilibili extras: +{extras_added} → {} 条（{}）",
+                posts.len(),
+                extra.get("debug").cloned().unwrap_or(Value::Null)
+            );
+        }
+    }
+    // B 站列表卡片只有播放量、没有点赞 —— 统一补一次互动数（点赞/评论/收藏）。
+    // 只补 likes 仍为 0 的条目并限量 60，避免补历史时把几百条全查一遍触发风控（-412）。
+    if is_bili {
+        let bvs: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            posts.iter()
+                .filter(|p| p.get("likes").and_then(Value::as_i64).unwrap_or(0) <= 0)
+                .filter_map(|p| p.get("url").and_then(Value::as_str))
+                .filter_map(bv_of_url)
+                .filter(|bv| seen.insert(bv.clone()))
+                .take(60)
+                .collect()
+        };
+        if !bvs.is_empty() {
+            let stats = tauri::async_runtime::block_on(async {
+                let ws = headless_browser::ws_url_for_port(port).await?;
+                headless_browser::fetch_bilibili_stats(&ws, url, &bvs).await
+            })
+            .unwrap_or_else(|e| {
+                println!("[monitor] bilibili stats failed: {e}");
+                json!({})
+            });
+            let mut filled = 0usize;
+            for post in posts.iter_mut() {
+                let Some(link) = post.get("url").and_then(Value::as_str).map(str::to_string) else {
+                    continue;
+                };
+                let Some(bv) = bv_of_url(&link) else { continue };
+                let Some(st) = stats.get(&bv) else { continue };
+                if let Some(obj) = post.as_object_mut() {
+                    obj.insert("likes".to_string(), st.get("like").cloned().unwrap_or(json!(0)));
+                    obj.insert("comments".to_string(), st.get("reply").cloned().unwrap_or(json!(0)));
+                    obj.insert("collects".to_string(), st.get("favorite").cloned().unwrap_or(json!(0)));
+                    filled += 1;
+                }
+            }
+            println!("[monitor] bilibili stats filled: {filled}/{}", bvs.len());
+        }
+    }
+
     let base_host = host_of(url).unwrap_or_default();
     // 作者解析：绑定了对标博主就用博主名；**临时粘贴单帖（无 watch）不能拿域名当作者**
     // （会显示成 `www.douyin.com`），改为抓一次帖子详情取真实昵称，失败再回退平台中文名。
@@ -1056,14 +1232,23 @@ fn fetch_monitor_via_cdp(
     let mut created: Vec<crate::MonitoredPostRecord> = Vec::new();
     let mut updated: Vec<crate::MonitoredPostRecord> = Vec::new();
 
-    for post in posts.iter().take(limit) {
+    // 补历史（深翻 + 合集补全）才放宽上限；普通抓取维持 30 条日增量窗口。
+    let effective_limit = if is_bili && emit_progress {
+        limit.max(600)
+    } else {
+        limit
+    };
+    for post in posts.iter().take(effective_limit) {
         let post_url = post
             .get("url")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        // 同站但不同子域要放行（B 站主页 space.* / 视频 www.*），否则合集结果会被整体丢掉
         if post_url.is_empty()
-            || host_of(&post_url).map(|host| host != base_host).unwrap_or(false)
+            || host_of(&post_url)
+                .map(|host| !same_registrable_domain(&host, &base_host))
+                .unwrap_or(true)
         {
             continue;
         }
@@ -1143,26 +1328,43 @@ fn fetch_monitor_via_cdp(
                 .as_ref()
                 .map(|previous| previous.detail_fetched)
                 .unwrap_or(false),
-            excerpt: existing
-                .as_ref()
-                .and_then(|previous| previous.excerpt.clone())
-                .or_else(|| Some(title.clone())),
+            excerpt: match existing.as_ref() {
+                // 旧记录里 excerpt 若只是「旧标题的副本」，跟着新标题刷新；
+                // 否则 B 站标题曾被抓成「播放量+弹幕+时长」的脏数据会一直留在列表副标题里。
+                Some(previous) => match previous.excerpt.clone() {
+                    Some(old) if old.trim() != previous.title.trim() => Some(old),
+                    _ => Some(title.clone()),
+                },
+                None => Some(title.clone()),
+            },
             published_at: existing
                 .as_ref()
-                .and_then(|previous| previous.published_at.clone()),
+                .and_then(|previous| previous.published_at.clone())
+                // 合集/收藏夹 API 直接给发布日期（yyyy-mm-dd），新帖落库时用它，
+                // 省掉「打开详情才补时间」的一次往返。
+                .or_else(|| {
+                    post.get("publishedAt")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToString::to_string)
+                }),
             // 列表点赞可能为 0（抖音列表不带点赞）→ 不要覆盖已有的真实点赞
             likes: if likes > 0 {
                 likes
             } else {
                 existing.as_ref().map(|previous| previous.likes).unwrap_or(0)
             },
+            // 新帖才有互动数（B 站由 archive/stat 补全，其它平台通常为 0）；老帖一律沿用旧值。
             comments: existing
                 .as_ref()
                 .map(|previous| previous.comments)
+                .or_else(|| post.get("comments").and_then(Value::as_i64))
                 .unwrap_or(0),
             collects: existing
                 .as_ref()
                 .map(|previous| previous.collects)
+                .or_else(|| post.get("collects").and_then(Value::as_i64))
                 .unwrap_or(0),
             prev_likes,
             prev_comments,
@@ -1245,10 +1447,13 @@ fn fetch_monitor_via_cdp(
         })?;
     }
 
+    let scanned = posts.iter().take(effective_limit).count();
     Ok(json!({
         "success": true,
         "profileUrl": url,
-        "scanned": posts.iter().take(limit).count(),
+        // 用 effective_limit 而不是原始 limit：B 站会合并合集/收藏夹补全的条目，
+        // 否则会出现「扫描 30 条，新增 190 条」这种自相矛盾的提示。
+        "scanned": scanned,
         "created": created,
         "updated": updated,
         "capturedVia": "chrome-cdp",
@@ -1258,7 +1463,11 @@ fn fetch_monitor_via_cdp(
         "scrollDiag": scroll_diag,
         // 主页声明的作品总数（进度条分母；未知为 0）
         "profileTotal": profile_total,
-        "note": "",
+        "note": if extras_added > 0 {
+            format!("已扫描 {scanned} 条（含合集/收藏夹补全 {extras_added} 条）。")
+        } else {
+            String::new()
+        },
     }))
 }
 
@@ -1761,6 +1970,116 @@ fn monitor_videos_dir(state: &State<'_, AppState>) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// 竞品图片本地缓存目录：`<workspace>/monitor-images/<post_id>/`。
+fn monitor_images_dir(state: &State<'_, AppState>, post_id: &str) -> Result<PathBuf, String> {
+    let dir = workspace_root(state)?.join("monitor-images").join(post_id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建图片缓存目录失败：{e}"))?;
+    Ok(dir)
+}
+
+/// 单张远程图片落盘（带 Referer/UA）。成功返回本地路径，失败返回 `None`。
+///
+/// 为什么必须本地化：B 站 `i0.hdslb.com`、小红书 `sns-webpic*.xhscdn.com` 都校验 Referer，
+/// WebView2 里 `<img src="https://...">` 不带 Referer → 403 → 详情页/导出全是裂图。
+fn cache_remote_image(
+    client: &reqwest::blocking::Client,
+    dir: &Path,
+    url: &str,
+    name: &str,
+    referer: &str,
+    ua: &str,
+) -> Option<String> {
+    let ext = url
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .rsplit('.')
+        .next()
+        .map(|e| e.to_ascii_lowercase())
+        .filter(|e| matches!(e.as_str(), "jpg" | "jpeg" | "png" | "webp" | "gif"))
+        .unwrap_or_else(|| "jpg".to_string());
+    let target = dir.join(format!("{name}.{ext}"));
+    if target.is_file() && std::fs::metadata(&target).map(|m| m.len() > 0).unwrap_or(false) {
+        return Some(target.display().to_string());
+    }
+    let resp = client
+        .get(url)
+        .header("Referer", referer)
+        .header("User-Agent", ua)
+        .send()
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp.bytes().ok()?;
+    if bytes.is_empty() || std::fs::write(&target, &bytes).is_err() {
+        return None;
+    }
+    Some(target.display().to_string())
+}
+
+/// 批量本地化帖子图片；下载失败的条目保留原 URL（至少不丢数据）。
+fn cache_post_images(
+    state: &State<'_, AppState>,
+    post_id: &str,
+    platform: &str,
+    urls: &[String],
+    cover: Option<&str>,
+) -> (Vec<String>, Option<String>) {
+    let dir = match monitor_images_dir(state, post_id) {
+        Ok(dir) => dir,
+        Err(_) => return (urls.to_vec(), cover.map(ToString::to_string)),
+    };
+    let referer = Platform::parse(platform)
+        .map(|p| p.home_url())
+        .unwrap_or("https://www.bilibili.com");
+    let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return (urls.to_vec(), cover.map(ToString::to_string)),
+    };
+
+    let mut local: Vec<String> = Vec::with_capacity(urls.len());
+    for (idx, url) in urls.iter().take(12).enumerate() {
+        // 协议相对 URL（`//i0.hdslb.com/...`）必须先补 https，否则会被误判成「已是本地路径」，
+        // 原样存进记录 → WebView 当成相对路径 → 裂图。
+        let normalized = if url.starts_with("//") {
+            format!("https:{url}")
+        } else {
+            url.trim().to_string()
+        };
+        if !normalized.starts_with("http") {
+            // 已经是本地文件才保留；否则（空串/非法）直接丢
+            if Path::new(&normalized).is_file() {
+                local.push(normalized);
+            }
+            continue;
+        }
+        let name = format!("img_{:02}", idx + 1);
+        match cache_remote_image(&client, &dir, &normalized, &name, referer, ua) {
+            Some(path) => local.push(path),
+            // 下载失败就**丢弃**：远程直连对这两家 CDN 必然 403，留着只会显示裂图。
+            None => println!("[monitor] cache image failed, dropped: {normalized}"),
+        }
+    }
+
+    let cover_local = cover.and_then(|c| {
+        let normalized = if c.starts_with("//") {
+            format!("https:{c}")
+        } else {
+            c.trim().to_string()
+        };
+        if !normalized.starts_with("http") {
+            return Path::new(&normalized).is_file().then_some(normalized);
+        }
+        cache_remote_image(&client, &dir, &normalized, "cover", referer, ua)
+    });
+    (local, cover_local)
+}
+
 /// 在帖子页抽取视频直链的 JS 模板。
 ///
 /// `__XHS__` / `__DY__` 由 Rust 替换为 `true`/`false` 后注入平台分支；其余为 JS 原样执行。
@@ -1902,18 +2221,84 @@ struct VideoStreamCandidates {
     audios: Vec<String>,
 }
 
+/// B 站取流：页面内调 `view`（拿 cid）+ `playurl`（拿 DASH 音视频直链）。
+///
+/// 不复用通用「扫 performance 资源」那套：B 站播放器用 **m4s + Range 分段**，
+/// performance 里全是带 `&range=` 的分片地址，ffmpeg 只下一段就完事；且 CDN 校验 Referer。
+/// 走官方 playurl 拿整段 `baseUrl` 才是完整文件。
+const BILI_VIDEO_EXTRACT_EXPRESSION: &str = r#"
+(async () => {
+    const out = { url: '', urls: [], audios: [], debug: '' };
+    const m = location.pathname.match(/\/video\/(BV[0-9A-Za-z]+)/);
+    const bv = m ? m[1] : '';
+    if (!bv) { out.debug = 'no-bv'; return out; }
+    const getJson = async (u) => {
+        try {
+            const r = await fetch(u, { credentials: 'include' });
+            return await r.json();
+        } catch (e) { return null; }
+    };
+    const view = await getJson('https://api.bilibili.com/x/web-interface/view?bvid=' + bv);
+    if (!view || view.code !== 0 || !view.data) {
+        out.debug = 'view-fail:' + (view && view.code);
+        return out;
+    }
+    const cid = view.data.cid || (view.data.pages && view.data.pages[0] && view.data.pages[0].cid) || 0;
+    if (!cid) { out.debug = 'no-cid'; return out; }
+    const pu = await getJson('https://api.bilibili.com/x/player/playurl?bvid=' + bv + '&cid=' + cid + '&qn=80&fnval=4048&fourk=1');
+    if (!pu || pu.code !== 0 || !pu.data) {
+        out.debug = 'playurl-fail:' + (pu && pu.code);
+        return out;
+    }
+    const pick = (x) => x && (x.baseUrl || x.base_url || '');
+    const dash = pu.data.dash || null;
+    if (dash) {
+        const vids = (dash.video || []).filter((x) => pick(x));
+        // 优先 avc(h264, codecid=7)：WebView 直接能播；再按清晰度 id 从高到低
+        vids.sort((a, b) => {
+            const ca = a.codecid === 7 ? 1 : 0;
+            const cb = b.codecid === 7 ? 1 : 0;
+            if (ca !== cb) return cb - ca;
+            return (b.id || 0) - (a.id || 0);
+        });
+        out.urls = vids.slice(0, 4).map(pick);
+        const au = (dash.audio || []).filter((x) => pick(x));
+        au.sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0));
+        out.audios = au.slice(0, 2).map(pick);
+    } else if (pu.data.durl && pu.data.durl[0]) {
+        // 老格式（番剧/部分版权视频）：整段 mp4
+        out.urls = (pu.data.durl || []).slice(0, 4).map((d) => d.url).filter(Boolean);
+    }
+    out.url = out.urls[0] || '';
+    out.debug = JSON.stringify({ bv: bv, cid: cid, videos: out.urls.length, audios: out.audios.length });
+    return out;
+})()
+"#;
+
 async fn extract_video_stream_url_async(
     ws_url: &str,
     post_url: &str,
     platform: &str,
 ) -> Result<VideoStreamCandidates, String> {
-    let mut expression = VIDEO_EXTRACT_EXPRESSION.to_string();
-    expression = expression
-        .replace("__XHS__", if Platform::parse(platform) == Some(Platform::Xiaohongshu) { "true" } else { "false" })
-        .replace("__DY__", if Platform::parse(platform) == Some(Platform::Douyin) { "true" } else { "false" });
+    let is_bili = Platform::parse(platform) == Some(Platform::Bilibili);
+    let (expression, await_promise) = if is_bili {
+        (BILI_VIDEO_EXTRACT_EXPRESSION.to_string(), true)
+    } else {
+        let mut expr = VIDEO_EXTRACT_EXPRESSION.to_string();
+        expr = expr
+            .replace("__XHS__", if Platform::parse(platform) == Some(Platform::Xiaohongshu) { "true" } else { "false" })
+            .replace("__DY__", if Platform::parse(platform) == Some(Platform::Douyin) { "true" } else { "false" });
+        (expr, false)
+    };
 
-    let result =
-        headless_browser::navigate_and_eval_settle(ws_url, post_url, &expression, 8_000).await?;
+    let result = headless_browser::navigate_and_eval_settle(
+        ws_url,
+        post_url,
+        &expression,
+        8_000,
+        await_promise,
+    )
+    .await?;
     // navigate_and_eval 返回 JS 求值结果；要么是对象，要么是字符串化的对象，做兼容解析。
     let parsed = if result.is_string() {
         serde_json::from_str::<Value>(result.as_str().unwrap_or("{}"))
@@ -2155,7 +2540,7 @@ fn download_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value)
     if !Platform::parse(&record.platform).map(|p| p.supports_video()).unwrap_or(false) {
         return Ok(json!({
             "success": false,
-            "note": "目前仅支持小红书 / 抖音的视频下载（需登录态 Chrome）。",
+            "note": "目前仅支持小红书 / 抖音 / B 站的视频下载（需登录态 Chrome）。",
         }));
     }
     let port = headless_browser::active_chrome_port(&record.platform);
@@ -3090,10 +3475,11 @@ fn write_obsidian_card(
 
         // ---- 视频（折叠，避免一开笔记就加载大文件） ----
         if let Some(v) = &video_name {
+            // 视频嵌入**不能**放进 `<details>`：Obsidian 不解析 HTML 块里的 wikilink，
+            // 会把 `![[视频.mp4]]` 当纯文本原样显示（实测）。图片用 HTML `<img>` 没事，
+            // 但 `![[...]]` 是 Obsidian 自己的语法，必须裸放在正文里。
             md.push_str("## 视频\n\n");
-            md.push_str("<details>\n<summary>展开视频</summary>\n\n");
             md.push_str(&format!("![[{vault}{v}]]\n\n"));
-            md.push_str("</details>\n\n");
         }
 
         md.push_str("---\n\n");
