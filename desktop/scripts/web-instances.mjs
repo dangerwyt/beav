@@ -380,7 +380,11 @@ const spawning = new Map();
 /** 单实例模式：所有用户共用 daemon 端口，靠 owner 头区分；多实例模式：各自的 port。 */
 function targetOf(user, asAdmin = false) {
   if (SINGLE_DAEMON) {
-    return { port: DAEMON_PORT, owner: asAdmin ? null : user?.username || null };
+    // role=admin 的 web 账号也按管理员处理（不加 owner 头 → 看全部），
+    // 否则它只会看到 owner=admin 的那部分数据。
+    const isAdminUser = user?.role === 'admin';
+    const owner = asAdmin || isAdminUser ? null : user?.username || null;
+    return { port: DAEMON_PORT, owner };
   }
   return { port: user.port, owner: null };
 }
