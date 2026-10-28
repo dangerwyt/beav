@@ -1,0 +1,31 @@
+# Beav Web 反向代理示例（Caddy 2）
+#
+# 多用户模式（推荐）：浏览器 -> Caddy(443) -> web-instances (:8090) -> 各用户实例
+# 单用户模式：把 upstream 换成 127.0.0.1:8080
+#
+# 关键点：
+#  1) flush_interval -1：SSE(/api/events) 必须立即 flush，否则事件会被缓冲、实时进度失效；
+#  2) 公网域名 Caddy 会自动申请证书；内网 IP 只能用 tls internal（自签，需客户端信任根证书）；
+#  3) 不要对 text/event-stream 开压缩（本示例未启用 encode）。
+
+# ---------- 公网域名（自动 HTTPS） ----------
+beav.example.com {
+	reverse_proxy 127.0.0.1:8090 {
+		flush_interval -1
+	}
+}
+
+# ---------- 内网 IP（自签） ----------
+# https://192.168.1.10 {
+# 	tls internal
+# 	reverse_proxy 127.0.0.1:8090 {
+# 		flush_interval -1
+# 	}
+# }
+
+# ---------- 单用户模式 ----------
+# beav.example.com {
+# 	reverse_proxy 127.0.0.1:8080 {
+# 		flush_interval -1
+# 	}
+# }

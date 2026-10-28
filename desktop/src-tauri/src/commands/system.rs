@@ -28,6 +28,7 @@ pub fn handle_system_channel(
         | "app:startup-migration-status"
         | "app:open-knowledge-api-guide"
         | "app:open-path"
+        | "app:runtime-flags"
         | "settings:pick-workspace-dir"
         | "ai-model-manager:snapshot"
         | "ai-model-manager:resolve"
@@ -64,6 +65,13 @@ pub fn handle_system_channel(
                 "app:startup-migration-start" => crate::start_startup_migration(app, state),
                 "app:open-knowledge-api-guide" => app_actions::open_knowledge_api_guide(app),
                 "app:open-path" => app_actions::open_path(state, payload),
+                // Web 受管多用户：不需要官方账号时跳过登录/扫码闸门。
+                "app:runtime-flags" => Ok(json!({
+                    "localMode": std::env::var("BEAV_SKIP_OFFICIAL_LOGIN")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                })),
                 "settings:pick-workspace-dir" => app_actions::pick_workspace_dir(),
                 "ai-model-manager:snapshot" => ai_model_ops::snapshot(state),
                 "ai-model-manager:resolve" => ai_model_ops::resolve(state, payload),

@@ -11,6 +11,14 @@ const CURRENT_WORKSPACE_DIR_NAME: &str = ".beav";
 const LEGACY_REDBOX_WORKSPACE_DIR_NAME: &str = ".redbox";
 const LEGACY_REDCONVERT_WORKSPACE_DIR_NAME: &str = ".redconvert";
 
+/// Web 多实例（受管模式）：导出根 / 工作区由服务端分配，禁止用户修改。
+pub(crate) fn managed_dirs_locked() -> bool {
+    std::env::var("BEAV_MANAGED_DIRS")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
 pub(crate) fn store_root(state: &State<'_, AppState>) -> Result<PathBuf, String> {
     let root = state
         .store_path
@@ -68,6 +76,13 @@ pub(crate) fn configured_workspace_dir(settings: &Value) -> Option<PathBuf> {
 }
 
 pub(crate) fn compatible_workspace_base_dir(settings: &Value) -> PathBuf {
+    // 多实例隔离：环境变量优先级最高，确保每个用户的图片/视频/导出都在自己的目录。
+    if let Ok(raw) = std::env::var("BEAV_WORKSPACE_ROOT") {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            return PathBuf::from(raw);
+        }
+    }
     if let Some(configured) = configured_workspace_dir(settings) {
         return configured;
     }

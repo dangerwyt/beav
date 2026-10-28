@@ -9,3 +9,5 @@ artifacts/
 .DS_Store
 .env.local
 .env.*.local
+/users.json
+/.beav-session-secret

@@ -5,6 +5,7 @@ import ReactMarkdown from 'react-markdown';
 import type { PendingChatMessage } from '../features/app-shell/types';
 import { useFeatureFlag } from '../hooks/useFeatureFlags';
 import { hasRenderableAssetUrl, resolveAssetUrl } from '../utils/pathManager';
+import { isTauriRuntime } from '../bridge/browserHost';
 import { SAFE_REMARK_PLUGINS } from '../utils/markdownRemarkPlugins';
 import { buildRedClawAuthoringMessage } from '../utils/redclawAuthoring';
 import { appAlert, appConfirm } from '../utils/appDialogs';
@@ -2661,7 +2662,12 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
                                 </div>
                             </div>
 
-                            {/* 全局导出根目录（与工作区解耦） */}
+                            {/* 全局导出根目录（与工作区解耦）；Web 多用户模式下由服务器固定 */}
+                            {!isTauriRuntime() ? (
+                                <div className="mt-3 rounded-xl border border-border/60 bg-surface-elevated/60 px-3 py-2 text-[11px] font-medium text-text-tertiary">
+                                    导出目录由服务器统一管理（Web 多用户模式），客户端不可修改。
+                                </div>
+                            ) : (
                             <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-border/60 bg-surface-elevated/60 px-3 py-2">
                                 <span className="shrink-0 text-[12px] font-bold text-text-primary">导出根目录</span>
                                 <span
@@ -2689,6 +2695,7 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
                                     </button>
                                 )}
                             </div>
+                            )}
 
                         </div>
                         {filteredKnowledgeItems.length === 0 ? (

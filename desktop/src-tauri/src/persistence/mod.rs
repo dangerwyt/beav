@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::sync::{MutexGuard, TryLockError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::Duration;
 use tauri::State;
 
@@ -290,6 +290,17 @@ fn select_store_path(base: &Path) -> PathBuf {
 }
 
 pub fn build_store_path() -> PathBuf {
+    // 多实例隔离：每个用户一个独立 store 目录。
+    if let Ok(raw) = std::env::var("BEAV_STORE_DIR") {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            let path = PathBuf::from(raw).join(CURRENT_STORE_FILE_NAME);
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            return path;
+        }
+    }
     let base = config_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let path = select_store_path(&base);
@@ -1066,7 +1077,33 @@ pub fn load_store(path: &PathBuf) -> AppStore {
     store
 }
 
+/// 全局写盘锁：`persist_store` 与延迟写盘任务共用，避免并发写坏 `beav-state.json`。
+fn store_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// 退出前同步落盘。延迟写盘任务有 180ms 防抖，进程销毁时可能来不及写，
+/// 导致「刚抓到的正文」这类最后变更丢失。
+pub fn flush_store_now(state: &State<'_, AppState>) {
+    // ExitRequested 与 Exit 都会触发，只写一次。
+    static FLUSHED: AtomicBool = AtomicBool::new(false);
+    if FLUSHED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let snapshot = match state.store.lock() {
+        Ok(store) => store.clone(),
+        Err(_) => return,
+    };
+    if let Err(error) = persist_store(&state.store_path, &snapshot) {
+        eprintln!("[persist] flush on exit failed: {error}");
+    }
+}
+
 pub fn persist_store(path: &PathBuf, store: &AppStore) -> Result<(), String> {
+    let _write_guard = store_write_lock()
+        .lock()
+        .map_err(|_| "store 写盘锁已损坏".to_string())?;
     let mut snapshot = store.clone();
     crate::session_manager::enforce_default_retention(&mut snapshot);
     crate::auth::sanitize_store_for_persist(&mut snapshot);
@@ -1423,6 +1460,15 @@ fn schedule_store_persist(state: &State<'_, AppState>) {
             let sessions = std::mem::take(&mut snapshot.chat_sessions);
             let context_records = std::mem::take(&mut snapshot.session_context_records);
             snapshot.debug_logs.clear();
+
+            // 与 persist_store 共用写盘锁，避免与退出 flush 并发写坏文件。
+            let _write_guard = match store_write_lock().lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    scheduled.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
 
             // Write per-session JSONL files
             let existing_index = load_session_index(&path)

@@ -27,6 +27,9 @@ interface AppUpdateInstallResult {
 
 export function createSystemBridge(core: BridgeCore) {
   return {
+    /** 运行时开关：localMode=true 表示跳过官方登录/扫码闸门（Web 受管多用户）。 */
+    runtimeFlags: () =>
+      core.invokeChannel('app:runtime-flags', {}) as Promise<{ localMode?: boolean }>,
     files: {
       showInFolder: (payload: { source: string }) => core.invokeChannel('file:show-in-folder', payload),
       copyImage: (payload: { source: string }) => core.invokeChannel('file:copy-image', payload),

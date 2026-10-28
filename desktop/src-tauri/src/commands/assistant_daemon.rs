@@ -47,6 +47,12 @@ pub fn ensure_assistant_daemon_running(
         return Err("Feishu websocket 接入尚未实现，请先切回 webhook 模式。".to_string());
     }
 
+    // 多实例隔离：每个实例必须用不同端口，否则第二个实例绑定失败。
+    let effective_port = std::env::var("BEAV_DAEMON_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(assistant_snapshot.port);
+
     {
         let mut runtime_guard = state
             .assistant_runtime
@@ -57,14 +63,14 @@ pub fn ensure_assistant_daemon_running(
             let join = run_assistant_listener(
                 app.clone(),
                 assistant_snapshot.host.clone(),
-                assistant_snapshot.port,
+                effective_port,
                 stop.clone(),
             )?;
             *runtime_guard = Some(AssistantRuntime {
                 stop,
                 join: Some(join),
                 host: assistant_snapshot.host.clone(),
-                port: assistant_snapshot.port,
+                port: effective_port,
             });
         }
     }

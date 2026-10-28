@@ -9,11 +9,12 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    mpsc::{channel as mpsc_channel, RecvTimeoutError, Sender},
+    Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Listener, Manager, State};
 
 use crate::store::assistant as assistant_store;
 use crate::{
@@ -948,6 +949,30 @@ fn handle_assistant_connection(app: AppHandle, mut stream: TcpStream, addr: Sock
     .unwrap_or_else(|_| AssistantStateRecord::default());
     let (raw_headers, body) = parse_http_request_parts(&request);
     let (method, _path, headers) = parse_http_request_meta(&raw_headers);
+    if normalize_request_path(&path) == "/api/events" {
+        stream_sse(&mut stream);
+        return;
+    }
+    if normalize_request_path(&path) == "/api/file" {
+        if method != "GET" {
+            let _ = http_json_response(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                json!({ "success": false, "error": "method not allowed" }),
+            );
+            return;
+        }
+        if let Err(error) = serve_local_file(&app, &mut stream, &path) {
+            let _ = http_json_response(
+                &mut stream,
+                404,
+                "Not Found",
+                json!({ "success": false, "error": error }),
+            );
+        }
+        return;
+    }
     if crate::is_acp_gateway_path(&path) {
         emit_assistant_log(&app, "assistant daemon matched route kind: acp");
         let acp_local_only = with_store(&app.state::<AppState>(), |store| {
@@ -1095,12 +1120,214 @@ fn handle_assistant_connection(app: AppHandle, mut stream: TcpStream, addr: Sock
     );
 }
 
+// ==== Web 版实时事件（SSE 桥）==============================================
+// 桌面端 `emit` 的事件，除了发给 WebView，也广播给通过 HTTP 连上来的浏览器。
+// 只新增监听 + 新路由，桌面端原有行为不变。
+
+fn sse_clients() -> &'static Mutex<Vec<Sender<String>>> {
+    static CLIENTS: OnceLock<Mutex<Vec<Sender<String>>>> = OnceLock::new();
+    CLIENTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn broadcast_sse_event(event: &str, payload: &str) {
+    let payload_value: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    let frame = format!(
+        "data: {}\n\n",
+        json!({ "event": event, "payload": payload_value })
+    );
+    let Ok(mut clients) = sse_clients().lock() else {
+        return;
+    };
+    // 接收端已断开（send 失败）时顺手清理。
+    clients.retain(|sender| sender.send(frame.clone()).is_ok());
+}
+
+/// 前端 `ipcRenderer.on(channel, …)` 会订阅的事件名，逐个注册并广播到 SSE。
+const SSE_EVENT_NAMES: &[&str] = &[
+    "advisors:changed",
+    "advisors:download-progress",
+    "app:startup-migration-status",
+    "app:update-available",
+    "app:update-install-progress",
+    "archives:sample-created",
+    "assistant:daemon-log",
+    "assistant:daemon-status",
+    "auth:data-changed",
+    "auth:state-changed",
+    "background:task-updated",
+    "chat:session-title-updated",
+    "data:changed",
+    "diagnostics:report-pending",
+    "generation:job-log",
+    "generation:job-updated",
+    "knowledge:catalog-updated",
+    "knowledge:changed",
+    "knowledge:docs-updated",
+    "knowledge:file-index-updated",
+    "knowledge:new-youtube-video",
+    "knowledge:note-updated",
+    "knowledge:youtube-video-updated",
+    "llm-readiness:state-changed",
+    "manuscripts:render-progress",
+    "manuscripts:write-proposal",
+    "plugins:changed",
+    "redclaw:runner-status",
+    "redclaw:task-event",
+    "runtime:event",
+    "settings:updated",
+    "space:changed",
+    "wander:progress",
+    "wander:result",
+    "youtube:fetch-info-progress",
+];
+
+/// 幂等：daemon 重启时不会重复注册。
+pub(crate) fn install_sse_event_bridge(app: &AppHandle) {
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    for name in SSE_EVENT_NAMES {
+        let event_name = (*name).to_string();
+        let _ = app.listen(event_name.clone(), move |event| {
+            broadcast_sse_event(&event_name, event.payload());
+        });
+    }
+    emit_assistant_log(app, "sse event bridge installed");
+}
+
+fn mime_for_path(path: &std::path::Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "json" => "application/json; charset=utf-8",
+        "txt" | "srt" => "text/plain; charset=utf-8",
+        "md" => "text/markdown; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Web 版文件代理：`GET /api/file?path=<绝对路径>`，仅允许工作区 / 导出根内的文件。
+/// 浏览器读不了 `file://`，Web 端图片/视频/字幕都靠它。
+fn serve_local_file(app: &AppHandle, stream: &mut TcpStream, path: &str) -> Result<(), String> {
+    let query = path.split_once('?').map(|(_, value)| value).unwrap_or("");
+    let mut raw_path = None;
+    for pair in query.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            if key == "path" {
+                raw_path = Some(value.to_string());
+            }
+        }
+    }
+    let raw_path = raw_path.ok_or_else(|| "缺少 path 参数".to_string())?;
+    let decoded = urlencoding::decode(&raw_path)
+        .map_err(|error| error.to_string())?
+        .into_owned();
+    let requested = std::path::PathBuf::from(decoded.trim());
+    let canonical = requested
+        .canonicalize()
+        .map_err(|_| format!("文件不存在: {}", requested.display()))?;
+
+    let state = app.state::<AppState>();
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(guard) = state.workspace_root_cache.lock() {
+        if let Ok(root) = guard.canonicalize() {
+            roots.push(root);
+        }
+    }
+    if let Ok(export_root) = with_store(&state, |store| Ok(store.monitor_export_root.clone())) {
+        let export_root = export_root.trim();
+        if !export_root.is_empty() {
+            if let Ok(root) = std::path::PathBuf::from(export_root).canonicalize() {
+                roots.push(root);
+            }
+        }
+    }
+    if !roots.iter().any(|root| canonical.starts_with(root)) {
+        return Err("路径不在允许的目录内".to_string());
+    }
+
+    let bytes = std::fs::read(&canonical).map_err(|error| error.to_string())?;
+    let response = http_response_bytes(
+        200,
+        "OK",
+        &[
+            ("Content-Type", mime_for_path(&canonical)),
+            ("Access-Control-Allow-Origin", "*"),
+            ("Cache-Control", "private, max-age=3600"),
+        ],
+        Some(&bytes),
+    );
+    stream
+        .write_all(&response)
+        .map_err(|error| error.to_string())
+}
+
+fn stream_sse(stream: &mut TcpStream) {
+    const HEADERS: &str = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Type: text/event-stream\r\n",
+        "Cache-Control: no-cache\r\n",
+        "Connection: keep-alive\r\n",
+        "Access-Control-Allow-Origin: *\r\n",
+        "\r\n"
+    );
+    if stream.write_all(HEADERS.as_bytes()).is_err() {
+        return;
+    }
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let (sender, receiver) = mpsc_channel::<String>();
+    if sse_clients()
+        .lock()
+        .map(|mut clients| clients.push(sender))
+        .is_err()
+    {
+        return;
+    }
+    let _ = stream.write_all(b": connected\n\n");
+    let _ = stream.flush();
+    loop {
+        match receiver.recv_timeout(Duration::from_secs(15)) {
+            Ok(frame) => {
+                if stream.write_all(frame.as_bytes()).is_err() {
+                    break;
+                }
+                let _ = stream.flush();
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if stream.write_all(b": ping\n\n").is_err() {
+                    break;
+                }
+                let _ = stream.flush();
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 pub(crate) fn run_assistant_listener(
     app: AppHandle,
     host: String,
     port: i64,
     stop: Arc<AtomicBool>,
 ) -> Result<JoinHandle<()>, String> {
+    install_sse_event_bridge(&app);
     let listener =
         TcpListener::bind(format!("{}:{}", host, port)).map_err(|error| error.to_string())?;
     listener

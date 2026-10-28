@@ -403,6 +403,20 @@ function App() {
   const { snapshot: officialAuthState, bootstrapped: officialAuthBootstrapped } = useOfficialAuthState();
   const { snapshot: llmReadinessState, bootstrapped: llmReadinessBootstrapped } = useLlmReadinessState();
   const [appOnboardingOpen, setAppOnboardingOpen] = useState(false);
+  // 本地模式：Web 受管实例不依赖官方账号，跳过登录/扫码与 LLM 就绪闸门。
+  const [localMode, setLocalMode] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    window.ipcRenderer
+      .runtimeFlags()
+      .then((flags) => {
+        if (!cancelled) setLocalMode(Boolean(flags?.localMode));
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const officialAuthStatus = String(officialAuthState?.status || '').trim();
   const officialAuthPending = !officialAuthBootstrapped
     || officialAuthStatus === 'restoring'
@@ -432,7 +446,7 @@ function App() {
     }
   }, []);
 
-  if (officialAuthPending) {
+  if (!localMode && officialAuthPending) {
     return (
       <>
         <OfficialLoginGate mode="checking" />
@@ -441,7 +455,7 @@ function App() {
     );
   }
 
-  if (officialAuthNeedsLogin) {
+  if (!localMode && officialAuthNeedsLogin) {
     return (
       <>
         <OfficialLoginGate mode={officialAuthStatus === 'reauthRequired' ? 'expired' : 'login'} />
@@ -450,7 +464,7 @@ function App() {
     );
   }
 
-  if (llmReadinessPending) {
+  if (!localMode && llmReadinessPending) {
     return (
       <>
         <OfficialLoginGate mode="checking" />
@@ -459,7 +473,7 @@ function App() {
     );
   }
 
-  if (!llmReadinessState?.ready) {
+  if (!localMode && !llmReadinessState?.ready) {
     return (
       <>
         <OfficialLoginGate mode={officialAuthStatus === 'reauthRequired' ? 'expired' : 'login'} />

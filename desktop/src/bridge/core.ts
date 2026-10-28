@@ -36,6 +36,52 @@ const explicitChannelByCommand = Object.fromEntries(
 
 const channelListeners = new Map<string, Map<Listener, ListenerRecord>>();
 
+// 浏览器模式：用同源 SSE（/api/events）接收桌面端广播的事件。
+// 桌面端（Tauri）仍走原生事件系统，不受影响。
+let browserEventSource: EventSource | null = null;
+
+function dispatchBrowserEvent(channel: string, payload: unknown): void {
+  const map = channelListeners.get(channel);
+  if (!map) return;
+  for (const [listener] of map) {
+    try {
+      listener({ __tauri: true, channel }, payload);
+    } catch (error) {
+      console.warn(`[] browser listener failed for ${channel}:`, error);
+    }
+  }
+}
+
+function ensureBrowserEventStream(): void {
+  if (typeof EventSource === 'undefined' || browserEventSource) return;
+  const open = (url: string, isFallback: boolean): void => {
+    const source = new EventSource(url);
+    browserEventSource = source;
+    source.onmessage = (message: MessageEvent<string>) => {
+      let parsed: { event?: string; payload?: unknown } | null = null;
+      try {
+        parsed = JSON.parse(message.data) as { event?: string; payload?: unknown };
+      } catch {
+        return;
+      }
+      const channel = String(parsed?.event || '');
+      if (channel) dispatchBrowserEvent(channel, parsed?.payload);
+    };
+    source.onerror = () => {
+      if (source.readyState !== EventSource.CLOSED) return;
+      source.close();
+      // 同源没有 SSE（例如直接用 Vite dev/preview 打开页面）→ 回退直连本机 daemon。
+      if (!isFallback) {
+        const host = typeof location !== 'undefined' && location.hostname ? location.hostname : '127.0.0.1';
+        open(`http://${host}:31937/api/events`, true);
+      } else if (browserEventSource === source) {
+        browserEventSource = null;
+      }
+    };
+  };
+  open('/api/events', false);
+}
+
 async function invokeChannel(channel: string, payload?: unknown): Promise<any> {
   try {
     if (!isTauriRuntime()) {
@@ -170,6 +216,12 @@ async function invokeCommandGuarded<T = unknown>(
 
 function on(channel: string, listener: Listener): void {
   if (!isTauriRuntime()) {
+    // Web 版：登记监听并通过 SSE 接收（桌面端不受影响）。
+    if (!channelListeners.has(channel)) {
+      channelListeners.set(channel, new Map());
+    }
+    channelListeners.get(channel)!.set(listener, {});
+    ensureBrowserEventStream();
     return;
   }
   const entry: ListenerRecord = {};

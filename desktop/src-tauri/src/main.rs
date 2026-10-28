@@ -120,6 +120,13 @@ pub(crate) use workspace::paths::*;
 use std::io::Write;
 
 fn main() {
+    // 多实例隔离：每个实例必须用独立的 WebView2 user-data 目录，否则会争抢同一份缓存/锁。
+    if let Ok(data_dir) = std::env::var("BEAV_WEBVIEW_DATA_DIR") {
+        let data_dir = data_dir.trim();
+        if !data_dir.is_empty() {
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", data_dir);
+        }
+    }
     // 全局 panic 落盘：应用静默闪退时，把触发位置与信息写入临时目录的日志文件，便于定位根因。
     // 同时保留默认 hook（继续输出到 stderr）。Rust Mutex 一旦中毒会连锁 panic，落盘能锁住第一现场。
     let default_hook = std::panic::take_hook();
@@ -223,6 +230,8 @@ fn main() {
                 tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
             ) {
                 let state = app.state::<AppState>();
+                // 退出前同步落盘，避免延迟写盘（180ms 防抖）来不及写导致最后变更丢失。
+                persistence::flush_store_now(&state);
                 if let Ok(mut guard) = state.media_generation_runtime.lock() {
                     if let Some(mut runtime) = guard.take() {
                         media_runtime::stop_media_generation_runtime(&mut runtime);

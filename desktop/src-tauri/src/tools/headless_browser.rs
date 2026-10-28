@@ -119,15 +119,34 @@ fn which_browser(name: &str) -> Result<PathBuf, ()> {
 }
 
 /// 每个平台独立的 profile 目录，cookie/缓存完全隔离。
+///
+/// 多实例：优先 `BEAV_CHROME_PROFILE_DIR`；否则跟随实例的 `BEAV_STORE_DIR`
+/// （`<store>/browser-profile`），避免所有用户共用同一份平台登录态。
 pub fn profile_dir_for(app: &AppHandle, platform: &str) -> Result<PathBuf, String> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("app_data_dir 不可用: {error}"))?;
-    let dir = base.join("browser-profile").join(platform);
+    let base = chrome_profile_root(app)?;
+    let dir = base.join(platform);
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("创建 profile 目录失败: {error}"))?;
     Ok(dir)
+}
+
+fn chrome_profile_root(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Ok(raw) = std::env::var("BEAV_CHROME_PROFILE_DIR") {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            return Ok(PathBuf::from(raw));
+        }
+    }
+    if let Ok(raw) = std::env::var("BEAV_STORE_DIR") {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            return Ok(PathBuf::from(raw).join("browser-profile"));
+        }
+    }
+    app.path()
+        .app_data_dir()
+        .map(|base| base.join("browser-profile"))
+        .map_err(|error| format!("app_data_dir 不可用: {error}"))
 }
 
 /// 清理使用同一 profile（user-data-dir）的残留浏览器进程。
@@ -652,38 +671,53 @@ pub async fn navigate_and_eval_settle(
 ) -> Result<Value, String> {
     let client = CdpClient::connect(ws_url).await?;
     let target_id = client.create_target("about:blank").await?;
-    let session_id = client.attach_to_target(&target_id).await?;
-    // 导航到目标 URL（sessionId 消息顶层）
-    let nav_params = json!({ "url": target_url });
-    let _ = client
-        .send_request("Page.navigate", Some(nav_params), Some(&session_id))
-        .await?;
-    // 等真实文档加载完成。
-    //
-    // ⚠️ 不能用 `wait_for_selector("body")`：新 target 是 about:blank，**它本来就有 body**，
-    // 轮询会在导航真正开始前就判定"已就绪"，于是只剩固定 sleep 在兜。抖音/小红书这类 SPA
-    // 的状态对象（`_ROUTER_DATA` / `__INITIAL_STATE__`）是异步注入的，等不够就会读了个空页，
-    // 表现为"明明页面有视频，却一个直链都抽不到"。所以这里轮询 `readyState === 'complete'`。
-    let nav_deadline = std::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        let state = client
-            .evaluate(
-                &session_id,
-                "(() => { try { return document.readyState; } catch (e) { return ''; } })()",
-                false,
-            )
-            .await;
-        if matches!(state.as_ref().ok().and_then(Value::as_str), Some("complete")) {
-            break;
+    // 导航/求值全放进 inner async 块：无论成功还是中途 `?` 返回，
+    // 都会走到下面的 Target.closeTarget —— 否则每抓一条就留一个标签页。
+    let outcome: Result<Value, String> = async {
+        let session_id = client.attach_to_target(&target_id).await?;
+        // 导航到目标 URL（sessionId 消息顶层）
+        let nav_params = json!({ "url": target_url });
+        let _ = client
+            .send_request("Page.navigate", Some(nav_params), Some(&session_id))
+            .await?;
+        // 等真实文档加载完成。
+        //
+        // ⚠️ 不能用 `wait_for_selector("body")`：新 target 是 about:blank，**它本来就有 body**，
+        // 轮询会在导航真正开始前就判定"已就绪"，于是只剩固定 sleep 在兜。抖音/小红书这类 SPA
+        // 的状态对象（`_ROUTER_DATA` / `__INITIAL_STATE__`）是异步注入的，等不够就会读了个空页，
+        // 表现为"明明页面有视频，却一个直链都抽不到"。所以这里轮询 `readyState === 'complete'`。
+        let nav_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let state = client
+                .evaluate(
+                    &session_id,
+                    "(() => { try { return document.readyState; } catch (e) { return ''; } })()",
+                    false,
+                )
+                .await;
+            if matches!(state.as_ref().ok().and_then(Value::as_str), Some("complete")) {
+                break;
+            }
+            if std::time::Instant::now() >= nav_deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        if std::time::Instant::now() >= nav_deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // readyState 到位后再给 SPA 异步渲染/注流留静置时间
+        tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+        client.evaluate(&session_id, expression, await_promise).await
     }
-    // readyState 到位后再给 SPA 异步渲染/注流留静置时间
-    tokio::time::sleep(Duration::from_millis(settle_ms)).await;
-    client.evaluate(&session_id, expression, await_promise).await
+    .await;
+    // 抓完即关临时标签页（浏览器级命令，无 session），再优雅关闭 WS。
+    let _ = client
+        .send_request(
+            "Target.closeTarget",
+            Some(json!({ "targetId": target_id })),
+            None,
+        )
+        .await;
+    client.close().await;
+    outcome
 }
 
 /// 剥掉 URL 里的 `modal_id` 查询参数（抖音视频弹窗）。
@@ -955,10 +989,29 @@ pub async fn scrape_profile_posts(
                     const desc = descEl ? (descEl.textContent || '').trim() : '';
                     title = cleanTitle(desc || title);
                 }
-                // B 站：标题在 .bili-video-card__info--tit（带完整 title 属性，避免 ellipsis 截断）
+                // B 站：改版可能换 class，用多候选兜底（标题节点 / 视频链接 title / 封面 img alt / 锚点 title），
+                // 并把「播放量+弹幕+时长」这类纯数字脏值判为无效，避免写进卡片标题（如 6.8万208052）。
                 if (group.kind === 'bilibili') {
-                    const t = card && card.querySelector('.bili-video-card__info--tit, [class*="info--tit"], h3');
-                    if (t) title = (t.getAttribute('title') || t.textContent || '').trim();
+                    const pickAttr = (el, name) => (el && el.getAttribute && el.getAttribute(name) ? String(el.getAttribute(name)).trim() : '');
+                    const titleEl = card && card.querySelector('.bili-video-card__info--tit, [class*="info--tit"], [class*="video-name"], h3');
+                    const titleLink = card && card.querySelector('a[href*="/video/"][title]');
+                    const coverImg = card && card.querySelector('img[alt]');
+                    const candidates = [
+                        pickAttr(titleEl, 'title') || (titleEl ? (titleEl.textContent || '').trim() : ''),
+                        pickAttr(titleLink, 'title'),
+                        pickAttr(coverImg, 'alt'),
+                        pickAttr(first.querySelector ? first.querySelector('img[alt]') : null, 'alt'),
+                        pickAttr(first, 'title'),
+                        title,
+                    ];
+                    const isStatsLike = (s) => {
+                        const trimmed = String(s || '').trim();
+                        // 以 mm:ss / h:mm:ss 结尾 = 时长（如 6.8万20108:52、充电专属3.2万9917:21）
+                        if (/\d{1,2}:\d{2}(?::\d{2})?$/.test(trimmed)) return true;
+                        const stripped = trimmed.replace(/[万亿]/g, '');
+                        return /\d/.test(trimmed) && !/[\u4e00-\u9fa5]/.test(stripped);
+                    };
+                    title = candidates.find((v) => v && v.length > 1 && !isStatsLike(v)) || '';
                 }
                 let likes = 0;
                 if (card) {
@@ -1196,6 +1249,9 @@ pub async fn scrape_profile_posts_paged(
                 const text = (document.body && document.body.innerText) || '';
                 let m = text.match(/笔记\s*([\d,]+)/);
                 if (!m) m = text.match(/作品\s*([\d,]+)/);
+                // B 站：视频 tab 的「视频 84」（投稿 105 可能含图文，优先取视频数）
+                if (!m) m = text.match(/视频\s*([\d,]+)/);
+                if (!m) m = text.match(/投稿\s*([\d,]+)/);
                 if (m) return parseInt(String(m[1]).replace(/,/g, ''), 10) || 0;
                 // 兜底：XHS SPA 全局状态里的作品数（他人主页也可能藏在这里）
                 const st = window.__INITIAL_STATE__;
@@ -1366,10 +1422,28 @@ pub async fn scrape_profile_posts_paged(
                     const desc = descEl ? (descEl.textContent || '').trim() : '';
                     title = cleanTitle(desc || title);
                 }
-                // B 站：标题在 .bili-video-card__info--tit（带完整 title 属性）
+                // B 站：多候选 + 脏值过滤（同 scrape_profile_posts，改版后 title 节点可能换 class）
                 if (group.kind === 'bilibili') {
-                    const t = card && card.querySelector('.bili-video-card__info--tit, [class*="info--tit"], h3');
-                    if (t) title = (t.getAttribute('title') || t.textContent || '').trim();
+                    const pickAttr = (el, name) => (el && el.getAttribute && el.getAttribute(name) ? String(el.getAttribute(name)).trim() : '');
+                    const titleEl = card && card.querySelector('.bili-video-card__info--tit, [class*="info--tit"], [class*="video-name"], h3');
+                    const titleLink = card && card.querySelector('a[href*="/video/"][title]');
+                    const coverImg = card && card.querySelector('img[alt]');
+                    const candidates = [
+                        pickAttr(titleEl, 'title') || (titleEl ? (titleEl.textContent || '').trim() : ''),
+                        pickAttr(titleLink, 'title'),
+                        pickAttr(coverImg, 'alt'),
+                        pickAttr(first.querySelector ? first.querySelector('img[alt]') : null, 'alt'),
+                        pickAttr(first, 'title'),
+                        title,
+                    ];
+                    const isStatsLike = (s) => {
+                        const trimmed = String(s || '').trim();
+                        // 以 mm:ss / h:mm:ss 结尾 = 时长（如 6.8万20108:52、充电专属3.2万9917:21）
+                        if (/\d{1,2}:\d{2}(?::\d{2})?$/.test(trimmed)) return true;
+                        const stripped = trimmed.replace(/[万亿]/g, '');
+                        return /\d/.test(trimmed) && !/[\u4e00-\u9fa5]/.test(stripped);
+                    };
+                    title = candidates.find((v) => v && v.length > 1 && !isStatsLike(v)) || '';
                 }
                 let likes = 0;
                 if (card) { const likeEl = card.querySelector('.like-wrapper .count, [class*="like"] [class*="count"], [class*="count"]'); if (likeEl) likes = parseCount(likeEl.textContent); }

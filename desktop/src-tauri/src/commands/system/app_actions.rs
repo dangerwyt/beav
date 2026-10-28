@@ -97,6 +97,9 @@ pub(super) fn open_path(state: &State<'_, AppState>, payload: &Value) -> Result<
 }
 
 pub(super) fn pick_workspace_dir() -> Result<Value, String> {
+    if crate::managed_dirs_locked() {
+        return Err("工作区由服务器统一管理（Web 多用户模式），不能在客户端选择".to_string());
+    }
     let selected = pick_files_native("选择工作区目录", true, false)?;
     let path = selected.first().map(|item| item.display().to_string());
     Ok(json!({

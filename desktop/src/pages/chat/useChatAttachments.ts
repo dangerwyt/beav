@@ -512,7 +512,8 @@ export function useChatAttachments({
   }, [attachFilePath]);
 
   useEffect(() => {
-    if (!allowFileUpload || !isActive) return;
+    // 原生窗口拖拽是 Tauri 专属能力；Web 版（浏览器）没有，跳过。
+    if (!allowFileUpload || !isActive || !isTauriRuntime()) return;
     let disposed = false;
     let unlisten: (() => void) | null = null;
 

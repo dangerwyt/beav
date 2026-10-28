@@ -684,8 +684,17 @@ const SCAN_LIMIT: usize = 30;
 ///
 /// 保留函数签名是为了让所有调用点（fetch_monitor / adhoc 抓取 / 每日预取）无需改动，
 /// 也避免旧前端传 `limit` 时报错。
-fn resolve_scan_limit(_state: &State<'_, AppState>, _payload: &Value) -> usize {
-    SCAN_LIMIT
+/// 单次抓取条数。默认 `SCAN_LIMIT`（日常增量只要最近 30 条）；
+/// 补历史深翻会在 payload 里显式传 `limit = BACKFILL_MAX(500)`，必须尊重它——
+/// 否则滚动循环里的 `captured >= limit` 会在第一屏就把 500 的目标截成 30。
+fn resolve_scan_limit(_state: &State<'_, AppState>, payload: &Value) -> usize {
+    let requested = payload
+        .get("limit")
+        .or_else(|| payload.get("scanLimit"))
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(SCAN_LIMIT);
+    requested.clamp(1, 2000)
 }
 
 /// 异常值检测：把某帖当前点赞与该作者近窗口的点赞中位数比较，超过阈值倍数即判为爆文。
@@ -760,12 +769,43 @@ fn resolve_spike_threshold(state: &State<'_, AppState>) -> f64 {
         .unwrap_or(DEFAULT_THRESHOLD)
 }
 
+/// 全局抓取互斥：同一时刻只允许一轮抓取（手动补历史 / 定时增量 / 多 watch 深翻）。
+/// 否则会同时开多个 CDP 标签抢同一个 Chrome，互相拖慢甚至触发平台限流。
+static MONITOR_FETCH_INFLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+struct MonitorFetchGuard;
+
+impl MonitorFetchGuard {
+    fn acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        if MONITOR_FETCH_INFLIGHT
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Some(Self)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for MonitorFetchGuard {
+    fn drop(&mut self) {
+        MONITOR_FETCH_INFLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn fetch_monitor(
     state: &State<'_, AppState>,
     payload: &Value,
     app: Option<AppHandle>,
     emit_progress: bool,
 ) -> Result<Value, String> {
+    let _fetch_guard = match MonitorFetchGuard::acquire() {
+        Some(guard) => guard,
+        None => return Err("monitor busy: 另一轮抓取正在进行，请稍候再试".to_string()),
+    };
     let watch: Option<crate::CompetitorWatchRecord> =
         if let Some(id) = str_field(payload, "watchId").or_else(|| str_field(payload, "watch_id")) {
             with_store_mut(state, |store| {
@@ -912,14 +952,15 @@ fn fetch_monitor(
                 .as_ref()
                 .map(|previous| previous.images.clone())
                 .unwrap_or_default(),
-            content: if text.trim().is_empty() {
-                existing
-                    .as_ref()
-                    .map(|previous| previous.content.clone())
-                    .unwrap_or_default()
-            } else {
-                text
-            },
+            // 已有正文一律保留，绝不被本次页面文本覆盖。
+            // 网页路径拿到的 `text` 只是页面可见文字（小红书常是那串 hashtag），
+            // 直接覆盖会把详情抓到的完整正文冲掉——重启后 Chrome 会话失效、定时抓取
+            // 改走网页路径时必现（CDP 路径早已修过同样的坑）。
+            content: existing
+                .as_ref()
+                .map(|previous| previous.content.clone())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(text),
             detail_fetched: existing
                 .as_ref()
                 .map(|previous| previous.detail_fetched)
@@ -1522,7 +1563,8 @@ fn post_list(state: &State<'_, AppState>, payload: &Value) -> Result<Value, Stri
         .get("limit")
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok());
-    with_store_mut(state, |store| {
+    // 纯读：用读锁，避免每次切换博主都触发一次整库落盘（2MB JSON）。
+    with_store(state, |store| {
         let mut items: Vec<_> = store.monitored_posts.iter().cloned().collect();
         if let Some(id) = &watch_id {
             items.retain(|item| item.watch_id.as_deref() == Some(id));
@@ -1570,7 +1612,8 @@ fn retro(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> 
 
     use std::collections::{HashMap, HashSet};
 
-    with_store_mut(state, |store| {
+    // 纯读：用读锁，避免复盘统计触发整库落盘。
+    with_store(state, |store| {
         // 作者清单（取全部库内作者，不受当前筛选影响，给前端下拉用）
         let mut authors: Vec<String> = store
             .monitored_posts
@@ -2421,8 +2464,8 @@ fn merge_audio_into_video(
     let headers = format!("Referer: {referer}\r\nUser-Agent: {ua}");
     let tmp_audio = video_path.with_extension("audio.m4a");
     let _ = std::fs::remove_file(&tmp_audio);
-    let out = Command::new(&ff)
-        .arg("-y")
+    let mut cmd = Command::new(&ff);
+    cmd.arg("-y")
         .arg("-headers")
         .arg(&headers)
         .arg("-i")
@@ -2430,9 +2473,9 @@ fn merge_audio_into_video(
         .arg("-rw_timeout")
         .arg("20000000")
         .arg("-vn")
-        .arg(&tmp_audio)
-        .output()
-        .map_err(|e| format!("启动 ffmpeg 下载音频失败：{e}"))?;
+        .arg(&tmp_audio);
+    let out = run_command_with_timeout(&mut cmd, std::time::Duration::from_secs(180))
+        .map_err(|e| format!("下载音频轨失败：{e}"))?;
     if !out.status.success() || std::fs::metadata(&tmp_audio).map(|m| m.len()).unwrap_or(0) == 0 {
         let _ = std::fs::remove_file(&tmp_audio);
         return Err(format!(
@@ -2531,6 +2574,58 @@ fn needs_playback_transcode(app: &AppHandle, path: &str) -> bool {
 ///
 /// 流程：CDP 现抓现下视频直链（签名短链过期快）→ 用 ffmpeg 落盘（同时支持直链 mp4 与 HLS m3u8 合并）。
 /// 下载成功写回 `video_local_path` / `video_status=done`；失败写 `video_status=failed` + `video_error`。
+/// 带看门狗的进程执行：网络类 ffmpeg（拉 B站/抖音流）可能在「连接已建立但不再给数据」
+/// 或 URL 过期时挂死，`-rw_timeout` 并不总能生效。这里按进程级超时兜底：到点强杀并返回
+/// `TimedOut`，让上层按失败处理、队列继续推进，而不是整批卡死。
+fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buffer);
+        }
+        buffer
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buffer);
+        }
+        buffer
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("进程超过 {}s 无响应，已强制结束", timeout.as_secs()),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    };
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn download_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
     let id = str_field(payload, "id").ok_or_else(|| "缺少 id".to_string())?;
     let record = with_store_mut(state, |store| {
@@ -2597,8 +2692,8 @@ fn download_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value)
         println!("[monitor] patchAudio: 跳过视频重下，直接补音轨 {id}");
     }
     for stream_url in candidates.videos.iter().take(4).filter(|_| !skip_video_download) {
-        let output = Command::new(&ff)
-            .arg("-y")
+        let mut cmd = Command::new(&ff);
+        cmd.arg("-y")
             .arg("-headers")
             .arg(&headers)
             .arg("-i")
@@ -2611,8 +2706,8 @@ fn download_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value)
             .arg("+faststart")
             .arg("-rw_timeout")
             .arg("20000000")
-            .arg(&dest_str)
-            .output()
+            .arg(&dest_str);
+        let output = run_command_with_timeout(&mut cmd, std::time::Duration::from_secs(600))
             .map_err(|e| format!("启动 ffmpeg 失败：{e}"))?;
         if output.status.success() {
             ok = true;
@@ -3109,6 +3204,7 @@ fn title_export_prefix(title: &str, n: usize) -> String {
 }
 
 /// 从文本里抠出第一个形如 `YYYY-MM-DD` / `YYYY/MM/DD` / `YYYYMMDD` 的日期，规范为 `YYYYMMDD`。
+#[allow(dead_code)]
 fn first_date_in(text: &str) -> Option<String> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -3151,6 +3247,7 @@ fn first_date_in(text: &str) -> Option<String> {
 }
 
 /// 毫秒时间戳 → 本地时区 `YYYYMMDD`。
+#[allow(dead_code)]
 fn millis_to_yyyymmdd(ms: i64) -> Option<String> {
     let secs = ms / 1000;
     let dt = match Utc.timestamp_opt(secs, 0) {
@@ -3165,23 +3262,9 @@ fn today_yyyymmdd() -> String {
     Local::now().format("%Y%m%d").to_string()
 }
 
-/// 帖子产物二级目录（日期）：优先用可解析的 `published_at`，否则回退 `created_at`（抓取时间），再否则今天。
-fn export_date_yyyymmdd(post: &MonitoredPostRecord) -> String {
-    if let Some(pa) = post.published_at.as_deref() {
-        if let Some(d) = first_date_in(pa) {
-            return d;
-        }
-        if let Ok(ms) = pa.parse::<i64>() {
-            if let Some(d) = millis_to_yyyymmdd(ms) {
-                return d;
-            }
-        }
-    }
-    if let Ok(ms) = post.created_at.parse::<i64>() {
-        if let Some(d) = millis_to_yyyymmdd(ms) {
-            return d;
-        }
-    }
+/// 帖子产物二级目录（日期）：按**导出当天**归档，方便「今天导出了哪些」。
+/// 不再用 `published_at`——否则一次补历史会把几十条散落到几十个历史日期目录里。
+fn export_date_yyyymmdd(_post: &MonitoredPostRecord) -> String {
     today_yyyymmdd()
 }
 
@@ -3236,6 +3319,13 @@ fn export_post_product(state: &State<'_, AppState>, post_id: &str) {
 /// 注意：早期实现用 `is_dir()` 判断，用户清理过导出目录后（目录被删）会**静默回退到工作区**，
 /// 表现为「设置了导出根目录但产物仍落在工作区」。这里改为只认配置值，目录由导出流程按需创建。
 fn resolve_export_target(state: &State<'_, AppState>) -> Result<PathBuf, String> {
+    // 受管模式（Web 多实例）：导出根由实例启动参数固定，忽略 store 里的用户设置。
+    if let Ok(raw) = std::env::var("BEAV_EXPORT_ROOT") {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            return Ok(PathBuf::from(raw));
+        }
+    }
     let export_root = with_store(state, |store| Ok(store.monitor_export_root.clone()))?;
     let export_root = export_root.trim().to_string();
     if !export_root.is_empty() {
@@ -3763,6 +3853,9 @@ fn get_export_root(state: &State<'_, AppState>) -> Result<Value, String> {
 ///
 /// 入参：`root`（绝对目录；空串 / null 表示清空、回退工作区根）。
 fn set_export_root(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
+    if crate::managed_dirs_locked() {
+        return Err("导出目录由服务器统一管理（Web 多用户模式），不能在客户端修改".to_string());
+    }
     let root = str_field(payload, "root")
         .or_else(|| str_field(payload, "dir"))
         .unwrap_or_default();
@@ -3780,6 +3873,9 @@ fn set_export_root(state: &State<'_, AppState>, payload: &Value) -> Result<Value
 
 /// 弹出系统目录选择器，返回所选目录（`monitor:pick-export-root`）。
 fn pick_export_root() -> Result<Value, String> {
+    if crate::managed_dirs_locked() {
+        return Err("导出目录由服务器统一管理（Web 多用户模式），不能在客户端选择".to_string());
+    }
     let selected = crate::pick_files_native("选择监控导出根目录", true, false)?;
     let path = selected.first().map(|item| item.display().to_string());
     Ok(json!({
@@ -4784,6 +4880,35 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
 }
 
 /// 计划任务入口：抓取所有到期的「启用中」监控项（按各自 interval_hours 判断）。
+/// 启动对账：进程重启后，所有 `downloading` 都必然是上次被中断的僵尸任务，
+/// 复位为 `none` 并记录原因，否则会永远卡在「下载中」且不再重试。
+pub fn reconcile_interrupted_video_downloads(state: &State<'_, AppState>) {
+    let _ = with_store_mut(state, |store| {
+        let mut reset = 0usize;
+        for post in store.monitored_posts.iter_mut() {
+            if post.video_status == "downloading" {
+                post.video_status = "none".to_string();
+                if post.video_error.is_none() {
+                    post.video_error = Some("上次下载被中断（应用重启），已复位".to_string());
+                }
+                reset += 1;
+            }
+        }
+        if reset > 0 {
+            crate::logging::emit_legacy_line(
+                crate::logging::event::LogSource::Host,
+                crate::logging::event::LogLevel::Info,
+                "monitor",
+                "monitor.video.reset_interrupted",
+                format!("[monitor] 启动复位移位下载 {reset} 条"),
+                json!({ "reset": reset }),
+                None,
+            );
+        }
+        Ok(())
+    });
+}
+
 pub fn run_due_fetches(state: &State<'_, AppState>, now: i64) -> Result<Value, String> {
     let due: Vec<crate::CompetitorWatchRecord> = with_store_mut(state, |store| {
         Ok(store
@@ -4803,6 +4928,10 @@ pub fn run_due_fetches(state: &State<'_, AppState>, now: i64) -> Result<Value, S
                 if let Some(created) = result.get("created").and_then(Value::as_array) {
                     total_new += created.len() as i64;
                 }
+            }
+            Err(error) if error.starts_with("monitor busy") => {
+                // 有一轮抓取正在跑（手动补历史等），本轮跳过即可，不算失败。
+                continue;
             }
             Err(error) => {
                 crate::logging::emit_legacy_line(

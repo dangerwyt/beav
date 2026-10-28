@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { startTransition, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Radar, Plus, RefreshCw, Trash2, ExternalLink, Zap, Sparkles, Check, X, Eye, Loader2, Link2, Lock, LogOut, ChevronDown, ChevronLeft, ChevronRight, FlaskConical, BookOpen, Copy, Download, Video, Film, History, AudioLines } from 'lucide-react';
 import { createPortal } from 'react-dom';
 import { clsx } from 'clsx';
@@ -650,7 +650,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       if (selectedRef.current) payload.watchId = selectedRef.current;
       const list = (await window.ipcRenderer.monitor.postList(payload)) as MonitoredPost[];
       if (seq !== postsLoadSeq.current) return;
-      setPosts(Array.isArray(list) ? list : []);
+      // 切换博主时上百张卡片同时重建，用 transition 让输入/滚动不被阻塞。
+      startTransition(() => setPosts(Array.isArray(list) ? list : []));
     } catch (e) {
       console.error('Failed to load posts:', e);
       if (seq === postsLoadSeq.current) {
@@ -765,9 +766,13 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
         const p = event.payload ?? {};
         if (!p.watchId) return;
         const wid = p.watchId as string;
-        // phase=videos-done：后台历史视频批处理结束，清掉该监控的进度条
+        // phase=videos-done：本批视频处理结束。多批并行时，先完成的小批
+        // 不能把还在跑的大批进度条删掉 → 只有完成批次 >= 当前记录的批次才清。
         if (p.phase === 'videos-done') {
+          const incomingTotal = p.total ?? 0;
           setBackfillProgress((prev) => {
+            const current = prev[wid];
+            if (current && current.total > incomingTotal) return prev;
             const next = { ...prev };
             delete next[wid];
             return next;
@@ -987,7 +992,17 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
     // 已抓取过（正文有 or 已标记 detailFetched）且非主动刷新 → 直接本地展示，秒开、不请求后端。
     // 纯图/无正文笔记 content 永远空，但 detailFetched 为真 → 同样命中缓存，不再反复重抓。
     // 图片列表已随详情抓取落库（post.images）；老数据没图时用封面兜底，避免二次打开空白。
-    if (!refresh && (post.detailFetched || (post.content && post.content.trim()))) {
+    const hasCachedBody = Boolean(post.content && post.content.trim());
+    // 纯图/无正文笔记没有 body，但有图也算有效缓存（避免每次打开都重抓 10-20s）。
+    const hasCachedVisual = Boolean(
+      post.detailFetched && (((post.images && post.images.length) > 0) || post.coverUrl),
+    );
+    console.log(
+      `[monitor] openDetail id=${post.id} contentLen=${post.content ? post.content.length : 0} ` +
+        `detailFetched=${String(post.detailFetched)} images=${post.images ? post.images.length : 0} ` +
+        `hasCachedBody=${hasCachedBody} hasCachedVisual=${hasCachedVisual}`,
+    );
+    if (!refresh && (hasCachedBody || hasCachedVisual)) {
       setDetailPost(post);
       setDetailImages(
         Array.isArray(post.images) && post.images.length
@@ -1024,16 +1039,37 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
         note?: string;
       };
       // 优先用后端回传的 post；失败回退到入参 post（保留当前展示）。
-      setDetailPost(result?.post ?? post);
+      // 防回归：后端这次没拿到正文（fetched:false / 超时）时，绝不能把已有正文覆盖成空。
+      const incomingPost = result?.post ?? post;
+      const keepOldBody = !incomingPost.content?.trim() && post.content?.trim();
+      const mergedPost = keepOldBody
+        ? { ...incomingPost, content: post.content, detailFetched: post.detailFetched ?? incomingPost.detailFetched }
+        : incomingPost;
+      console.log(
+        `[monitor] openDetail result id=${post.id} fetched=${String(result?.fetched)} ` +
+          `note=${JSON.stringify(String(result?.note || ''))} ` +
+          `beforeLen=${post.content ? post.content.length : 0} ` +
+          `afterLen=${mergedPost.content ? mergedPost.content.length : 0}`,
+      );
+      setDetailPost(mergedPost);
       // 抓到有效图片就用新的；否则保留现有缩略图（prefill 已兜底 cover/image），不清空。
-      const incoming = Array.isArray(result?.images) ? result.images : [];
-      if (incoming.length) setDetailImages(incoming);
+      const incomingImages = Array.isArray(result?.images) ? result.images : [];
+      if (incomingImages.length) setDetailImages(incomingImages);
       setDetailNote(result?.note || null);
       // 回写列表状态：让卡片带上正文+图片，下次直接命中客户端缓存，无需再进后端。
       // 注意：刷新（refresh=true）也要回写，否则二次打开仍读不到新抓到的图。
       if (result?.post) {
         setPosts((prev) =>
-          prev.map((p) => (p.id === result.post!.id ? { ...p, ...result.post } : p)),
+          prev.map((p) =>
+            p.id === mergedPost.id
+              ? {
+                  ...p,
+                  ...mergedPost,
+                  // 同样保护：新结果正文为空时保留列表原有的正文。
+                  content: mergedPost.content?.trim() ? mergedPost.content : p.content,
+                }
+              : p,
+          ),
         );
       }
     } catch (e) {
@@ -1831,6 +1867,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               <div
                 key={post.id}
                 className="rounded-xl border border-border bg-surface-primary p-4 transition-colors"
+                // 跳过屏外卡片的渲染/布局，长列表（100+）滚动和切换明显更快。
+                style={{ contentVisibility: 'auto', containIntrinsicSize: '220px' }}
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0 flex-1">

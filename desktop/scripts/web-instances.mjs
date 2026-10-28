@@ -1,0 +1,893 @@
+#!/usr/bin/env node
+/**
+ * Beav 多用户实例管理器（方案 B：每用户一个隐藏实例 + 独立数据目录）
+ *
+ * 职责：
+ *  1) 账号：本地 users.json（scrypt 口令）+ 登录 cookie
+ *  2) 路由：按登录用户把 /api/* 反代到该用户实例（127.0.0.1:<port>）
+ *  3) 生命周期：首次访问拉起隐藏实例，闲置 IDLE_MINUTES 分钟回收
+ *  4) 隔离：每用户独立 APPDATA / store / workspace / exports / Chrome profile / WebView2
+ *
+ * 用法：
+ *  node scripts/web-instances.mjs --create alice 密码 [端口]
+ *  node scripts/web-instances.mjs --set-password alice 新密码
+ *  node scripts/web-instances.mjs --list
+ *  node scripts/web-instances.mjs                # 启动服务（默认 8090）
+ *
+ * 环境变量：
+ *  WEB_HOST / WEB_PORT              监听地址/端口（默认 0.0.0.0:8090）
+ *  WEB_DIST                         前端 dist 目录
+ *  BEAV_EXE                         实例可执行文件（默认自动找 release / tauri-dev / debug）
+ *  BEAV_USERS_FILE                  用户表路径（默认 desktop/users.json）
+ *  BEAV_USERS_ROOT                  用户数据根（默认 D:\beav_workspace\users）
+ *  BEAV_INSTANCE_BASE_PORT          实例端口起点（默认 32001）
+ *  BEAV_IDLE_MINUTES                闲置回收分钟（默认 30）
+ *  BEAV_SESSION_HOURS               登录有效期小时（默认 72）
+ *  BEAV_SESSION_SECRET              会话签名密钥（不设则落盘 .beav-session-secret）
+ */
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { execFile, spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DESKTOP_ROOT = path.resolve(__dirname, '..');
+const DIST_DIR = path.resolve(process.env.WEB_DIST || path.join(DESKTOP_ROOT, 'dist'));
+const USERS_FILE = path.resolve(
+  process.env.BEAV_USERS_FILE || path.join(DESKTOP_ROOT, 'users.json'),
+);
+const USERS_ROOT = path.resolve(
+  process.env.BEAV_USERS_ROOT || path.join('D:', 'beav_workspace', 'users'),
+);
+const WEB_HOST = process.env.WEB_HOST || '0.0.0.0';
+const WEB_PORT = Number(process.env.WEB_PORT || 8090);
+const BASE_PORT = Number(process.env.BEAV_INSTANCE_BASE_PORT || 32001);
+const IDLE_MINUTES = Number(process.env.BEAV_IDLE_MINUTES || 30);
+const SESSION_HOURS = Number(process.env.BEAV_SESSION_HOURS || 72);
+const SECRET_FILE = path.resolve(
+  process.env.BEAV_SESSION_SECRET_FILE || path.join(DESKTOP_ROOT, '.beav-session-secret'),
+);
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.map': 'application/json; charset=utf-8',
+};
+
+function log(...args) {
+  console.log('[multi]', ...args);
+}
+
+// ---------------- 账号 ----------------
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return `scrypt$${salt}$${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  const [algo, salt, hash] = String(stored || '').split('$');
+  if (algo !== 'scrypt' || !salt || !hash) return false;
+  const actual = crypto.scryptSync(String(password), salt, 64);
+  const expected = Buffer.from(hash, 'hex');
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+function loadUsers() {
+  if (!fs.existsSync(USERS_FILE)) return { users: [] };
+  const raw = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+  if (!Array.isArray(raw.users)) raw.users = [];
+  return raw;
+}
+
+function saveUsers(data) {
+  fs.writeFileSync(USERS_FILE, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function ensureUsersFile() {
+  if (fs.existsSync(USERS_FILE)) return;
+  const password = crypto.randomBytes(9).toString('base64url');
+  saveUsers({
+    users: [
+      {
+        username: 'admin',
+        uid: 'admin',
+        role: 'admin',
+        port: BASE_PORT,
+        passwordHash: hashPassword(password),
+        createdAt: new Date().toISOString(),
+      },
+    ],
+  });
+  log(`已创建用户表 ${USERS_FILE}`);
+  log(`默认账号 admin / ${password}  ← 请尽快用 --set-password 修改`);
+}
+
+function nextPort(users) {
+  const used = new Set(users.map((u) => Number(u.port)).filter(Boolean));
+  let port = BASE_PORT;
+  while (used.has(port)) port += 1;
+  return port;
+}
+
+// ---------------- 会话 ----------------
+
+function sessionSecret() {
+  if (process.env.BEAV_SESSION_SECRET) return process.env.BEAV_SESSION_SECRET;
+  if (fs.existsSync(SECRET_FILE)) return fs.readFileSync(SECRET_FILE, 'utf8').trim();
+  const secret = crypto.randomBytes(32).toString('hex');
+  fs.writeFileSync(SECRET_FILE, secret, { mode: 0o600 });
+  return secret;
+}
+
+function signSession(username) {
+  const payload = Buffer.from(
+    JSON.stringify({ u: username, exp: Date.now() + SESSION_HOURS * 3_600_000 }),
+  ).toString('base64url');
+  const sig = crypto.createHmac('sha256', sessionSecret()).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function verifySession(token) {
+  const [payload, sig] = String(token || '').split('.');
+  if (!payload || !sig) return null;
+  const expected = crypto
+    .createHmac('sha256', sessionSecret())
+    .update(payload)
+    .digest('base64url');
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (!data.u || Number(data.exp) < Date.now()) return null;
+    return data.u;
+  } catch {
+    return null;
+  }
+}
+
+function parseCookies(header) {
+  const out = {};
+  for (const part of String(header || '').split(';')) {
+    const index = part.indexOf('=');
+    if (index > 0) out[part.slice(0, index).trim()] = decodeURIComponent(part.slice(index + 1).trim());
+  }
+  return out;
+}
+
+// ---------------- 实例 ----------------
+
+function resolveExe() {
+  if (process.env.BEAV_EXE) return path.resolve(process.env.BEAV_EXE);
+  const base = path.join(DESKTOP_ROOT, 'src-tauri', 'target');
+  const candidates = [
+    path.join(base, 'release', 'beav.exe'),
+    path.join(base, 'tauri-dev', 'debug', 'beav.exe'),
+    path.join(base, 'debug', 'beav.exe'),
+  ];
+  for (const candidate of candidates) if (fs.existsSync(candidate)) return candidate;
+  return candidates[1];
+}
+
+function userDir(user) {
+  return path.join(USERS_ROOT, user.uid || user.username);
+}
+
+function ensureUserDirs(user) {
+  const dir = userDir(user);
+  for (const sub of ['appdata', 'state', 'workspace', 'exports', 'chrome-profile', 'webview']) {
+    fs.mkdirSync(path.join(dir, sub), { recursive: true });
+  }
+  return dir;
+}
+
+function instanceEnv(user) {
+  const dir = ensureUserDirs(user);
+  return {
+    ...process.env,
+    // APPDATA 一起隔离：auth-state.json / acp-gateway.json 等才会各用各的。
+    APPDATA: path.join(dir, 'appdata'),
+    BEAV_STORE_DIR: path.join(dir, 'state'),
+    BEAV_WORKSPACE_ROOT: path.join(dir, 'workspace'),
+    BEAV_EXPORT_ROOT: path.join(dir, 'exports'),
+    BEAV_CHROME_PROFILE_DIR: path.join(dir, 'chrome-profile'),
+    BEAV_WEBVIEW_DATA_DIR: path.join(dir, 'webview'),
+    BEAV_DAEMON_PORT: String(user.port),
+    BEAV_HEADLESS: '1',
+    BEAV_MANAGED_DIRS: '1',
+    // 不需要官方功能：跳过登录/扫码闸门，直接进工作台。
+    BEAV_SKIP_OFFICIAL_LOGIN: '1',
+  };
+}
+
+const instances = new Map(); // uid -> { child, port, lastActive }
+
+async function healthOk(port) {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/api/ipc/health`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+function execFileText(file, args, timeout = 5000) {
+  return new Promise((resolve) => {
+    execFile(
+      file,
+      args,
+      { windowsHide: true, timeout, maxBuffer: 8 * 1024 * 1024 },
+      (error, stdout) => resolve(error ? '' : String(stdout || '')),
+    );
+  });
+}
+
+/** 进程常驻内存（MB）。Windows 用 tasklist，其余用 ps。 */
+async function getMemoryMB(pid) {
+  if (!pid) return null;
+  if (process.platform === 'win32') {
+    const stdout = await execFileText('tasklist', [
+      '/FI',
+      `PID eq ${pid}`,
+      '/FO',
+      'CSV',
+      '/NH',
+    ]);
+    // "beav.exe","12345","Console","1","123,456 K"
+    const match = stdout.trim().match(/^"[^"]*","(\d+)","[^"]*","\d+","([\d.,]+)\s*K"/m);
+    if (!match) return null;
+    return Math.round(Number(match[2].replace(/[.,]/g, '')) / 1024);
+  }
+  const stdout = await execFileText('ps', ['-o', 'rss=', '-p', String(pid)]);
+  const kb = Number(stdout.trim());
+  return Number.isFinite(kb) ? Math.round(kb / 1024) : null;
+}
+
+/** 按监听端口反查 PID（管理器重启后也能识别既有实例）。 */
+async function findPidByPort(port) {
+  if (process.platform === 'win32') {
+    const stdout = await execFileText('netstat', ['-ano', '-p', 'TCP'], 8000);
+    for (const line of stdout.split(/\r?\n/)) {
+      if (!line.includes(`:${port}`) || !line.includes('LISTENING')) continue;
+      const parts = line.trim().split(/\s+/);
+      const pid = Number(parts[parts.length - 1]);
+      if (pid) return pid;
+    }
+    return null;
+  }
+  const stdout = await execFileText('sh', ['-c', `lsof -nP -iTCP:${port} -sTCP:LISTEN -t 2>/dev/null`]);
+  const pid = Number(stdout.trim().split(/\s+/)[0]);
+  return Number.isFinite(pid) && pid > 0 ? pid : null;
+}
+
+async function instanceStatus(user) {
+  const key = user.uid || user.username;
+  const record = instances.get(key);
+  const running = await healthOk(user.port);
+  let pid = record?.child?.pid ?? null;
+  if (!pid && running) pid = await findPidByPort(user.port);
+  const rssMB = pid ? await getMemoryMB(pid) : null;
+  return {
+    username: user.username,
+    uid: key,
+    role: user.role || 'user',
+    port: user.port,
+    running,
+    pid,
+    rssMB,
+    startedAt: record?.startedAt ?? null,
+    lastActive: record?.lastActive ?? null,
+    createdAt: user.createdAt ?? null,
+  };
+}
+
+// 同一用户的并发请求必须共用一次 spawn：页面首屏会同时发几十个 /api/*，
+// 没有去重就会瞬间拉起多个实例（只有一个抢到端口，其余变僵尸进程）。
+const spawning = new Map();
+
+async function ensureInstance(user) {
+  const key = user.uid || user.username;
+
+  const existing = instances.get(key);
+  if (existing) {
+    existing.lastActive = Date.now();
+    if (await healthOk(user.port)) return existing;
+    try {
+      existing.child?.kill();
+    } catch {}
+    instances.delete(key);
+  }
+
+  if (await healthOk(user.port)) {
+    const record = { child: null, port: user.port, lastActive: Date.now(), startedAt: null };
+    instances.set(key, record);
+    return record;
+  }
+
+  const pending = spawning.get(key);
+  if (pending) return pending;
+
+  const task = (async () => {
+    // 拿到"启动权"后再确认一次，避免上一个刚起好又被重复 spawn。
+    if (await healthOk(user.port)) {
+      const record = { child: null, port: user.port, lastActive: Date.now(), startedAt: null };
+      instances.set(key, record);
+      return record;
+    }
+
+    const exe = resolveExe();
+    if (!fs.existsSync(exe)) throw new Error(`找不到实例可执行文件：${exe}`);
+    const child = spawn(exe, [], {
+      env: instanceEnv(user),
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    log(`spawn ${user.username} -> :${user.port} (pid ${child.pid})`);
+
+    const deadline = Date.now() + 45_000;
+    while (Date.now() < deadline) {
+      if (await healthOk(user.port)) {
+        const record = {
+          child,
+          port: user.port,
+          lastActive: Date.now(),
+          startedAt: Date.now(),
+        };
+        instances.set(key, record);
+        log(`instance ready ${user.username} :${user.port}`);
+        return record;
+      }
+      if (child.exitCode !== null) break;
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    }
+    try {
+      child.kill();
+    } catch {}
+    throw new Error(`实例启动超时（${user.username} :${user.port}）`);
+  })().finally(() => spawning.delete(key));
+
+  spawning.set(key, task);
+  return task;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, record] of instances) {
+    if (now - record.lastActive > IDLE_MINUTES * 60_000) {
+      try {
+        record.child?.kill();
+      } catch {}
+      instances.delete(key);
+      log(`reap idle instance ${key}`);
+    }
+  }
+}, 60_000).unref?.();
+
+// ---------------- HTTP ----------------
+
+function sendJson(res, status, body) {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(payload),
+    'Cache-Control': 'no-store',
+  });
+  res.end(payload);
+}
+
+function sendHtml(res, status, html) {
+  res.writeHead(status, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Length': Buffer.byteLength(html),
+    'Cache-Control': 'no-store',
+  });
+  res.end(html);
+}
+
+const LOGIN_HTML = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Beav 登录</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+    background:#1b1b1f;color:#e8e8ea;font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+  form{width:320px;padding:28px;border:1px solid #33333a;border-radius:14px;background:#232329}
+  h1{margin:0 0 4px;font-size:18px}
+  p{margin:0 0 18px;color:#8a8a93;font-size:12px}
+  input{width:100%;box-sizing:border-box;margin-bottom:12px;padding:10px 12px;border-radius:8px;
+    border:1px solid #3a3a42;background:#1b1b1f;color:#e8e8ea;font-size:14px}
+  button{width:100%;padding:10px;border:0;border-radius:8px;background:#c9a227;color:#1b1b1f;
+    font-weight:700;font-size:14px;cursor:pointer}
+  .err{color:#f87171;font-size:12px;margin-bottom:12px}
+  .alt{margin-top:14px;font-size:12px;color:#8a8a93;text-align:center}
+  a{color:#c9a227}
+</style></head>
+<body><form method="post" action="/login">
+  <h1>Beav</h1><p>多用户工作区，请输入账号</p>
+  __ERROR__
+  <input name="username" placeholder="用户名" autocomplete="username" autofocus />
+  <input name="password" type="password" placeholder="密码" autocomplete="current-password" />
+  <button type="submit">登录</button>
+  __REGISTER__
+</form></body></html>`;
+
+function loginPage(error) {
+  return LOGIN_HTML
+    .replace('__ERROR__', error ? `<div class="err">${escapeHtml(error)}</div>` : '')
+    .replace('__REGISTER__', process.env.BEAV_ALLOW_REGISTER === '0'
+      ? ''
+      : '<div class="alt">还没有账号？<a href="/register">注册</a></div>');
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[ch]));
+}
+
+const REGISTER_HTML = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Beav 注册</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+    background:#1b1b1f;color:#e8e8ea;font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+  form{width:320px;padding:28px;border:1px solid #33333a;border-radius:14px;background:#232329}
+  h1{margin:0 0 4px;font-size:18px}
+  p{margin:0 0 18px;color:#8a8a93;font-size:12px}
+  input{width:100%;box-sizing:border-box;margin-bottom:12px;padding:10px 12px;border-radius:8px;
+    border:1px solid #3a3a42;background:#1b1b1f;color:#e8e8ea;font-size:14px}
+  button{width:100%;padding:10px;border:0;border-radius:8px;background:#c9a227;color:#1b1b1f;
+    font-weight:700;font-size:14px;cursor:pointer}
+  .err{color:#f87171;font-size:12px;margin-bottom:12px}
+  .alt{margin-top:14px;font-size:12px;color:#8a8a93;text-align:center}
+  a{color:#c9a227}
+</style></head>
+<body><form method="post" action="/register">
+  <h1>注册 Beav</h1><p>每个账号拥有独立的数据、工作区与导出目录</p>
+  __ERROR__
+  <input name="username" placeholder="用户名（2-24 位字母/数字/_-）" autocomplete="username" autofocus />
+  <input name="password" type="password" placeholder="密码（至少 6 位）" autocomplete="new-password" />
+  <input name="confirm" type="password" placeholder="确认密码" autocomplete="new-password" />
+  <button type="submit">注册并登录</button>
+  <div class="alt">已有账号？<a href="/login">登录</a></div>
+</form></body></html>`;
+
+function registerPage(error) {
+  return REGISTER_HTML.replace(
+    '__ERROR__',
+    error ? `<div class="err">${escapeHtml(error)}</div>` : '',
+  );
+}
+
+const ADMIN_HTML = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Beav 实例状态</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;padding:28px;background:#1b1b1f;color:#e8e8ea;
+    font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+  h1{margin:0 0 4px;font-size:20px}
+  .sub{color:#8a8a93;font-size:12px;margin-bottom:20px}
+  .summary{display:flex;gap:18px;margin-bottom:14px;font-size:12px;color:#a0a0aa}
+  .summary b{color:#e8e8ea}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #2c2c33;white-space:nowrap}
+  th{color:#8a8a93;font-weight:600;font-size:12px}
+  .run{color:#4ade80}.stop{color:#8a8a93}
+  button{padding:4px 10px;border:1px solid #3a3a42;border-radius:6px;background:#232329;
+    color:#e8e8ea;font-size:12px;cursor:pointer}
+  button:hover{border-color:#c9a227;color:#c9a227}
+  .right{margin-left:auto}
+  a{color:#c9a227;text-decoration:none}
+</style></head><body>
+<h1>实例状态</h1>
+<div class="sub">每 5 秒自动刷新 · 数据目录 <code>__ROOT__</code></div>
+<div class="summary">
+  <span>用户 <b id="total">-</b></span>
+  <span>运行中 <b id="running">-</b></span>
+  <span>总内存 <b id="mem">-</b></span>
+  <span class="right"><a href="/account">我的账号</a> · <a href="/logout">退出</a></span>
+</div>
+<table><thead><tr>
+  <th>用户</th><th>端口</th><th>状态</th><th>PID</th><th>内存</th><th>启动时间</th><th>最近活跃</th><th></th>
+</tr></thead><tbody id="rows"><tr><td colspan="8">加载中…</td></tr></tbody></table>
+<script>
+function fmtTime(ts){ return ts ? new Date(ts).toLocaleTimeString() : '-'; }
+async function stopUser(username){
+  if(!confirm('停止 ' + username + ' 的实例？下次访问会自动重启')) return;
+  await fetch('/admin/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username})});
+  refresh();
+}
+async function refresh(){
+  let list;
+  try { const res = await fetch('/admin/api/instances'); if(!res.ok) throw new Error('HTTP '+res.status); list = await res.json(); }
+  catch(e){ document.getElementById('rows').innerHTML = '<tr><td colspan="8">读取失败：'+e.message+'</td></tr>'; return; }
+  const tbody = document.getElementById('rows'); tbody.innerHTML='';
+  let mem=0, running=0;
+  for(const it of list){
+    if(it.running) running++;
+    if(it.rssMB) mem += it.rssMB;
+    const tr=document.createElement('tr');
+    const cells=[it.username + (it.role==='admin'?' (admin)':''), it.port,
+      it.running?'运行中':'未启动', it.pid ?? '-', it.rssMB!=null?it.rssMB+' MB':'-',
+      fmtTime(it.startedAt), fmtTime(it.lastActive)];
+    for(const c of cells){ const td=document.createElement('td'); td.textContent=String(c); if(c==='运行中')td.className='run'; if(c==='未启动')td.className='stop'; tr.appendChild(td); }
+    const td=document.createElement('td');
+    if(it.running){ const b=document.createElement('button'); b.textContent='停止'; b.onclick=()=>stopUser(it.username); td.appendChild(b); }
+    tr.appendChild(td); tbody.appendChild(tr);
+  }
+  document.getElementById('total').textContent=String(list.length);
+  document.getElementById('running').textContent=String(running);
+  document.getElementById('mem').textContent=mem?mem+' MB':'-';
+}
+refresh(); setInterval(refresh, 5000);
+</script></body></html>`;
+
+function accountPage(user, status) {
+  const rows = [
+    ['用户名', user.username],
+    ['角色', user.role || 'user'],
+    ['实例端口', status.port],
+    ['状态', status.running ? '运行中' : '未启动'],
+    ['PID', status.pid ?? '-'],
+    ['内存', status.rssMB != null ? `${status.rssMB} MB` : '-'],
+    ['数据目录', path.join(USERS_ROOT, user.uid || user.username)],
+  ];
+  const trs = rows
+    .map(([key, value]) => `<tr><th>${escapeHtml(key)}</th><td>${escapeHtml(value)}</td></tr>`)
+    .join('');
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8" />
+<title>我的账号 · Beav</title><style>
+:root{color-scheme:dark}body{margin:0;padding:28px;background:#1b1b1f;color:#e8e8ea;
+font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+h1{font-size:20px;margin:0 0 16px}table{border-collapse:collapse;min-width:420px}
+th,td{padding:8px 12px;border-bottom:1px solid #2c2c33;text-align:left;font-size:13px}
+th{color:#8a8a93;font-weight:600;width:120px}a{color:#c9a227;text-decoration:none}
+.bar{margin-top:18px;font-size:12px}
+</style></head><body>
+<h1>我的账号</h1>
+<table>${trs}</table>
+<div class="bar"><a href="/">进入工作台</a>${user.role === 'admin' ? ' · <a href="/admin">实例状态</a>' : ''} · <a href="/logout">退出</a></div>
+</body></html>`;
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function proxyToInstance(req, res, user, url, body) {
+  const targetOrigin = `http://127.0.0.1:${user.port}`;
+  const headers = { ...req.headers };
+  headers.origin = targetOrigin;
+  headers.referer = `${targetOrigin}/`;
+  headers.host = `127.0.0.1:${user.port}`;
+  delete headers['transfer-encoding'];
+  if (body.length > 0) headers['content-length'] = String(body.length);
+  else delete headers['content-length'];
+
+  const upstream = http.request(
+    {
+      hostname: '127.0.0.1',
+      port: user.port,
+      method: req.method,
+      path: `${url.pathname}${url.search}`,
+      headers,
+    },
+    (upstreamRes) => {
+      const outHeaders = { ...upstreamRes.headers };
+      delete outHeaders['access-control-allow-origin'];
+      res.writeHead(upstreamRes.statusCode || 502, outHeaders);
+      upstreamRes.pipe(res);
+    },
+  );
+  upstream.on('error', (error) => {
+    log(`proxy error ${user.username}:`, error.message);
+    if (!res.headersSent) {
+      sendJson(res, 502, { success: false, error: `实例不可用：${error.message}` });
+    } else {
+      res.destroy();
+    }
+  });
+  upstream.end(body);
+}
+
+function serveFile(req, res, filePath, allowSpaFallback) {
+  let stat;
+  try {
+    stat = fs.statSync(filePath);
+  } catch {
+    if (allowSpaFallback) return serveFile(req, res, path.join(DIST_DIR, 'index.html'), false);
+    return sendJson(res, 404, { success: false, error: 'not found' });
+  }
+  if (stat.isDirectory()) {
+    return serveFile(req, res, path.join(filePath, 'index.html'), allowSpaFallback);
+  }
+  const headers = {
+    'Content-Type': MIME[path.extname(filePath).toLowerCase()] || 'application/octet-stream',
+    'Content-Length': stat.size,
+    'Cache-Control': filePath.includes(`${path.sep}assets${path.sep}`)
+      ? 'public, max-age=31536000, immutable'
+      : 'no-cache',
+  };
+  res.writeHead(200, headers);
+  if (req.method === 'HEAD') return res.end();
+  fs.createReadStream(filePath).pipe(res);
+}
+
+function serveApp(req, res, url) {
+  const relative = decodeURIComponent(url.pathname).replace(/^\/+/, '');
+  const target = path.resolve(DIST_DIR, relative || 'index.html');
+  if (!target.startsWith(DIST_DIR)) return sendJson(res, 403, { success: false, error: 'forbidden' });
+  return serveFile(req, res, target, path.extname(target) === '');
+}
+
+// ---------------- 启动 ----------------
+
+function findUser(username) {
+  const target = String(username || '').trim().toLowerCase();
+  return loadUsers().users.find((user) => String(user.username).toLowerCase() === target);
+}
+
+async function main() {
+  const command = process.argv[2];
+  if (command === '--list') {
+    const { users } = loadUsers();
+    if (!users.length) log('（空）');
+    for (const user of users) log(`${user.username}  uid=${user.uid}  port=${user.port}`);
+    return;
+  }
+  if (command === '--create' || command === '--create-admin') {
+    const username = process.argv[3];
+    const password = process.argv[4];
+    if (!username || !password) {
+      throw new Error(`用法：${command} <用户名> <密码> [端口]`);
+    }
+    const data = loadUsers();
+    if (data.users.some((user) => user.username === username)) {
+      throw new Error(`用户已存在：${username}`);
+    }
+    const port = Number(process.argv[5] || nextPort(data.users));
+    data.users.push({
+      username,
+      uid: username,
+      role: command === '--create-admin' ? 'admin' : 'user',
+      port,
+      passwordHash: hashPassword(password),
+      createdAt: new Date().toISOString(),
+    });
+    saveUsers(data);
+    log(`已创建 ${username}（role=${command === '--create-admin' ? 'admin' : 'user'}, port=${port}）`);
+    return;
+  }
+  if (command === '--set-password') {
+    const username = process.argv[3];
+    const password = process.argv[4];
+    if (!username || !password) throw new Error('用法：--set-password <用户名> <新密码>');
+    const data = loadUsers();
+    const user = data.users.find((item) => item.username === username);
+    if (!user) throw new Error(`用户不存在：${username}`);
+    user.passwordHash = hashPassword(password);
+    saveUsers(data);
+    log(`已更新 ${username} 的密码`);
+    return;
+  }
+  if (command === '--delete') {
+    const username = process.argv[3];
+    const data = loadUsers();
+    const before = data.users.length;
+    data.users = data.users.filter((item) => item.username !== username);
+    saveUsers(data);
+    log(`已删除 ${before - data.users.length} 个用户`);
+    return;
+  }
+
+  ensureUsersFile();
+  if (!fs.existsSync(path.join(DIST_DIR, 'index.html'))) {
+    log(`警告：${DIST_DIR}/index.html 不存在，请先 pnpm web:build`);
+  }
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+
+      if (url.pathname === '/login') {
+        if (req.method === 'GET') return sendHtml(res, 200, loginPage(''));
+        if (req.method === 'POST') {
+          const body = (await readBody(req)).toString('utf8');
+          const params = new URLSearchParams(body);
+          const username = String(params.get('username') || '').trim();
+          const password = String(params.get('password') || '');
+          const user = findUser(username);
+          if (!user || !verifyPassword(password, user.passwordHash)) {
+            return sendHtml(res, 401, loginPage('用户名或密码不正确'));
+          }
+          const token = signSession(user.username);
+          res.writeHead(302, {
+            'Set-Cookie': `beav_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_HOURS * 3600}`,
+            Location: '/',
+          });
+          return res.end();
+        }
+        return sendJson(res, 405, { success: false, error: 'method not allowed' });
+      }
+
+      if (url.pathname === '/logout') {
+        res.writeHead(302, {
+          'Set-Cookie': 'beav_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0',
+          Location: '/login',
+        });
+        return res.end();
+      }
+
+      if (url.pathname === '/register') {
+        if (process.env.BEAV_ALLOW_REGISTER === '0') {
+          return sendHtml(res, 403, registerPage('注册已关闭，请联系管理员'));
+        }
+        if (req.method === 'GET') return sendHtml(res, 200, registerPage(''));
+        if (req.method === 'POST') {
+          const body = (await readBody(req)).toString('utf8');
+          const params = new URLSearchParams(body);
+          const username = String(params.get('username') || '').trim();
+          const password = String(params.get('password') || '');
+          const confirm = String(params.get('confirm') || '');
+          if (!/^[A-Za-z0-9_-]{2,24}$/.test(username)) {
+            return sendHtml(res, 400, registerPage('用户名需为 2-24 位字母/数字/_/-'));
+          }
+          if (password.length < 6) {
+            return sendHtml(res, 400, registerPage('密码至少 6 位'));
+          }
+          if (password !== confirm) {
+            return sendHtml(res, 400, registerPage('两次输入的密码不一致'));
+          }
+          const data = loadUsers();
+          if (
+            data.users.some(
+              (user) => String(user.username).toLowerCase() === username.toLowerCase(),
+            )
+          ) {
+            return sendHtml(res, 409, registerPage('用户名已被占用'));
+          }
+          const port = nextPort(data.users);
+          data.users.push({
+            username,
+            uid: username,
+            role: 'user',
+            port,
+            passwordHash: hashPassword(password),
+            createdAt: new Date().toISOString(),
+          });
+          saveUsers(data);
+          log(`registered ${username} :${port}`);
+          const token = signSession(username);
+          res.writeHead(302, {
+            'Set-Cookie': `beav_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_HOURS * 3600}`,
+            Location: '/',
+          });
+          return res.end();
+        }
+        return sendJson(res, 405, { success: false, error: 'method not allowed' });
+      }
+
+      const cookies = parseCookies(req.headers.cookie);
+      const sessionUser = verifySession(cookies.beav_session);
+      const user = sessionUser ? findUser(sessionUser) : null;
+      if (!user) {
+        if (url.pathname.startsWith('/api/')) {
+          return sendJson(res, 401, { success: false, error: '未登录' });
+        }
+        res.writeHead(302, { Location: '/login' });
+        return res.end();
+      }
+
+      if (url.pathname === '/admin' || url.pathname.startsWith('/admin/api/')) {
+        if ((user.role || 'user') !== 'admin') {
+          if (url.pathname.startsWith('/admin/api/')) {
+            return sendJson(res, 403, { success: false, error: '需要管理员权限' });
+          }
+          return sendHtml(res, 403, '<h1>403 · 需要管理员权限</h1>');
+        }
+        if (url.pathname === '/admin') {
+          return sendHtml(res, 200, ADMIN_HTML.replace('__ROOT__', escapeHtml(USERS_ROOT)));
+        }
+        if (url.pathname === '/admin/api/instances') {
+          const list = [];
+          for (const item of loadUsers().users) {
+            list.push(await instanceStatus(item));
+          }
+          return sendJson(res, 200, list);
+        }
+        if (url.pathname === '/admin/api/stop') {
+          if (req.method !== 'POST') {
+            return sendJson(res, 405, { success: false, error: 'method not allowed' });
+          }
+          const body = (await readBody(req)).toString('utf8');
+          let parsed = {};
+          try {
+            parsed = JSON.parse(body || '{}');
+          } catch {}
+          const target = findUser(parsed.username);
+          if (!target) return sendJson(res, 404, { success: false, error: '用户不存在' });
+          const key = target.uid || target.username;
+          const record = instances.get(key);
+          let pid = record?.child?.pid ?? null;
+          if (!pid) pid = await findPidByPort(target.port);
+          if (pid) {
+            try {
+              process.kill(pid);
+            } catch {}
+          }
+          instances.delete(key);
+          log(`stopped instance ${target.username} (pid ${pid ?? '-'})`);
+          return sendJson(res, 200, { success: true });
+        }
+        return sendJson(res, 404, { success: false, error: 'not found' });
+      }
+
+      if (url.pathname === '/account') {
+        const status = await instanceStatus(user);
+        return sendHtml(res, 200, accountPage(user, status));
+      }
+
+      if (url.pathname.startsWith('/api/')) {
+        await ensureInstance(user);
+        const record = instances.get(user.uid || user.username);
+        if (record) record.lastActive = Date.now();
+        const body = await readBody(req);
+        return proxyToInstance(req, res, user, url, body);
+      }
+
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        return sendJson(res, 405, { success: false, error: 'method not allowed' });
+      }
+      return serveApp(req, res, url);
+    } catch (error) {
+      log('request failed:', error.message);
+      if (!res.headersSent) sendJson(res, 500, { success: false, error: error.message });
+    }
+  });
+
+  server.listen(WEB_PORT, WEB_HOST, () => {
+    log(`listening on http://${WEB_HOST}:${WEB_PORT}`);
+    log(`users   -> ${USERS_FILE}`);
+    log(`data    -> ${USERS_ROOT}`);
+    log(`exe     -> ${resolveExe()}`);
+    log(`idle    -> ${IDLE_MINUTES} min`);
+  });
+}
+
+main().catch((error) => {
+  console.error('[multi] fatal:', error.message);
+  process.exit(1);
+});

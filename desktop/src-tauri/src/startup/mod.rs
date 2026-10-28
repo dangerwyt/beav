@@ -205,6 +205,10 @@ pub(crate) fn run_setup_restore_sequence(
     app: &mut tauri::App,
 ) -> Result<(), Box<dyn std::error::Error>> {
     register_global_app_handle(app.handle().clone());
+    // 启动对账：把上次被中断的「下载中」复位，避免永久卡住且不重试。
+    crate::commands::monitor::reconcile_interrupted_video_downloads(
+        &app.state::<crate::AppState>(),
+    );
     #[cfg(target_os = "windows")]
     if let Some(window) = app.get_webview_window("main") {
         if let Err(error) = window.set_decorations(false) {
@@ -220,6 +224,12 @@ pub(crate) fn run_setup_restore_sequence(
                 json!({ "error": error.to_string() }),
                 None,
             );
+        }
+    }
+    // 多实例：headless 实例不显示窗口（只作为该用户的 daemon 后端）。
+    if std::env::var("BEAV_HEADLESS").ok().as_deref() == Some("1") {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.hide();
         }
     }
     let _ = app.emit("indexing:status", default_indexing_stats());

@@ -4,6 +4,7 @@ import clsx from 'clsx';
 import { APP_BRAND } from '../../config/brand';
 import { SUPPORTED_LANGUAGES, useI18n, type AppLanguage } from '../../i18n';
 import { PasswordInput, resolveRuntimeAssetUrl } from './shared';
+import { isTauriRuntime } from '../../bridge/browserHost';
 import type {
   CliRuntimeEnvironmentRecord,
   CliRuntimeEnvironmentScope,
@@ -672,25 +673,35 @@ function GeneralSettingsSectionInner({
                             value={formData.workspace_dir}
                             onChange={(e) => setFormData((d: any) => ({ ...d, workspace_dir: e.target.value }))}
                             placeholder="~/.redbox"
-                            className="w-full bg-surface-secondary/30 rounded border border-border pl-10 pr-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors"
+                            disabled={!isTauriRuntime()}
+                            className="w-full bg-surface-secondary/30 rounded border border-border pl-10 pr-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors disabled:opacity-60"
                         />
                     </div>
-                    <button
-                        type="button"
-                        onClick={() => void handlePickWorkspaceDir()}
-                        className="shrink-0 rounded border border-border px-3 py-2 text-xs font-medium text-text-primary hover:bg-surface-secondary transition-colors"
-                    >
-                        {t('settings.general.pickFolder')}
-                    </button>
-                    <button
-                        type="button"
-                        onClick={handleResetWorkspaceDir}
-                        disabled={!String(formData.workspace_dir || '').trim()}
-                        className="shrink-0 rounded border border-border px-3 py-2 text-xs font-medium text-text-secondary hover:bg-surface-secondary transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                        {t('settings.general.restoreDefault')}
-                    </button>
+                    {isTauriRuntime() && (
+                        <>
+                            <button
+                                type="button"
+                                onClick={() => void handlePickWorkspaceDir()}
+                                className="shrink-0 rounded border border-border px-3 py-2 text-xs font-medium text-text-primary hover:bg-surface-secondary transition-colors"
+                            >
+                                {t('settings.general.pickFolder')}
+                            </button>
+                            <button
+                                type="button"
+                                onClick={handleResetWorkspaceDir}
+                                disabled={!String(formData.workspace_dir || '').trim()}
+                                className="shrink-0 rounded border border-border px-3 py-2 text-xs font-medium text-text-secondary hover:bg-surface-secondary transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                                {t('settings.general.restoreDefault')}
+                            </button>
+                        </>
+                    )}
                 </div>
+                {!isTauriRuntime() && (
+                    <div className="mt-1 text-[11px] text-text-tertiary">
+                        工作区由服务器统一管理（Web 多用户模式），客户端不可修改。
+                    </div>
+                )}
             </div>
 
             <div className="bg-surface-secondary/30 rounded-lg border border-border p-4">
