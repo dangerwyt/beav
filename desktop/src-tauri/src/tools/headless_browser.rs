@@ -814,30 +814,72 @@ pub async fn capture_login_qr(ws_url: &str, login_url: &str) -> Result<String, S
     Ok(data_url)
 }
 
-/// 检查某平台是否已登录（小红书看 `web_session` cookie）。
+/// 检查某平台是否**真实登录**。
+///
+/// 不能只看 cookie：小红书给游客也会下发 `web_session`，只看存在会误判。
+/// 以页面状态为准（explore 是否仍弹登录框），cookie 仅作兜底。
 pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, String> {
     let client = CdpClient::connect(ws_url).await?;
-    let result = client.send_request("Storage.getCookies", None, None).await?;
-    let matched = result
-        .get("cookies")
-        .and_then(Value::as_array)
-        .map(|cookies| {
-            cookies.iter().any(|cookie| {
-                let name = cookie.get("name").and_then(Value::as_str).unwrap_or("");
-                let domain = cookie.get("domain").and_then(Value::as_str).unwrap_or("");
-                let value = cookie.get("value").and_then(Value::as_str).unwrap_or("");
-                let wanted = match platform {
-                    "xiaohongshu" => "web_session",
-                    "douyin" => "sessionid",
-                    "bilibili" => "SESSDATA",
-                    _ => "web_session",
-                };
-                name == wanted && !value.is_empty() && domain.contains(platform_domain(platform))
-            })
-        })
+    let home = match platform {
+        "douyin" => "https://www.douyin.com/",
+        "bilibili" => "https://www.bilibili.com/",
+        _ => "https://www.xiaohongshu.com/explore",
+    };
+    let target_id = client.create_target(home).await?;
+    let session_id = client.attach_to_target(&target_id).await?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state = client
+            .evaluate(
+                &session_id,
+                "(() => { try { return document.readyState; } catch (e) { return ''; } })()",
+                false,
+            )
+            .await;
+        if matches!(state.as_ref().ok().and_then(Value::as_str), Some("complete")) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // 给弹窗渲染留时间
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let logged = client
+        .evaluate(
+            &session_id,
+            r#"(() => {
+                try {
+                    const s = window.__INITIAL_STATE__;
+                    const u = s && s.user;
+                    if (u && typeof u.loggedIn === 'boolean') return u.loggedIn;
+                    if (u && u.userInfo && (u.userInfo.nickname || u.userInfo.userId)) return true;
+                } catch (e) {}
+                const text = (document.body && document.body.innerText) || '';
+                if (text.includes('登录后查看') || text.includes('手机号登录') || text.includes('扫码登录')) {
+                    return false;
+                }
+                return (document.cookie || '').includes('web_session=');
+            })()"#,
+            false,
+        )
+        .await
+        .ok()
+        .and_then(|value| value.as_bool())
         .unwrap_or(false);
+
+    let _ = client
+        .send_request(
+            "Target.closeTarget",
+            Some(json!({ "targetId": target_id })),
+            None,
+        )
+        .await;
     client.close().await;
-    Ok(matched)
+    Ok(logged)
 }
 
 fn platform_domain(platform: &str) -> &'static str {

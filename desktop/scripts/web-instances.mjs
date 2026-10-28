@@ -894,7 +894,7 @@ async function refreshQr(){
     img.src = data.image;
     img.style.display = 'block';
     document.getElementById('msg').textContent = '请用小红书 App 扫码';
-    if(!timer) timer = setInterval(poll, 2000);
+    if(!timer) timer = setInterval(poll, 5000);
   }catch(e){ document.getElementById('msg').textContent = '失败：' + e.message; }
 }
 async function poll(){
