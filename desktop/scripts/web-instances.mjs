@@ -414,6 +414,43 @@ const PLATFORM_HOME = {
   bilibili: 'https://www.bilibili.com',
 };
 
+const STUCK_MS = 30 * 60_000;
+
+/** 视频下载异常：failed / 卡在 downloading 超过 30 分钟；另统计从未下载的。 */
+function computeVideoIssues(posts) {
+  const now = Date.now();
+  const issues = [];
+  let pending = 0;
+  for (const post of posts) {
+    if (post.mediaType !== 'video') continue;
+    const status = String(post.videoStatus || '');
+    const updatedAt = Number(post.updatedAt || 0);
+    if (status === 'failed') {
+      issues.push({
+        id: post.id,
+        title: post.title || '',
+        platform: post.platform,
+        status: 'failed',
+        error: post.videoError || '',
+        updatedAt,
+      });
+    } else if (status === 'downloading' && now - updatedAt > STUCK_MS) {
+      issues.push({
+        id: post.id,
+        title: post.title || '',
+        platform: post.platform,
+        status: 'stuck',
+        error: post.videoError || '',
+        updatedAt,
+      });
+    } else if (status === 'none' || !status) {
+      pending += 1;
+    }
+  }
+  issues.sort((a, b) => b.updatedAt - a.updatedAt);
+  return { issues, pending };
+}
+
 /** 夜间任务：拉起实例 → 确保各平台 Chrome → 跑每日预取。 */
 async function runDailyFor(user) {
   await ensureInstance(user);
@@ -452,6 +489,19 @@ async function runDailyFor(user) {
     log(`daily ${user.username} done: ${JSON.stringify(result).slice(0, 180)}`);
   } catch (error) {
     log(`daily ${user.username} failed: ${error.message}`);
+  }
+
+  // 跑完汇总视频异常，便于管理员第二天直接重试。
+  try {
+    const posts = await callIpc(user, 'monitor:post-list', { limit: 300 }, 60_000);
+    const { issues, pending } = computeVideoIssues(Array.isArray(posts) ? posts : []);
+    const failed = issues.filter((item) => item.status === 'failed').length;
+    const stuck = issues.length - failed;
+    log(
+      `daily ${user.username} video issues: ${failed} failed, ${stuck} stuck, ${pending} pending`,
+    );
+  } catch (error) {
+    log(`daily ${user.username}: issue scan failed: ${error.message}`);
   }
 }
 
@@ -802,14 +852,32 @@ const USER_PAGE_HTML = `<!doctype html>
 <h2>监控博主</h2>
 <table><thead><tr><th>名称</th><th>平台</th><th>已收录</th><th>上次抓取</th><th>已补历史</th></tr></thead>
 <tbody id="watches"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody></table>
+<h2>视频下载异常 <span id="issueCount" class="muted"></span></h2>
+<div class="bar">
+  <button id="retryAll">全部重试</button>
+  <span id="issueMsg" class="muted"></span>
+</div>
+<table><thead><tr><th>标题</th><th>平台</th><th>状态</th><th>错误</th><th>更新时间</th><th></th></tr></thead>
+<tbody id="issues"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody></table>
+<p id="pending" class="muted"></p>
+
 <h2>最近动态</h2>
 <table><thead><tr><th>标题</th><th>平台</th><th>视频</th><th>更新时间</th></tr></thead>
 <tbody id="posts"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody></table>
 <script>
 const UID = __UID__;
 const NAMES = __NAME__;
+let current = null;
 function td(text){const el=document.createElement('td');el.textContent=String(text??'');return el;}
 function row(){return document.createElement('tr');}
+async function retryOne(item){
+  document.getElementById('issueMsg').textContent='重试中…';
+  try{
+    await fetch('/admin/api/retry-video',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:UID,postId:item.id,platform:item.platform})});
+    document.getElementById('issueMsg').textContent='已触发重试';
+  }catch(e){document.getElementById('issueMsg').textContent='重试失败：'+e.message;}
+}
 async function refresh(){
   let data;
   try{
@@ -819,6 +887,7 @@ async function refresh(){
   }catch(e){
     document.getElementById('msg').textContent='读取失败：'+e.message;return;
   }
+  current = data;
   document.title=NAMES+' · 用户数据';
   document.getElementById('title').textContent=NAMES+' 的数据';
   const wt=document.getElementById('watches');wt.innerHTML='';
@@ -830,6 +899,20 @@ async function refresh(){
     wt.appendChild(tr);
   }
   if(!data.watches.length) wt.innerHTML='<tr><td colspan="5" class="muted">还没有监控博主</td></tr>';
+  const it=document.getElementById('issues');it.innerHTML='';
+  document.getElementById('issueCount').textContent = data.issues.length ? '('+data.issues.length+')' : '';
+  for(const x of data.issues){
+    const tr=row();
+    const statusText = x.status==='failed' ? '失败' : x.status==='stuck' ? '卡住' : x.status;
+    tr.append(td(x.title||'(无标题)'),td(x.platform),td(statusText),td(x.error||'-'),
+      td(x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'));
+    const action=document.createElement('td');
+    const btn=document.createElement('button');btn.textContent='重试';btn.onclick=()=>retryOne(x);
+    action.appendChild(btn);tr.appendChild(action);it.appendChild(tr);
+  }
+  if(!data.issues.length) it.innerHTML='<tr><td colspan="6" class="muted">没有异常</td></tr>';
+  document.getElementById('pending').textContent = data.pendingVideos
+    ? ('另有 '+data.pendingVideos+' 个视频从未下载（不在异常列表）') : '';
   const pt=document.getElementById('posts');pt.innerHTML='';
   for(const p of data.posts){
     const tr=row();
@@ -839,6 +922,16 @@ async function refresh(){
   }
   if(!data.posts.length) pt.innerHTML='<tr><td colspan="4" class="muted">没有动态</td></tr>';
 }
+document.getElementById('retryAll').onclick=async()=>{
+  if(!current || !current.issues.length) return;
+  const ids = current.issues.map((x)=>x.id);
+  document.getElementById('issueMsg').textContent='批量重试中…';
+  try{
+    await fetch('/admin/api/retry-videos',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:UID,ids})});
+    document.getElementById('issueMsg').textContent='已触发 '+ids.length+' 个';
+  }catch(e){document.getElementById('issueMsg').textContent='批量重试失败：'+e.message;}
+};
 document.getElementById('run').onclick=async()=>{
   document.getElementById('msg').textContent='已触发，后台执行中…';
   try{
@@ -1144,7 +1237,67 @@ async function main() {
           ]);
           const watches = Array.isArray(watchesRaw) ? watchesRaw : [];
           const posts = Array.isArray(postsRaw) ? postsRaw : [];
-          return sendJson(res, 200, { watches, posts });
+          const { issues, pending } = computeVideoIssues(posts);
+          return sendJson(res, 200, { watches, posts, issues, pendingVideos: pending });
+        }
+        if (url.pathname === '/admin/api/retry-video') {
+          if (req.method !== 'POST') {
+            return sendJson(res, 405, { success: false, error: 'method not allowed' });
+          }
+          const body = (await readBody(req)).toString('utf8');
+          let parsed = {};
+          try {
+            parsed = JSON.parse(body || '{}');
+          } catch {}
+          const target = findUser(parsed.username);
+          const postId = String(parsed.postId || '').trim();
+          if (!target) return sendJson(res, 404, { success: false, error: '用户不存在' });
+          if (!postId) return sendJson(res, 400, { success: false, error: '缺少 postId' });
+          await ensureInstance(target);
+          if (parsed.platform) {
+            try {
+              await callIpc(
+                target,
+                'monitor:chrome-launch',
+                {
+                  platform: parsed.platform,
+                  url: PLATFORM_HOME[parsed.platform] || PLATFORM_HOME.xiaohongshu,
+                },
+                30_000,
+              );
+            } catch (error) {
+              log(`retry chrome ${parsed.platform} failed: ${error.message}`);
+            }
+          }
+          callIpc(target, 'monitor:download-video', { id: postId })
+            .then((result) => log(`retry ${postId}: ${JSON.stringify(result).slice(0, 120)}`))
+            .catch((error) => log(`retry ${postId} failed: ${error.message}`));
+          return sendJson(res, 200, { success: true, started: true });
+        }
+        if (url.pathname === '/admin/api/retry-videos') {
+          if (req.method !== 'POST') {
+            return sendJson(res, 405, { success: false, error: 'method not allowed' });
+          }
+          const body = (await readBody(req)).toString('utf8');
+          let parsed = {};
+          try {
+            parsed = JSON.parse(body || '{}');
+          } catch {}
+          const target = findUser(parsed.username);
+          const ids = Array.isArray(parsed.ids) ? parsed.ids.filter(Boolean) : [];
+          if (!target) return sendJson(res, 404, { success: false, error: '用户不存在' });
+          if (!ids.length) return sendJson(res, 400, { success: false, error: '没有可重试的帖子' });
+          (async () => {
+            for (const id of ids) {
+              try {
+                await callIpc(target, 'monitor:download-video', { id });
+              } catch (error) {
+                log(`retry ${id} failed: ${error.message}`);
+              }
+            }
+            log(`retry batch ${target.username} done (${ids.length})`);
+          })();
+          return sendJson(res, 200, { success: true, started: true, count: ids.length });
         }
         if (url.pathname === '/admin/api/run-daily') {
           if (req.method !== 'POST') {

@@ -125,9 +125,11 @@ node scripts/web-instances.mjs --delete alice
 | `/register` | 公开（可关） | 注册并自动登录 |
 | `/account` | 登录用户 | 自己的端口/状态/PID/内存/数据目录 |
 | `/admin` | `role=admin` | 所有用户实例状态、内存、启动时间、最近活跃、停止按钮（5s 刷新） |
-| `/admin/user/<uid>` | admin | 该用户的**只读**数据：监控博主 + 最近动态 +「立即跑每日任务」 |
+| `/admin/user/<uid>` | admin | 该用户的**只读**数据：监控博主 + **视频下载异常** + 最近动态 +「立即跑每日任务」 |
 | `/admin/api/instances` | admin | 上述数据 JSON |
-| `/admin/api/user/<uid>` | admin | 该用户的 watches + posts（会按需拉起实例） |
+| `/admin/api/user/<uid>` | admin | 该用户的 watches + posts + `issues`（失败/卡住）+ `pendingVideos` |
+| `/admin/api/retry-video` | admin | POST `{username, postId, platform?}` 重新下载单个视频（先拉起对应平台 Chrome） |
+| `/admin/api/retry-videos` | admin | POST `{username, ids}` 批量重试 |
 | `/admin/api/run-daily` | admin | POST `{username}` 触发该用户的每日预取 |
 | `/admin/api/stop` | admin | POST `{username}` 停止实例 |
 
