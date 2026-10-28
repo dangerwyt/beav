@@ -220,7 +220,9 @@ fn watch_add(state: &State<'_, AppState>, payload: &Value) -> Result<Value, Stri
         id: make_id("watch"),
         name,
         platform: str_field(payload, "platform").unwrap_or_default(),
-        profile_url: str_field(payload, "profileUrl").or_else(|| str_field(payload, "profile_url")),
+        profile_url: str_field(payload, "profileUrl")
+            .or_else(|| str_field(payload, "profile_url"))
+            .map(|url| crate::tools::headless_browser::normalize_profile_url(&url)),
         handle: str_field(payload, "handle"),
         note: str_field(payload, "note"),
         enabled: payload
