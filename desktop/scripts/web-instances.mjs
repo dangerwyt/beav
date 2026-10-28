@@ -52,6 +52,8 @@ const IDLE_MINUTES = Number(process.env.BEAV_IDLE_MINUTES ?? 30);
 // 置空（BEAV_PREWARM_AT=）可关闭。
 const PREWARM_AT = String(process.env.BEAV_PREWARM_AT ?? '23:55').trim();
 const KEEP_UNTIL = String(process.env.BEAV_KEEP_UNTIL ?? '03:00').trim();
+// 集中触发每日任务：到点对每个用户实例调用 monitor:run-daily（置空关闭）。
+const DAILY_AT = String(process.env.BEAV_DAILY_AT ?? '00:00').trim();
 const SESSION_HOURS = Number(process.env.BEAV_SESSION_HOURS || 72);
 const SECRET_FILE = path.resolve(
   process.env.BEAV_SESSION_SECRET_FILE || path.join(DESKTOP_ROOT, '.beav-session-secret'),
@@ -268,6 +270,8 @@ function instanceEnv(user) {
     BEAV_MANAGED_DIRS: '1',
     // 不需要官方功能：跳过登录/扫码闸门，直接进工作台。
     BEAV_SKIP_OFFICIAL_LOGIN: '1',
+    // 每日任务由管理器集中触发，实例内定时器关闭，避免重复跑。
+    BEAV_DISABLE_DAILY_SCHEDULER: '1',
   };
   // 隔离 Tauri 的 app_data（official auth / acp 配置 / 日志队列等）。
   if (process.platform === 'win32') {
@@ -367,6 +371,89 @@ async function instanceStatus(user) {
 // 同一用户的并发请求必须共用一次 spawn：页面首屏会同时发几十个 /api/*，
 // 没有去重就会瞬间拉起多个实例（只有一个抢到端口，其余变僵尸进程）。
 const spawning = new Map();
+
+/** 直接调该用户实例的 IPC（管理器内部用，带 Origin/CORS 与 Content-Length）。 */
+function callIpc(user, channel, payload, timeoutMs = 0) {
+  const body = Buffer.from(JSON.stringify({ channel, payload: payload ?? {} }));
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      {
+        hostname: '127.0.0.1',
+        port: user.port,
+        method: 'POST',
+        path: '/api/ipc/invoke',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': body.length,
+          Origin: `http://127.0.0.1:${user.port}`,
+        },
+      },
+      (response) => {
+        let text = '';
+        response.on('data', (chunk) => (text += chunk));
+        response.on('end', () => {
+          try {
+            resolve(JSON.parse(text));
+          } catch (error) {
+            reject(new Error(`invalid JSON: ${text.slice(0, 120)}`));
+          }
+        });
+      },
+    );
+    request.on('error', reject);
+    if (timeoutMs > 0) {
+      request.setTimeout(timeoutMs, () => request.destroy(new Error('timeout')));
+    }
+    request.end(body);
+  });
+}
+
+const PLATFORM_HOME = {
+  xiaohongshu: 'https://www.xiaohongshu.com',
+  douyin: 'https://www.douyin.com',
+  bilibili: 'https://www.bilibili.com',
+};
+
+/** 夜间任务：拉起实例 → 确保各平台 Chrome → 跑每日预取。 */
+async function runDailyFor(user) {
+  await ensureInstance(user);
+  const record = instances.get(user.uid || user.username);
+  if (record) {
+    record.lastActive = Date.now();
+    record.keepAliveUntil = Date.now() + 4 * 3_600_000;
+  }
+
+  let watches = [];
+  try {
+    const list = await callIpc(user, 'monitor:watch-list', {}, 30_000);
+    watches = Array.isArray(list) ? list : Array.isArray(list?.items) ? list.items : [];
+  } catch (error) {
+    log(`daily ${user.username}: watch-list failed: ${error.message}`);
+  }
+
+  const platforms = [...new Set(watches.map((item) => item?.platform).filter(Boolean))];
+  for (const platform of platforms) {
+    try {
+      await callIpc(
+        user,
+        'monitor:chrome-launch',
+        { platform, url: PLATFORM_HOME[platform] || PLATFORM_HOME.xiaohongshu },
+        60_000,
+      );
+      log(`daily ${user.username}: chrome ${platform} ready`);
+    } catch (error) {
+      log(`daily ${user.username}: chrome ${platform} failed: ${error.message}`);
+    }
+  }
+  if (platforms.length) await new Promise((resolve) => setTimeout(resolve, 4_000));
+
+  try {
+    const result = await callIpc(user, 'monitor:run-daily', {});
+    log(`daily ${user.username} done: ${JSON.stringify(result).slice(0, 180)}`);
+  } catch (error) {
+    log(`daily ${user.username} failed: ${error.message}`);
+  }
+}
 
 async function ensureInstance(user) {
   const key = user.uid || user.username;
@@ -488,6 +575,29 @@ setInterval(() => {
       log(`reap idle instance ${key}`);
     }
   }
+}, 60_000).unref?.();
+
+// 集中触发每日任务（不依赖各实例内部定时器）。
+let lastDailyDay = '';
+setInterval(() => {
+  if (!DAILY_AT) return;
+  const now = new Date();
+  if (hhmm(now) !== DAILY_AT) return;
+  const dayKey = now.toDateString();
+  if (lastDailyDay === dayKey) return;
+  lastDailyDay = dayKey;
+  (async () => {
+    const users = loadUsers().users;
+    log(`daily start (${users.length} users)`);
+    for (const user of users) {
+      try {
+        await runDailyFor(user);
+      } catch (error) {
+        log(`daily ${user.username} failed: ${error.message}`);
+      }
+    }
+    log('daily finished');
+  })();
 }, 60_000).unref?.();
 
 // ---------------- HTTP ----------------
@@ -993,6 +1103,7 @@ async function main() {
     log(`exe     -> ${resolveExe()}`);
     log(`idle    -> ${IDLE_MINUTES > 0 ? `${IDLE_MINUTES} min` : 'never'}`);
     log(`prewarm -> ${PREWARM_AT ? `${PREWARM_AT} (keep until ${KEEP_UNTIL})` : 'off'}`);
+    log(`daily   -> ${DAILY_AT || 'off'}`);
   });
 }
 

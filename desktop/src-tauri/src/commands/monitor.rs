@@ -5005,6 +5005,10 @@ pub fn start_monitor_scheduler(app: AppHandle) {
     {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
+            // 受管多用户：由实例管理器集中触发每日任务，实例内不再自己跑，避免重复。
+            if std::env::var("BEAV_DISABLE_DAILY_SCHEDULER").ok().as_deref() == Some("1") {
+                return;
+            }
             loop {
                 let now = crate::now_i64();
                 // 计算下一个本地 00:00（时区取本机，与 task_policy 的每日调度同源）。

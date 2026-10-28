@@ -101,16 +101,21 @@ node scripts/web-instances.mjs --delete alice
 
 ### 夜间增量（本地 00:00）
 
-每日预取由**实例内部**的调度器触发，所以实例必须活着：
+由**管理器集中触发**：到点对每个用户实例调用 `monitor:run-daily`。
+受管实例内部自带的每日定时器已通过 `BEAV_DISABLE_DAILY_SCHEDULER=1` 关闭，不会重复跑。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `BEAV_PREWARM_AT` | `23:55` | 到点自动拉起所有用户实例；置空关闭 |
-| `BEAV_KEEP_UNTIL` | `03:00` | 预热实例保活到几点（不被闲置回收） |
-| `BEAV_IDLE_MINUTES` | `30` | 闲置回收分钟；`0` = 不回收（常驻） |
+| `BEAV_DAILY_AT` | `00:00` | 集中触发时间；置空关闭 |
+| `BEAV_PREWARM_AT` | `23:55` | 提前拉起所有用户实例；置空关闭 |
+| `BEAV_KEEP_UNTIL` | `03:00` | 预热实例保活到几点 |
+| `BEAV_IDLE_MINUTES` | `30` | 闲置回收分钟；`0` = 不回收 |
 
-> 还需要**Chrome 连接**（登录管理里打开的 headless Chrome）。实例活着但 Chrome 被关掉，
-> 详情/视频抓取仍会失败。桌面端同理：App 必须开着。
+管理器会先按该用户的 watch 平台调 `monitor:chrome-launch` 拉起 Chrome，再跑预取；
+任务开始时自动保活 4 小时。
+
+> Chrome 必须能拉起（服务器有图形会话）。若 Chrome 被关掉，详情/视频抓取仍会失败。
+> 桌面端同理：App 必须开着。
 
 ### 页面
 
