@@ -862,44 +862,62 @@ refresh(); setInterval(refresh, 5000);
 const QR_PAGE_HTML = `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>扫码登录 · 小红书</title>
+<title>扫码登录 · 平台</title>
 <style>
   :root{color-scheme:dark}
   body{margin:0;padding:32px;background:#1b1b1f;color:#e8e8ea;
     font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
   h1{font-size:20px;margin:0 0 6px}
-  .sub{color:#8a8a93;font-size:12px;margin-bottom:18px}
+  .sub{color:#8a8a93;font-size:12px;margin-bottom:14px}
+  .warn{color:#f0b429;font-size:12px;margin-bottom:16px}
   button{padding:8px 14px;border:1px solid #3a3a42;border-radius:8px;background:#232329;
     color:#e8e8ea;font-size:13px;cursor:pointer}
   button:hover{border-color:#c9a227;color:#c9a227}
+  .tabs{display:flex;gap:8px;margin-bottom:14px}
+  .tab.active{border-color:#c9a227;color:#c9a227}
   #msg{color:#a0a0aa;font-size:12px;margin-left:10px}
   #wrap{margin-top:20px;display:flex;justify-content:center}
   #qr{max-width:320px;border-radius:12px;background:#fff;padding:10px;display:none}
   a{color:#c9a227;text-decoration:none}
 </style></head><body>
-<h1>扫码登录 · 小红书</h1>
-<div class="sub">用**小红书 App** 扫描下方二维码；登录成功后自动保存 cookie（约 2 分钟过期）· <a href="/admin">返回</a></div>
+<h1>扫码登录</h1>
+<div class="sub">用对应平台的 **App** 扫描下方二维码；登录成功后自动保存 cookie（约 2 分钟过期）· <a href="/admin">返回</a></div>
+<div class="warn">服务器上的平台账号是<b>所有用户共享</b>的：扫码会更换服务器上的账号（原会话被顶掉）。已登录时默认拒绝扫码。</div>
+<div class="tabs">
+  <button class="tab" data-p="xiaohongshu">小红书</button>
+  <button class="tab" data-p="douyin">抖音</button>
+  <button class="tab" data-p="bilibili">B 站</button>
+</div>
 <button id="start">获取二维码 / 刷新</button><span id="msg"></span>
-<div id="wrap"><img id="qr" alt="小红书登录二维码" /></div>
+<div id="wrap"><img id="qr" alt="登录二维码" /></div>
 <script>
+const APPS = { xiaohongshu:'小红书', douyin:'抖音', bilibili:'哔哩哔哩' };
+let platform = 'xiaohongshu';
 let timer = null;
+function select(p){
+  platform = p;
+  document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.p === p));
+  document.getElementById('qr').style.display = 'none';
+  if(timer){ clearInterval(timer); timer = null; }
+  refreshQr();
+}
 async function refreshQr(){
   document.getElementById('msg').textContent = '获取中…（首次启动 Chrome 约 10-30s）';
   try{
     const res = await fetch('/admin/api/qr-start',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({platform:'xiaohongshu'})});
+      body:JSON.stringify({platform})});
     const data = await res.json();
     if(!data.success){ document.getElementById('msg').textContent = '失败：' + (data.error||''); return; }
     const img = document.getElementById('qr');
     img.src = data.image;
     img.style.display = 'block';
-    document.getElementById('msg').textContent = '请用小红书 App 扫码';
+    document.getElementById('msg').textContent = '请用' + APPS[platform] + ' App 扫码';
     if(!timer) timer = setInterval(poll, 5000);
   }catch(e){ document.getElementById('msg').textContent = '失败：' + e.message; }
 }
 async function poll(){
   try{
-    const res = await fetch('/admin/api/qr-status?platform=xiaohongshu');
+    const res = await fetch('/admin/api/qr-status?platform=' + encodeURIComponent(platform));
     const data = await res.json();
     if(data.loggedIn){
       document.getElementById('msg').textContent = '已登录 ✅ 可以关闭本页';
@@ -907,8 +925,9 @@ async function poll(){
     }
   }catch(e){}
 }
+document.querySelectorAll('.tab').forEach(b => b.onclick = () => select(b.dataset.p));
 document.getElementById('start').onclick = refreshQr;
-refreshQr();
+select('xiaohongshu');
 </script></body></html>`;
 
 const USER_PAGE_HTML = `<!doctype html>

@@ -352,12 +352,21 @@ pub fn active_chrome_port(platform: &str) -> u16 {
         .unwrap_or(0)
 }
 
+/// 端口对应�� Chrome 是否**还活着**。
+///
+/// 会话表里的端口会残留（用户手动关掉 Chrome 后进程没了、端口号还在），
+/// 直接用它当"已就绪"会让 UI 一直显示已连接，实际抓取全部失败。
+pub fn chrome_session_alive(platform: &str) -> bool {
+    let port = active_chrome_port(platform);
+    port != 0 && debug_port_alive(port)
+}
+
 /// 返回所有已就绪的平台名（供 UI 展示）。
 pub fn ready_platforms() -> Vec<String> {
     let sessions = CHROME_SESSIONS.get_or_init(Default::default).lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     sessions
         .iter()
-        .filter(|(_, session)| session.port != 0)
+        .filter(|(platform, session)| session.port != 0 && debug_port_alive(session.port))
         .map(|(platform, _)| platform.clone())
         .collect()
 }
@@ -733,18 +742,97 @@ pub async fn navigate_and_eval_settle(
     outcome
 }
 
+/// 各平台扫码登录配置。
+///
+/// - `login_url`：登录页
+/// - `prepare_js`：进入登录页后要先点的按钮（抖音要先点「登录」才弹二维码）
+/// - `cookie_name`：登录成功后该平台必然有的 cookie（游客不会有）
+/// - `home_url`：登录态检查用的首页
+pub struct QrPlatformSpec {
+    pub login_url: &'static str,
+    pub prepare_js: &'static str,
+    pub cookie_name: &'static str,
+    pub home_url: &'static str,
+}
+
+const XHS_QR: QrPlatformSpec = QrPlatformSpec {
+    login_url: "https://www.xiaohongshu.com/login",
+    prepare_js: "",
+    cookie_name: "web_session",
+    home_url: "https://www.xiaohongshu.com/explore",
+};
+
+const DOUYIN_QR: QrPlatformSpec = QrPlatformSpec {
+    login_url: "https://www.douyin.com/",
+    // 抖音首页右上角「登录」按钮 → 弹出二维码
+    prepare_js: r#"(() => {
+        const hit = [...document.querySelectorAll('button,div,span,a')]
+            .find((el) => (el.textContent || '').trim() === '登录');
+        if (hit) { hit.click(); return true; }
+        const fallback = document.querySelector('.login-btn,[data-e2e="login-button"],#douyin-header-menuCt button');
+        if (fallback) { fallback.click(); return true; }
+        return false;
+    })()"#,
+    cookie_name: "sessionid",
+    home_url: "https://www.douyin.com/",
+};
+
+const BILIBILI_QR: QrPlatformSpec = QrPlatformSpec {
+    login_url: "https://account.bilibili.com/login",
+    // 登录页默认展示二维码；存在「扫码登录」页签时点一下
+    prepare_js: r#"(() => {
+        const hit = [...document.querySelectorAll('div,span,a,button')]
+            .find((el) => (el.textContent || '').trim().startsWith('扫码登录'));
+        if (hit) { hit.click(); return true; }
+        return false;
+    })()"#,
+    cookie_name: "SESSDATA",
+    home_url: "https://www.bilibili.com/",
+};
+
+pub fn qr_platform_spec(platform: &str) -> Option<QrPlatformSpec> {
+    match platform {
+        "xiaohongshu" => Some(XHS_QR),
+        "douyin" => Some(DOUYIN_QR),
+        "bilibili" => Some(BILIBILI_QR),
+        _ => None,
+    }
+}
+
+/// 找页面上的二维码区域。
+///
+/// 兼容三种形态：`<img>` / `<canvas>` / 带 background-image 的 div（B 站就是这种）。
+const FIND_QR_JS: &str = r#"(() => {
+    const cands = [];
+    const consider = (el) => {
+        const r = el.getBoundingClientRect();
+        if (r.width < 110 || r.width > 420) return;
+        if (Math.abs(r.width - r.height) > 36) return;
+        if (r.x < 0 || r.y < 0) return;
+        cands.push({ x: r.x, y: r.y, width: r.width, height: r.height });
+    };
+    document.querySelectorAll('img,canvas').forEach(consider);
+    document.querySelectorAll('div,span').forEach((el) => {
+        const bg = getComputedStyle(el).backgroundImage || '';
+        if (bg !== 'none' && (bg.includes('data:image') || bg.includes('base64'))) consider(el);
+    });
+    if (!cands.length) return null;
+    cands.sort((a, b) => b.width - a.width);
+    return cands[0];
+})()"#;
+
 /// 打开登录页并截取二维码（返回 data URL）。
 ///
 /// 用于 Web 端扫码登录：管理员在浏览器里看到平台自己的登录二维码，
 /// 用手机 App 扫，登录态落在该平台 profile 里，之后抓取复用。
-pub async fn capture_login_qr(ws_url: &str, login_url: &str) -> Result<String, String> {
+pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<String, String> {
     let client = CdpClient::connect(ws_url).await?;
     let target_id = client.create_target("about:blank").await?;
     let session_id = client.attach_to_target(&target_id).await?;
     let _ = client
         .send_request(
             "Page.navigate",
-            Some(json!({ "url": login_url })),
+            Some(json!({ "url": spec.login_url })),
             Some(&session_id),
         )
         .await?;
@@ -767,26 +855,17 @@ pub async fn capture_login_qr(ws_url: &str, login_url: &str) -> Result<String, S
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+
+    // 平台特有的前置操作（抖音要点「登录」弹窗）
+    if !spec.prepare_js.is_empty() {
+        let _ = client.evaluate(&session_id, spec.prepare_js, false).await;
+    }
     // 给登录弹窗/二维码渲染留时间
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // 找二维码元素（最大且接近正方形的一张图/画布）
+    // 找二维码元素
     let rect = client
-        .evaluate(
-            &session_id,
-            r#"(() => {
-                const nodes = [...document.querySelectorAll('img,canvas')];
-                const items = nodes.map((el) => {
-                    const r = el.getBoundingClientRect();
-                    return { x: r.x, y: r.y, width: r.width, height: r.height };
-                }).filter((r) => r.width >= 120 && r.width <= 380
-                    && Math.abs(r.width - r.height) <= 24 && r.x >= 0 && r.y >= 0);
-                if (!items.length) return null;
-                items.sort((a, b) => b.width - a.width);
-                return items[0];
-            })()"#,
-            false,
-        )
+        .evaluate(&session_id, FIND_QR_JS, false)
         .await
         .ok()
         .filter(|value| value.is_object());
@@ -816,16 +895,23 @@ pub async fn capture_login_qr(ws_url: &str, login_url: &str) -> Result<String, S
 
 /// 检查某平台是否**真实登录**。
 ///
-/// 不能只看 cookie：小红书给游客也会下发 `web_session`，只看存在会误判。
-/// 以页面状态为准（explore 是否仍弹登录框），cookie 仅作兜底。
+/// 各平台判定方式不同：
+/// - 小红书：游客也会拿到 `web_session`，只能看页面状态（explore 是否仍弹登录框）；
+/// - 抖音：登录后必有 `sessionid`；
+/// - B 站：登录后必有 `SESSDATA`。
 pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, String> {
+    let spec = qr_platform_spec(platform).ok_or_else(|| format!("不支持的平台：{platform}"))?;
     let client = CdpClient::connect(ws_url).await?;
-    let home = match platform {
-        "douyin" => "https://www.douyin.com/",
-        "bilibili" => "https://www.bilibili.com/",
-        _ => "https://www.xiaohongshu.com/explore",
-    };
-    let target_id = client.create_target(home).await?;
+
+    // 抖音 / B 站：cookie 判定足够可靠且便宜。
+    if platform != "xiaohongshu" {
+        let matched = has_login_cookie(&client, spec.cookie_name, platform).await;
+        client.close().await;
+        return Ok(matched);
+    }
+
+    // 小红书：必须看页面状态。
+    let target_id = client.create_target(spec.home_url).await?;
     let session_id = client.attach_to_target(&target_id).await?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -880,6 +966,27 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
         .await;
     client.close().await;
     Ok(logged)
+}
+
+/// 该平台是否存在登录态 cookie。
+async fn has_login_cookie(client: &CdpClient, name: &str, platform: &str) -> bool {
+    let result = match client.send_request("Storage.getCookies", None, None).await {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let domain = platform_domain(platform);
+    result
+        .get("cookies")
+        .and_then(Value::as_array)
+        .map(|cookies| {
+            cookies.iter().any(|cookie| {
+                let cookie_name = cookie.get("name").and_then(Value::as_str).unwrap_or("");
+                let cookie_domain = cookie.get("domain").and_then(Value::as_str).unwrap_or("");
+                let cookie_value = cookie.get("value").and_then(Value::as_str).unwrap_or("");
+                cookie_name == name && !cookie_value.is_empty() && cookie_domain.contains(domain)
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn platform_domain(platform: &str) -> &'static str {

@@ -199,38 +199,68 @@ fn chrome_status(_app: &AppHandle, payload: &Value) -> Result<Value, String> {
         .unwrap_or("default");
     let path = headless_browser::detect_chrome_path();
     let port = headless_browser::active_chrome_port(platform);
+    // 必须校验端口是否还活着：用户手动关掉 Chrome 后端口号仍留在会话表里，
+    // 不校验就会一直显示"已就绪"，实际抓取全失败。
+    let alive = port != 0 && headless_browser::chrome_session_alive(platform);
     let ready_platforms = headless_browser::ready_platforms();
     Ok(json!({
         "chromeInstalled": path.is_some(),
         "chromePath": path.as_ref().map(|p| p.display().to_string()),
         "platform": platform,
-        "debugPort": port,
-        "debugReady": port != 0,
+        "debugPort": if alive { port } else { 0 },
+        "debugReady": alive,
         "readyPlatforms": ready_platforms,
     }))
 }
 
-/// 小红书扫码登录：打开登录页并截图二维码，返回 data URL 给前端显示。
+/// 扫码登录：打开登录页并截图二维码，返回 data URL 给前端显示。
+///
+/// 支持小红书 / 抖音 / B 站（都用手机对应 App 扫官方二维码）。
+///
+/// 保护：服务器上的平台账号是**所有用户共享**的 —— 任何人一扫码就等于把
+/// 服务器换成他自己的账号（把原来的会话顶掉）。所以已登录时默认拒绝，
+/// 需要显式 `force` 才允许更换。
 fn chrome_qr_start(app: &AppHandle, payload: &Value) -> Result<Value, String> {
     let platform = payload
         .get("platform")
         .and_then(Value::as_str)
         .unwrap_or("xiaohongshu");
-    if platform != "xiaohongshu" {
-        return Err("暂时只支持小红书扫码登录".to_string());
-    }
-    let login_url = "https://www.xiaohongshu.com/login";
+    let spec = headless_browser::qr_platform_spec(platform)
+        .ok_or_else(|| "暂时只支持小红书 / 抖音 / B 站扫码登录".to_string())?;
+    let force = payload
+        .get("force")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     let mut port = headless_browser::active_chrome_port(platform);
     if port == 0 {
-        chrome_launch(app, &json!({ "platform": platform, "url": login_url }))?;
+        chrome_launch(
+            app,
+            &json!({ "platform": platform, "url": spec.login_url }),
+        )?;
         port = headless_browser::active_chrome_port(platform);
     }
     if port == 0 {
         return Err("Chrome 未就绪（启动失败）".to_string());
     }
     let ws_url = tauri::async_runtime::block_on(headless_browser::ws_url_for_port(port))?;
+
+    // 已登录 → 拒绝扫码，避免把服务器上共享的账号顶掉。
+    if !force {
+        let already = tauri::async_runtime::block_on(headless_browser::login_logged_in(
+            &ws_url, platform,
+        ))
+        .unwrap_or(false);
+        if already {
+            return Err(
+                "服务器已登录该平台（账号对所有用户共享）。如需更换账号，请先在桌面端「登录管理」点「退出登录」后再扫码。"
+                    .to_string(),
+            );
+        }
+    }
+
     let image = tauri::async_runtime::block_on(headless_browser::capture_login_qr(
-        &ws_url, login_url,
+        &ws_url, &spec,
     ))?;
     Ok(json!({ "success": true, "image": image, "port": port }))
 }
