@@ -758,6 +758,11 @@ async function refresh(){
       fmtTime(it.startedAt), fmtTime(it.lastActive)];
     for(const c of cells){ const td=document.createElement('td'); td.textContent=String(c); if(c==='运行中')td.className='run'; if(c==='未启动')td.className='stop'; tr.appendChild(td); }
     const td=document.createElement('td');
+    const link=document.createElement('a');
+    link.href='/admin/user/'+encodeURIComponent(it.username);
+    link.textContent='数据';
+    link.style.marginRight='10px';
+    td.appendChild(link);
     if(it.running){ const b=document.createElement('button'); b.textContent='停止'; b.onclick=()=>stopUser(it.username); td.appendChild(b); }
     tr.appendChild(td); tbody.appendChild(tr);
   }
@@ -767,6 +772,89 @@ async function refresh(){
 }
 refresh(); setInterval(refresh, 5000);
 </script></body></html>`;
+
+const USER_PAGE_HTML = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>用户数据 · Beav</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;padding:28px;background:#1b1b1f;color:#e8e8ea;
+    font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+  h1{font-size:20px;margin:0 0 6px}h2{font-size:14px;margin:22px 0 8px;color:#a0a0aa}
+  .sub{color:#8a8a93;font-size:12px;margin-bottom:14px}
+  .bar{display:flex;gap:10px;align-items:center;margin-bottom:8px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:7px 10px;text-align:left;border-bottom:1px solid #2c2c33;white-space:nowrap}
+  th{color:#8a8a93;font-weight:600;font-size:12px}
+  button{padding:6px 12px;border:1px solid #3a3a42;border-radius:7px;background:#232329;
+    color:#e8e8ea;font-size:12px;cursor:pointer}
+  button:hover{border-color:#c9a227;color:#c9a227}
+  a{color:#c9a227;text-decoration:none}
+  .muted{color:#8a8a93}
+</style></head><body>
+<h1 id="title">用户数据</h1>
+<div class="sub">只读视图 · 数据来自该用户自己的实例 · <a href="/admin">返回实例列表</a></div>
+<div class="bar">
+  <button id="run">立即跑每日任务</button>
+  <span id="msg" class="muted"></span>
+</div>
+<h2>监控博主</h2>
+<table><thead><tr><th>名称</th><th>平台</th><th>已收录</th><th>上次抓取</th><th>已补历史</th></tr></thead>
+<tbody id="watches"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody></table>
+<h2>最近动态</h2>
+<table><thead><tr><th>标题</th><th>平台</th><th>视频</th><th>更新时间</th></tr></thead>
+<tbody id="posts"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody></table>
+<script>
+const UID = __UID__;
+const NAMES = __NAME__;
+function td(text){const el=document.createElement('td');el.textContent=String(text??'');return el;}
+function row(){return document.createElement('tr');}
+async function refresh(){
+  let data;
+  try{
+    const res=await fetch('/admin/api/user/'+encodeURIComponent(UID));
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    data=await res.json();
+  }catch(e){
+    document.getElementById('msg').textContent='读取失败：'+e.message;return;
+  }
+  document.title=NAMES+' · 用户数据';
+  document.getElementById('title').textContent=NAMES+' 的数据';
+  const wt=document.getElementById('watches');wt.innerHTML='';
+  for(const w of data.watches){
+    const tr=row();
+    tr.append(td(w.name),td(w.platform),td(w.postCount??'-'),
+      td(w.lastFetchAt?new Date(Number(w.lastFetchAt)).toLocaleString():'-'),
+      td(w.historyBackfilledAt?'是':'否'));
+    wt.appendChild(tr);
+  }
+  if(!data.watches.length) wt.innerHTML='<tr><td colspan="5" class="muted">还没有监控博主</td></tr>';
+  const pt=document.getElementById('posts');pt.innerHTML='';
+  for(const p of data.posts){
+    const tr=row();
+    tr.append(td(p.title||'(无标题)'),td(p.platform),td(p.videoStatus||'-'),
+      td(p.updatedAt?new Date(Number(p.updatedAt)).toLocaleString():'-'));
+    pt.appendChild(tr);
+  }
+  if(!data.posts.length) pt.innerHTML='<tr><td colspan="4" class="muted">没有动态</td></tr>';
+}
+document.getElementById('run').onclick=async()=>{
+  document.getElementById('msg').textContent='已触发，后台执行中…';
+  try{
+    await fetch('/admin/api/run-daily',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:UID})});
+    document.getElementById('msg').textContent='已触发（看管理器日志）';
+  }catch(e){document.getElementById('msg').textContent='触发失败：'+e.message;}
+};
+refresh();
+</script></body></html>`;
+
+function userPage(uid, username) {
+  return USER_PAGE_HTML
+    .replace('__UID__', JSON.stringify(uid))
+    .replace('__NAME__', JSON.stringify(username || uid));
+}
 
 function accountPage(user, status) {
   const rows = [
@@ -1029,7 +1117,7 @@ async function main() {
         return res.end();
       }
 
-      if (url.pathname === '/admin' || url.pathname.startsWith('/admin/api/')) {
+      if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
         if ((user.role || 'user') !== 'admin') {
           if (url.pathname.startsWith('/admin/api/')) {
             return sendJson(res, 403, { success: false, error: '需要管理员权限' });
@@ -1038,6 +1126,41 @@ async function main() {
         }
         if (url.pathname === '/admin') {
           return sendHtml(res, 200, ADMIN_HTML.replace('__ROOT__', escapeHtml(USERS_ROOT)));
+        }
+        if (url.pathname.startsWith('/admin/user/')) {
+          const uid = decodeURIComponent(url.pathname.slice('/admin/user/'.length));
+          const target = findUser(uid);
+          if (!target) return sendHtml(res, 404, '<h1>用户不存在</h1>');
+          return sendHtml(res, 200, userPage(target.uid || target.username, target.username));
+        }
+        if (url.pathname.startsWith('/admin/api/user/')) {
+          const uid = decodeURIComponent(url.pathname.slice('/admin/api/user/'.length));
+          const target = findUser(uid);
+          if (!target) return sendJson(res, 404, { success: false, error: '用户不存在' });
+          await ensureInstance(target);
+          const [watchesRaw, postsRaw] = await Promise.all([
+            callIpc(target, 'monitor:watch-list', {}, 30_000).catch(() => []),
+            callIpc(target, 'monitor:post-list', { limit: 200 }, 60_000).catch(() => []),
+          ]);
+          const watches = Array.isArray(watchesRaw) ? watchesRaw : [];
+          const posts = Array.isArray(postsRaw) ? postsRaw : [];
+          return sendJson(res, 200, { watches, posts });
+        }
+        if (url.pathname === '/admin/api/run-daily') {
+          if (req.method !== 'POST') {
+            return sendJson(res, 405, { success: false, error: 'method not allowed' });
+          }
+          const body = (await readBody(req)).toString('utf8');
+          let parsed = {};
+          try {
+            parsed = JSON.parse(body || '{}');
+          } catch {}
+          const target = findUser(parsed.username);
+          if (!target) return sendJson(res, 404, { success: false, error: '用户不存在' });
+          runDailyFor(target).catch((error) =>
+            log(`manual daily ${target.username} failed: ${error.message}`),
+          );
+          return sendJson(res, 200, { success: true, started: true });
         }
         if (url.pathname === '/admin/api/instances') {
           const list = [];
