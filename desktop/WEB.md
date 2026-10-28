@@ -46,7 +46,34 @@ netsh advfirewall firewall add rule name="Beav Web 8080" dir=in action=allow pro
 
 ---
 
-## 二、多用户模式（方案 B）
+## 二、单实例多租户（推荐：服务器只开桌面端）
+
+适合"服务器只跑一个桌面 App，局域网用户用 web"：
+
+```
+局域网用户 ──► web 网关(8090) ──登录 + X-Beav-User──► 桌面端 daemon(31937)
+                                                        │
+                                            一份 store，watch/post 带 owner
+                                            ├ 桌面端（admin）：看全部、跑全部
+                                            └ web 用户：只看/只写自己的
+```
+
+```bash
+# 桌面端（服务器，可省略扫码）
+BEAV_SKIP_OFFICIAL_LOGIN=1 pnpm tauri:dev:beav     # 或运行打包好的 App
+
+# web 网关：单实例模式，不拉起隐藏实例
+cd desktop
+BEAV_SINGLE_DAEMON=1 pnpm web:instances            # 8090
+```
+
+- 账号仍用 `users.json`（`--create` / 注册页）；请求由网关注入 `X-Beav-User`；
+- daemon 按 `owner` 过滤：桌面端（无头）看全部，web 用户只看自己；
+- 夜间由**桌面端的调度器**遍历所有 watch（无需多实例/预热）；
+- 旧数据 `owner` 为空 → 归 admin；新数据写入当前用户；
+- **已知限制**：图片/视频/导出仍共用一个工作区，未按 owner 分目录（适合 2–3 个可信用户）。
+
+## 三、多用户多实例（方案 B，每用户一个隐藏实例）
 
 ```
 浏览器 ──► web-instances.mjs (:8090)

@@ -27,6 +27,7 @@ mod events;
 mod ffmpeg_runtime;
 mod helpers;
 mod host_impl;
+mod identity;
 mod http_utils;
 mod interactive_runtime_shared;
 mod json_util;

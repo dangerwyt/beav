@@ -775,6 +775,9 @@ pub(crate) struct CompetitorWatchRecord {
     /// 老数据没有这个字段 → None → 视为"还没补过"，会被自动补一次。
     #[serde(default)]
     pub(crate) history_backfilled_at: Option<String>,
+    /// 归属用户（web 多租户）。空 = 旧数据，归 admin。
+    #[serde(default)]
+    pub(crate) owner: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
 }
@@ -783,6 +786,9 @@ pub(crate) struct CompetitorWatchRecord {
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct MonitoredPostRecord {
     pub(crate) id: String,
+    /// 归属用户（冗余自 watch，便于按用户过滤）。空 = 旧数据，归 admin。
+    #[serde(default)]
+    pub(crate) owner: String,
     pub(crate) watch_id: Option<String>,
     pub(crate) platform: String,
     pub(crate) author: String,

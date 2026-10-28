@@ -54,6 +54,10 @@ const PREWARM_AT = String(process.env.BEAV_PREWARM_AT ?? '23:55').trim();
 const KEEP_UNTIL = String(process.env.BEAV_KEEP_UNTIL ?? '03:00').trim();
 // 集中触发每日任务：到点对每个用户实例调用 monitor:run-daily（置空关闭）。
 const DAILY_AT = String(process.env.BEAV_DAILY_AT ?? '00:00').trim();
+// 单实例多租户：所有 web 用户共用桌面端 daemon，只靠 X-Beav-User 区分数据。
+const SINGLE_DAEMON = process.env.BEAV_SINGLE_DAEMON === '1';
+const DAEMON_URL = new URL(process.env.BEAV_DAEMON || 'http://127.0.0.1:31937');
+const DAEMON_PORT = Number(DAEMON_URL.port || 31937);
 const SESSION_HOURS = Number(process.env.BEAV_SESSION_HOURS || 72);
 const SECRET_FILE = path.resolve(
   process.env.BEAV_SESSION_SECRET_FILE || path.join(DESKTOP_ROOT, '.beav-session-secret'),
@@ -373,20 +377,31 @@ async function instanceStatus(user) {
 const spawning = new Map();
 
 /** 直接调该用户实例的 IPC（管理器内部用，带 Origin/CORS 与 Content-Length）。 */
-function callIpc(user, channel, payload, timeoutMs = 0) {
+/** 单实例模式：所有用户共用 daemon 端口，靠 owner 头区分；多实例模式：各自的 port。 */
+function targetOf(user, asAdmin = false) {
+  if (SINGLE_DAEMON) {
+    return { port: DAEMON_PORT, owner: asAdmin ? null : user?.username || null };
+  }
+  return { port: user.port, owner: null };
+}
+
+function callIpc(user, channel, payload, timeoutMs = 0, asAdmin = false) {
   const body = Buffer.from(JSON.stringify({ channel, payload: payload ?? {} }));
+  const target = targetOf(user, asAdmin);
+  const headers = {
+    'Content-Type': 'application/json',
+    'Content-Length': body.length,
+    Origin: `http://127.0.0.1:${target.port}`,
+  };
+  if (target.owner) headers['x-beav-user'] = target.owner;
   return new Promise((resolve, reject) => {
     const request = http.request(
       {
         hostname: '127.0.0.1',
-        port: user.port,
+        port: target.port,
         method: 'POST',
         path: '/api/ipc/invoke',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': body.length,
-          Origin: `http://127.0.0.1:${user.port}`,
-        },
+        headers,
       },
       (response) => {
         let text = '';
@@ -453,6 +468,15 @@ function computeVideoIssues(posts) {
 
 /** 夜间任务：拉起实例 → 确保各平台 Chrome → 跑每日预取。 */
 async function runDailyFor(user) {
+  if (SINGLE_DAEMON) {
+    try {
+      const result = await callIpc(user, 'monitor:run-daily', {}, 0, true);
+      log(`daily (shared) done: ${JSON.stringify(result).slice(0, 180)}`);
+    } catch (error) {
+      log(`daily (shared) failed: ${error.message}`);
+    }
+    return;
+  }
   await ensureInstance(user);
   const record = instances.get(user.uid || user.username);
   if (record) {
@@ -506,6 +530,12 @@ async function runDailyFor(user) {
 }
 
 async function ensureInstance(user) {
+  if (SINGLE_DAEMON) {
+    if (await healthOk(DAEMON_PORT)) {
+      return { child: null, port: DAEMON_PORT, lastActive: Date.now(), startedAt: null };
+    }
+    throw new Error(`桌面端未运行或 daemon 未监听 ${DAEMON_PORT}`);
+  }
   const key = user.uid || user.username;
 
   const existing = instances.get(key);
@@ -591,6 +621,7 @@ function nextKeepUntil(now) {
 let lastPrewarmDay = '';
 
 setInterval(() => {
+  if (SINGLE_DAEMON) return;
   const now = Date.now();
 
   // 夜间预热：到点把全部用户实例拉起，并保活到 KEEP_UNTIL。
@@ -630,6 +661,7 @@ setInterval(() => {
 // 集中触发每日任务（不依赖各实例内部定时器）。
 let lastDailyDay = '';
 setInterval(() => {
+  if (SINGLE_DAEMON) return;
   if (!DAILY_AT) return;
   const now = new Date();
   if (hhmm(now) !== DAILY_AT) return;
@@ -987,11 +1019,14 @@ function readBody(req) {
 }
 
 function proxyToInstance(req, res, user, url, body) {
-  const targetOrigin = `http://127.0.0.1:${user.port}`;
+  const target = targetOf(user);
+  const targetOrigin = `http://127.0.0.1:${target.port}`;
   const headers = { ...req.headers };
   headers.origin = targetOrigin;
   headers.referer = `${targetOrigin}/`;
-  headers.host = `127.0.0.1:${user.port}`;
+  headers.host = `127.0.0.1:${target.port}`;
+  if (target.owner) headers['x-beav-user'] = target.owner;
+  else delete headers['x-beav-user'];
   delete headers['transfer-encoding'];
   if (body.length > 0) headers['content-length'] = String(body.length);
   else delete headers['content-length'];
@@ -999,7 +1034,7 @@ function proxyToInstance(req, res, user, url, body) {
   const upstream = http.request(
     {
       hostname: '127.0.0.1',
-      port: user.port,
+      port: target.port,
       method: req.method,
       path: `${url.pathname}${url.search}`,
       headers,
@@ -1316,6 +1351,25 @@ async function main() {
           return sendJson(res, 200, { success: true, started: true });
         }
         if (url.pathname === '/admin/api/instances') {
+          if (SINGLE_DAEMON) {
+            const running = await healthOk(DAEMON_PORT);
+            const pid = running ? await findPidByPort(DAEMON_PORT) : null;
+            const rssMB = pid ? await getMemoryMB(pid) : null;
+            return sendJson(res, 200, [
+              {
+                username: '(桌面端共享实例)',
+                uid: 'shared',
+                role: 'shared',
+                port: DAEMON_PORT,
+                running,
+                pid,
+                rssMB,
+                startedAt: null,
+                lastActive: null,
+                createdAt: null,
+              },
+            ]);
+          }
           const list = [];
           for (const item of loadUsers().users) {
             list.push(await instanceStatus(item));
@@ -1323,6 +1377,12 @@ async function main() {
           return sendJson(res, 200, list);
         }
         if (url.pathname === '/admin/api/stop') {
+          if (SINGLE_DAEMON) {
+            return sendJson(res, 400, {
+              success: false,
+              error: '单实例模式：请直接在桌面端退出',
+            });
+          }
           if (req.method !== 'POST') {
             return sendJson(res, 405, { success: false, error: 'method not allowed' });
           }
@@ -1374,6 +1434,7 @@ async function main() {
 
   server.listen(WEB_PORT, WEB_HOST, () => {
     log(`listening on http://${WEB_HOST}:${WEB_PORT}`);
+    log(`mode    -> ${SINGLE_DAEMON ? `single-daemon(:${DAEMON_PORT})` : 'multi-instance'}`);
     log(`users   -> ${USERS_FILE}`);
     log(`data    -> ${USERS_ROOT}`);
     log(`exe     -> ${resolveExe()}`);

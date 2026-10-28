@@ -33,6 +33,79 @@ use tokio::time::interval;
 /// - monitor:chrome-test     通过 CDP 测试抓取一段 JS 评估结果（验证通道）
 /// - monitor:clear           清空全部「对标博主」与「全部动态」数据（危险操作，UI 需二次确认）
 /// - monitor:post-detail     本地查看单条动态详情（CDP 抓正文并缓存，尽量不跳外部平台）
+/// Web 用户只能操作自己的对象：对带 `id` / `watchId` 的通道做归属校验。
+/// 找不到对象时不在这里报错，交给具体 handler 给出更准确的提示。
+fn guard_owned_target(
+    state: &State<'_, AppState>,
+    channel: &str,
+    payload: &Value,
+) -> Result<(), String> {
+    if crate::identity::is_admin() {
+        return Ok(());
+    }
+    const OWNED_CHANNELS: &[&str] = &[
+        "monitor:watch-remove",
+        "monitor:post-remove",
+        "monitor:post-detail",
+        "monitor:fetch",
+        "monitor:backfill-history",
+        "monitor:download-video",
+        "monitor:analyze-video",
+        "monitor:transcribe-video",
+        "monitor:video-analysis",
+        "monitor:deconstruct",
+        "monitor:inject-topic",
+        "monitor:export-post",
+    ];
+    if !OWNED_CHANNELS.contains(&channel) {
+        return Ok(());
+    }
+
+    if let Some(id) = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let owner = with_store(state, |store| {
+            if let Some(post) = store.monitored_posts.iter().find(|item| item.id == id) {
+                return Ok(Some(post.owner.clone()));
+            }
+            if let Some(watch) = store.competitor_watchlist.iter().find(|item| item.id == id) {
+                return Ok(Some(watch.owner.clone()));
+            }
+            Ok(None)
+        })?;
+        if let Some(owner) = owner {
+            if !crate::identity::owner_matches(&owner) {
+                return Err("对象不存在".to_string());
+            }
+        }
+    }
+
+    if let Some(watch_id) = payload
+        .get("watchId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let owner = with_store(state, |store| {
+            Ok(store
+                .competitor_watchlist
+                .iter()
+                .find(|item| item.id == watch_id)
+                .map(|item| item.owner.clone()))
+        })?;
+        if let Some(owner) = owner {
+            if !crate::identity::owner_matches(&owner) {
+                return Err("博主不存在".to_string());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn handle_monitor_channel(
     app: &AppHandle,
     state: &State<'_, AppState>,
@@ -41,6 +114,28 @@ pub fn handle_monitor_channel(
 ) -> Option<Result<Value, String>> {
     if !channel.starts_with("monitor:") {
         return None;
+    }
+    // 全局/危险操作仅管理员（桌面端）可用；web 用户只能操作自己的数据。
+    const ADMIN_ONLY: &[&str] = &[
+        "monitor:clear",
+        "monitor:clear-posts",
+        "monitor:retro",
+        "monitor:set-export-root",
+        "monitor:pick-export-root",
+        "monitor:set-obsidian-vault",
+        "monitor:pick-obsidian-vault",
+        "monitor:patch-audio-batch",
+        "monitor:run-daily",
+        "monitor:run-due",
+        "monitor:set-scan-limit",
+        "monitor:set-spike-threshold",
+        "monitor:chrome-shutdown",
+    ];
+    if !crate::identity::is_admin() && ADMIN_ONLY.contains(&channel) {
+        return Some(Err("该操作仅管理员可用".to_string()));
+    }
+    if let Err(error) = guard_owned_target(state, channel, payload) {
+        return Some(Err(error));
     }
     Some(
         (|| match channel {
@@ -216,8 +311,10 @@ fn push_snapshot(
 fn watch_add(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
     let name = str_field(payload, "name").ok_or_else(|| "缺少博主名称 name".to_string())?;
     let now = now_i64();
+    let owner = crate::identity::owner_or_admin();
     let record = crate::CompetitorWatchRecord {
         id: make_id("watch"),
+        owner,
         name,
         platform: str_field(payload, "platform").unwrap_or_default(),
         profile_url: str_field(payload, "profileUrl").or_else(|| str_field(payload, "profile_url")),
@@ -266,6 +363,8 @@ fn watch_list(state: &State<'_, AppState>, payload: &Value) -> Result<Value, Str
             println!("[monitor] cleaned {cleaned} legacy history-backfill flags");
         }
         let mut items: Vec<_> = store.competitor_watchlist.iter().cloned().collect();
+        // 按请求身份过滤：桌面端（admin）看全部，web 用户只看自己的。
+        items.retain(|item| crate::identity::owner_matches(&item.owner));
         if only_enabled {
             items.retain(|item| item.enabled);
         }
@@ -362,6 +461,9 @@ fn post_detail(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
             .cloned())
     })?
     .ok_or_else(|| "动态不存在".to_string())?;
+    if !crate::identity::owner_matches(&record.owner) {
+        return Err("动态不存在".to_string());
+    }
 
     let can_cdp = Platform::parse(&record.platform).map(|p| p.is_cdp()).unwrap_or(false);
     if !can_cdp {
@@ -930,6 +1032,12 @@ fn fetch_monitor(
                 .as_ref()
                 .map(|previous| previous.id.clone())
                 .unwrap_or_else(|| make_id("mpost")),
+            owner: existing
+                .as_ref()
+                .map(|previous| previous.owner.clone())
+                .filter(|value| !value.is_empty())
+                .or_else(|| watch.as_ref().map(|item| item.owner.clone()).filter(|value| !value.is_empty()))
+                .unwrap_or_else(crate::identity::owner_or_admin),
             watch_id: watch_id.clone(),
             platform: platform.clone(),
             author: author_name.clone(),
@@ -1339,6 +1447,12 @@ fn fetch_monitor_via_cdp(
                 .as_ref()
                 .map(|previous| previous.id.clone())
                 .unwrap_or_else(|| make_id("mpost")),
+            owner: existing
+                .as_ref()
+                .map(|previous| previous.owner.clone())
+                .filter(|value| !value.is_empty())
+                .or_else(|| watch.map(|item| item.owner.clone()).filter(|value| !value.is_empty()))
+                .unwrap_or_else(crate::identity::owner_or_admin),
             watch_id: watch.map(|item| item.id.clone()),
             platform: platform.to_string(),
             author: author_name.clone(),
@@ -1566,6 +1680,7 @@ fn post_list(state: &State<'_, AppState>, payload: &Value) -> Result<Value, Stri
     // 纯读：用读锁，避免每次切换博主都触发一次整库落盘（2MB JSON）。
     with_store(state, |store| {
         let mut items: Vec<_> = store.monitored_posts.iter().cloned().collect();
+        items.retain(|item| crate::identity::owner_matches(&item.owner));
         if let Some(id) = &watch_id {
             items.retain(|item| item.watch_id.as_deref() == Some(id));
         }
