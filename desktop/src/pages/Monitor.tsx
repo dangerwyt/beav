@@ -8,6 +8,11 @@ import type { MonitorChromeStatus, MonitorChromeLaunchResult, MonitorChromeTestR
 import { resolveAssetUrl } from '../utils/pathManager';
 import { CDP_PLATFORMS, PLATFORM_HOME, PLATFORMS, type CdpPlatform } from '../constants/platforms';
 
+/** 是否是内容平台链接（小红书/抖音/B站/微博）—— 这些链接含会话凭证。 */
+function isPlatformUrl(url: string): boolean {
+  return /xiaohongshu\.com|douyin\.com|bilibili\.com|weibo\.com/i.test(String(url || ''));
+}
+
 interface CompetitorWatch {
   id: string;
   name: string;
@@ -801,12 +806,24 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
 
   const openExternal = useCallback(async (url?: string | null) => {
     if (!url) return;
+    // Web 模式下「原文」链接带的是**服务器会话**的 xsec_token：只有本地浏览器登录了
+    // 同一个小红书账号才打得开，否则会 404/跳登录。与其让用户撞一脸登录框，
+    // 不如复制链接并说明——正文/图片其实已经被服务器抓进本工作区了。
+    if (!isTauriRuntime() && isPlatformUrl(url)) {
+      try {
+        await navigator.clipboard.writeText(url);
+        showToast('ok', '链接已复制（该链接含服务器会话凭证；正文与图片已抓取到本工作区，直接看详情即可）');
+      } catch {
+        showToast('ok', url);
+      }
+      return;
+    }
     try {
       await window.ipcRenderer.openExternalUrl(url);
     } catch (e) {
       console.warn('openExternalUrl failed:', e);
     }
-  }, []);
+  }, [showToast]);
 
   const handleFetchWatch = useCallback(async (watch: CompetitorWatch) => {
     setFetching(true);
