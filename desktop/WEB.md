@@ -71,6 +71,13 @@ pnpm web:build
 pnpm web:instances        # http://0.0.0.0:8090
 ```
 
+> **跨平台**
+> - Windows 的实例二进制是 `beav.exe`；macOS/Linux 是 `beav`（无扩展名），也会识别 `.app` 包；
+> - 服务器上必须**先构建**（`pnpm tauri:build:beav`）或用 `BEAV_EXE` 指向可执行文件；
+> - 默认用户目录：Windows `D:\beav_workspace\users`，macOS/Linux `~/.beav-workspace/users`
+>   （可用 `BEAV_USERS_ROOT` 覆盖）；
+> - macOS 需要有**图形会话**（Tauri/WebView 依赖 WindowServer），纯 SSH 无登录会话跑不起来。
+
 首次启动若没有 `users.json`，会创建管理员并**打印随机密码**：
 
 ```

@@ -27,6 +27,7 @@
  */
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
@@ -38,9 +39,11 @@ const DIST_DIR = path.resolve(process.env.WEB_DIST || path.join(DESKTOP_ROOT, 'd
 const USERS_FILE = path.resolve(
   process.env.BEAV_USERS_FILE || path.join(DESKTOP_ROOT, 'users.json'),
 );
-const USERS_ROOT = path.resolve(
-  process.env.BEAV_USERS_ROOT || path.join('D:', 'beav_workspace', 'users'),
-);
+const DEFAULT_USERS_ROOT =
+  process.platform === 'win32'
+    ? path.join('D:', 'beav_workspace', 'users')
+    : path.join(os.homedir(), '.beav-workspace', 'users');
+const USERS_ROOT = path.resolve(process.env.BEAV_USERS_ROOT || DEFAULT_USERS_ROOT);
 const WEB_HOST = process.env.WEB_HOST || '0.0.0.0';
 const WEB_PORT = Number(process.env.WEB_PORT || 8090);
 const BASE_PORT = Number(process.env.BEAV_INSTANCE_BASE_PORT || 32001);
@@ -174,16 +177,57 @@ function parseCookies(header) {
 
 // ---------------- 实例 ----------------
 
+/** 跨平台可执行文件解析：Windows 是 beav.exe，macOS/Linux 是 beav（无扩展名）。 */
 function resolveExe() {
   if (process.env.BEAV_EXE) return path.resolve(process.env.BEAV_EXE);
   const base = path.join(DESKTOP_ROOT, 'src-tauri', 'target');
-  const candidates = [
-    path.join(base, 'release', 'beav.exe'),
-    path.join(base, 'tauri-dev', 'debug', 'beav.exe'),
-    path.join(base, 'debug', 'beav.exe'),
+  const names =
+    process.platform === 'win32'
+      ? ['beav.exe', 'beaw.exe', 'redbox.exe', 'thrive.exe']
+      : ['beav', 'beaw', 'redbox', 'thrive'];
+  const dirs = [
+    path.join(base, 'release'),
+    path.join(base, 'tauri-dev', 'debug'),
+    path.join(base, 'debug'),
   ];
-  for (const candidate of candidates) if (fs.existsSync(candidate)) return candidate;
-  return candidates[1];
+
+  for (const dir of dirs) {
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+    // macOS .app 包
+    if (process.platform === 'darwin') {
+      const bundleDir = path.join(dir, 'bundle', 'macos');
+      if (fs.existsSync(bundleDir)) {
+        for (const entry of fs.readdirSync(bundleDir)) {
+          if (!entry.endsWith('.app')) continue;
+          const macosDir = path.join(bundleDir, entry, 'Contents', 'MacOS');
+          if (!fs.existsSync(macosDir)) continue;
+          for (const bin of fs.readdirSync(macosDir)) {
+            const candidate = path.join(macosDir, bin);
+            try {
+              if (fs.statSync(candidate).isFile()) return candidate;
+            } catch {}
+          }
+        }
+      }
+    }
+    // 兜底：目录下任意可执行文件
+    if (fs.existsSync(dir)) {
+      for (const entry of fs.readdirSync(dir)) {
+        if (entry.includes('.')) continue;
+        const candidate = path.join(dir, entry);
+        try {
+          const stat = fs.statSync(candidate);
+          if (stat.isFile() && (process.platform === 'win32' || (stat.mode & 0o111))) {
+            return candidate;
+          }
+        } catch {}
+      }
+    }
+  }
+  return null;
 }
 
 function userDir(user) {
@@ -192,7 +236,15 @@ function userDir(user) {
 
 function ensureUserDirs(user) {
   const dir = userDir(user);
-  for (const sub of ['appdata', 'state', 'workspace', 'exports', 'chrome-profile', 'webview']) {
+  for (const sub of [
+    'appdata',
+    'home',
+    'state',
+    'workspace',
+    'exports',
+    'chrome-profile',
+    'webview',
+  ]) {
     fs.mkdirSync(path.join(dir, sub), { recursive: true });
   }
   return dir;
@@ -200,10 +252,8 @@ function ensureUserDirs(user) {
 
 function instanceEnv(user) {
   const dir = ensureUserDirs(user);
-  return {
+  const env = {
     ...process.env,
-    // APPDATA 一起隔离：auth-state.json / acp-gateway.json 等才会各用各的。
-    APPDATA: path.join(dir, 'appdata'),
     BEAV_STORE_DIR: path.join(dir, 'state'),
     BEAV_WORKSPACE_ROOT: path.join(dir, 'workspace'),
     BEAV_EXPORT_ROOT: path.join(dir, 'exports'),
@@ -215,6 +265,16 @@ function instanceEnv(user) {
     // 不需要官方功能：跳过登录/扫码闸门，直接进工作台。
     BEAV_SKIP_OFFICIAL_LOGIN: '1',
   };
+  // 隔离 Tauri 的 app_data（official auth / acp 配置 / 日志队列等）。
+  if (process.platform === 'win32') {
+    env.APPDATA = path.join(dir, 'appdata');
+  } else {
+    env.HOME = path.join(dir, 'home');
+    if (process.platform !== 'darwin') {
+      env.XDG_CONFIG_HOME = path.join(dir, 'home', '.config');
+    }
+  }
+  return env;
 }
 
 const instances = new Map(); // uid -> { child, port, lastActive }
@@ -335,7 +395,12 @@ async function ensureInstance(user) {
     }
 
     const exe = resolveExe();
-    if (!fs.existsSync(exe)) throw new Error(`找不到实例可执行文件：${exe}`);
+    if (!exe || !fs.existsSync(exe)) {
+      throw new Error(
+        '找不到实例可执行文件（已尝试 target/release、target/debug、.app 包）。' +
+          '请先在服务器上构建（pnpm tauri:build:beav），或用 BEAV_EXE 指向可执行文件。',
+      );
+    }
     const child = spawn(exe, [], {
       env: instanceEnv(user),
       stdio: 'ignore',
