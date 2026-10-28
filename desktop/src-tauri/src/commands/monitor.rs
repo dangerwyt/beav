@@ -130,6 +130,8 @@ pub fn handle_monitor_channel(
         "monitor:set-scan-limit",
         "monitor:set-spike-threshold",
         "monitor:chrome-shutdown",
+        "monitor:chrome-launch",
+        "monitor:chrome-test",
     ];
     if !crate::identity::is_admin() && ADMIN_ONLY.contains(&channel) {
         return Some(Err("该操作仅管理员可用".to_string()));

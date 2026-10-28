@@ -1,4 +1,5 @@
 import { startTransition, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { isTauriRuntime } from '../bridge/browserHost';
 import { Radar, Plus, RefreshCw, Trash2, ExternalLink, Zap, Sparkles, Check, X, Eye, Loader2, Link2, Lock, LogOut, ChevronDown, ChevronLeft, ChevronRight, FlaskConical, BookOpen, Copy, Download, Video, Film, History, AudioLines } from 'lucide-react';
 import { createPortal } from 'react-dom';
 import { clsx } from 'clsx';
@@ -1490,7 +1491,12 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                       {chromeStatus.debugReady ? (
                         <> · 调试端口 <span className="text-emerald-600">{chromeStatus.debugPort}</span>（已就绪）</>
                       ) : (
-                        <span className="text-amber-600"> · 未启动，请点下面「打开 Chrome 登录」</span>
+                        <span className="text-amber-600">
+                          {' · 未启动'}
+                          {isTauriRuntime()
+                            ? '，请点下面「打开 Chrome 登录」'
+                            : '，请联系管理员在服务器端登录'}
+                        </span>
                       )}</>
                   ) : (
                     <span className="text-amber-600">未检测到 Chrome / Edge / Brave，请先安装 Google Chrome</span>
@@ -1498,11 +1504,13 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 )}
               </div>
 
-              <p className="text-[11px] leading-relaxed text-text-tertiary">
-                小红书 / 抖音 / B 站需要登录态抓取。先选平台点「打开登录页」，在弹出的 Chrome 内完成登录（cookie 仅存于本机独立 profile）。之后 Beav 复用登录态抓取。
-              </p>
+              {isTauriRuntime() ? (
+                <>
+                  <p className="text-[11px] leading-relaxed text-text-tertiary">
+                    小红书 / 抖音 / B 站需要登录态抓取。先选平台点「打开登录页」，在弹出的 Chrome 内完成登录（cookie 仅存于本机独立 profile）。之后 Beav 复用登录态抓取。
+                  </p>
 
-              <div className="flex gap-1.5">
+                  <div className="flex gap-1.5">
                 {CDP_PLATFORMS.map((p) => (
                   <button
                     key={p}
@@ -1546,6 +1554,12 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   </button>
                 </div>
               </div>
+                </>
+              ) : (
+                <p className="text-[11px] leading-relaxed text-text-tertiary">
+                  Chrome 登录由服务器端（桌面版）完成；Web 端只复用已登录的会话，需要重新登录请联系管理员。
+                </p>
+              )}
 
               {chromeTestResult && (
                 <div className={clsx(

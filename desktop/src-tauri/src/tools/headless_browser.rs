@@ -248,6 +248,15 @@ fn kill_stale_profile_chrome(profile_dir: &PathBuf) {
 /// `-remote-debugging-port=0` 让 OS 分配随机端口，再从 Chrome 的 stderr 行
 /// `DevTools listening on ws://127.0.0.1:<port>/...` 解析出真实端口（比扫固定端口范围可靠）。
 /// 子进程句柄被存进 `CHROME_SESSIONS` 保活，直到 `shutdown_chrome` 显式结束。
+/// 端口是否有进程在监听（识别"陈旧会话"用）。
+fn debug_port_alive(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(600),
+    )
+    .is_ok()
+}
+
 pub fn launch_chrome_for_login(
     chrome_path: &PathBuf,
     profile_dir: &PathBuf,
@@ -257,10 +266,14 @@ pub fn launch_chrome_for_login(
     // 该平台已有会话 → 复用其端口（窗口仍在，用户可直接在该 Chrome 登录/使用）。
     // 注意：只复用「同一平台」的会话，绝不跨平台复用（否则 cookie 串台）。
     {
-        let sessions = CHROME_SESSIONS.get_or_init(Default::default).lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut sessions = CHROME_SESSIONS.get_or_init(Default::default).lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(session) = sessions.get(platform) {
             if session.port != 0 {
-                return Ok(session.port);
+                // 端口必须还活着，否则是陈旧会话（Chrome 已退出）→ 清掉并重新拉起。
+                if debug_port_alive(session.port) {
+                    return Ok(session.port);
+                }
+                sessions.remove(platform);
             }
         }
     }
