@@ -896,6 +896,15 @@ fn platform_domain(platform: &str) -> &'static str {
 /// 打开这种链接，页面会在作品列表之外挂出「相关推荐」里**其他博主**的 `/video/`
 /// 链接 → 被抽取器误收成该博主的作品（表现为「混了几个不是这个博主的视频」，
 /// 且抓取数 > 主页作品总数）。导航前剥掉，保证落在干净的主页。
+/// 剥掉主页 URL 上不该带走的参数。
+///
+/// - `modal_id`：抖音弹窗参数。
+/// - `xsec_token` / `xsec_source`：小红书防盗链令牌，**与浏览器会话绑定**。
+///   用户在自己电脑上复制的主页链接带的是他本机的 token，搬到服务器上无效
+///   （甚至会被判无效）。服务器抓取时用的是服务器自己的登录态，主页里的笔记链接
+///   会由登录态 SSR 重新带上服务器的有效 token，所以这里统一剥掉。
+///
+/// 注意：仅用于**主页**URL；笔记详情 URL 的 token 必须保留（否则 404）。
 fn strip_modal_id_param(url: &str) -> String {
     let Some((base, query)) = url.split_once('?') else {
         return url.to_string();
@@ -903,13 +912,23 @@ fn strip_modal_id_param(url: &str) -> String {
     let kept: Vec<&str> = query
         .split('&')
         .filter(|p| !p.is_empty())
-        .filter(|p| p.split('=').next() != Some("modal_id"))
+        .filter(|p| {
+            !matches!(
+                p.split('=').next(),
+                Some("modal_id") | Some("xsec_token") | Some("xsec_source")
+            )
+        })
         .collect();
     if kept.is_empty() {
         base.to_string()
     } else {
         format!("{base}?{}", kept.join("&"))
     }
+}
+
+/// 公开版：给 watch 存储用（与导航时保持一致，避免库里留着别人的 token）。
+pub fn normalize_profile_url(url: &str) -> String {
+    strip_modal_id_param(url)
 }
 
 /// 通过已登录的 Chrome 抓取博主主页帖子（小红书 / 抖音等 JS 渲染站点）。
@@ -2278,5 +2297,26 @@ mod tests {
             let ok = path.exists();
             assert!(ok, "路径不存在: {}", path.display());
         }
+    }
+
+    /// 主页 URL 必须剥掉会话绑定的 xsec_token / xsec_source（用户本机的 token 对服务器无效）。
+    #[test]
+    fn profile_url_strips_session_bound_xsec_params() {
+        let raw = "https://www.xiaohongshu.com/user/profile/5c6d8d59000000001202e285\
+                   ?xsec_token=ABSdL4W6abZI4RlqJqbTGcZGdw7DHvEyi_g14nnHl1q1c%3D\
+                   &xsec_source=pc_search";
+        assert_eq!(
+            strip_modal_id_param(raw),
+            "https://www.xiaohongshu.com/user/profile/5c6d8d59000000001202e285"
+        );
+        // 无 query / 其他参数不受影响
+        assert_eq!(
+            strip_modal_id_param("https://www.xiaohongshu.com/user/profile/abc"),
+            "https://www.xiaohongshu.com/user/profile/abc"
+        );
+        assert_eq!(
+            strip_modal_id_param("https://www.douyin.com/user/MS4wLjABAAAA?modal_id=1&foo=2"),
+            "https://www.douyin.com/user/MS4wLjABAAAA?foo=2"
+        );
     }
 }
