@@ -1301,8 +1301,14 @@ async function main() {
         return res.end();
       }
 
+      // 扫码页只显示平台二维码，不涉及用户数据 → 允许所有已登录用户使用；
+      // 其余 /admin（用户数据、实例状态）仍仅管理员。
+      const qrPath =
+        process.env.BEAV_QR_FOR_ALL !== '0' &&
+        (url.pathname === '/admin/qr' || url.pathname.startsWith('/admin/api/qr-'));
+
       if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
-        if ((user.role || 'user') !== 'admin') {
+        if (!qrPath && (user.role || 'user') !== 'admin') {
           if (url.pathname.startsWith('/admin/api/')) {
             return sendJson(res, 403, { success: false, error: '需要管理员权限' });
           }
