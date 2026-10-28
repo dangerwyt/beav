@@ -99,6 +99,19 @@ node scripts/web-instances.mjs --delete alice
 - 端口必须唯一；不传端口时自动取 `32001+` 的空闲值；
 - 用户表 `desktop/users.json`、会话密钥 `desktop/.beav-session-secret` 均已 gitignore。
 
+### 夜间增量（本地 00:00）
+
+每日预取由**实例内部**的调度器触发，所以实例必须活着：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `BEAV_PREWARM_AT` | `23:55` | 到点自动拉起所有用户实例；置空关闭 |
+| `BEAV_KEEP_UNTIL` | `03:00` | 预热实例保活到几点（不被闲置回收） |
+| `BEAV_IDLE_MINUTES` | `30` | 闲置回收分钟；`0` = 不回收（常驻） |
+
+> 还需要**Chrome 连接**（登录管理里打开的 headless Chrome）。实例活着但 Chrome 被关掉，
+> 详情/视频抓取仍会失败。桌面端同理：App 必须开着。
+
 ### 页面
 
 | 路径 | 权限 | 内容 |

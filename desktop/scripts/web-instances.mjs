@@ -47,7 +47,11 @@ const USERS_ROOT = path.resolve(process.env.BEAV_USERS_ROOT || DEFAULT_USERS_ROO
 const WEB_HOST = process.env.WEB_HOST || '0.0.0.0';
 const WEB_PORT = Number(process.env.WEB_PORT || 8090);
 const BASE_PORT = Number(process.env.BEAV_INSTANCE_BASE_PORT || 32001);
-const IDLE_MINUTES = Number(process.env.BEAV_IDLE_MINUTES || 30);
+const IDLE_MINUTES = Number(process.env.BEAV_IDLE_MINUTES ?? 30);
+// 夜间预热：默认 23:55 拉起所有用户实例，保活到 03:00，保证 00:00 的每日增量能跑。
+// 置空（BEAV_PREWARM_AT=）可关闭。
+const PREWARM_AT = String(process.env.BEAV_PREWARM_AT ?? '23:55').trim();
+const KEEP_UNTIL = String(process.env.BEAV_KEEP_UNTIL ?? '03:00').trim();
 const SESSION_HOURS = Number(process.env.BEAV_SESSION_HOURS || 72);
 const SECRET_FILE = path.resolve(
   process.env.BEAV_SESSION_SECRET_FILE || path.join(DESKTOP_ROOT, '.beav-session-secret'),
@@ -434,9 +438,48 @@ async function ensureInstance(user) {
   return task;
 }
 
+function hhmm(date) {
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+/** 下一个 KEEP_UNTIL 时间戳（今天的还没到就今天，否则明天）。 */
+function nextKeepUntil(now) {
+  const [hours, minutes] = KEEP_UNTIL.split(':').map((value) => Number(value) || 0);
+  const target = new Date(now);
+  target.setHours(hours, minutes, 0, 0);
+  if (target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
+  return target.getTime();
+}
+
+let lastPrewarmDay = '';
+
 setInterval(() => {
   const now = Date.now();
+
+  // 夜间预热：到点把全部用户实例拉起，并保活到 KEEP_UNTIL。
+  if (PREWARM_AT) {
+    const current = new Date(now);
+    if (hhmm(current) === PREWARM_AT) {
+      const dayKey = current.toDateString();
+      if (lastPrewarmDay !== dayKey) {
+        lastPrewarmDay = dayKey;
+        const keepUntil = nextKeepUntil(current);
+        for (const user of loadUsers().users) {
+          ensureInstance(user)
+            .then((record) => {
+              record.keepAliveUntil = keepUntil;
+              log(`prewarm ${user.username} (keep until ${KEEP_UNTIL})`);
+            })
+            .catch((error) => log(`prewarm ${user.username} failed: ${error.message}`));
+        }
+      }
+    }
+  }
+
+  // 闲置回收：IDLE_MINUTES<=0 表示不回收；保活中的实例跳过。
+  if (IDLE_MINUTES <= 0) return;
   for (const [key, record] of instances) {
+    if (record.keepAliveUntil && now < record.keepAliveUntil) continue;
     if (now - record.lastActive > IDLE_MINUTES * 60_000) {
       try {
         record.child?.kill();
@@ -948,7 +991,8 @@ async function main() {
     log(`users   -> ${USERS_FILE}`);
     log(`data    -> ${USERS_ROOT}`);
     log(`exe     -> ${resolveExe()}`);
-    log(`idle    -> ${IDLE_MINUTES} min`);
+    log(`idle    -> ${IDLE_MINUTES > 0 ? `${IDLE_MINUTES} min` : 'never'}`);
+    log(`prewarm -> ${PREWARM_AT ? `${PREWARM_AT} (keep until ${KEEP_UNTIL})` : 'off'}`);
   });
 }
 
