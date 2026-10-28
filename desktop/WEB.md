@@ -73,6 +73,24 @@ BEAV_SINGLE_DAEMON=1 pnpm web:instances            # 8090
 - 旧数据 `owner` 为空 → 归 admin；新数据写入当前用户；
 - **已知限制**：图片/视频/导出仍共用一个工作区，未按 owner 分目录（适合 2–3 个可信用户）。
 
+### macOS 常驻（launchd，开机/登录自启）
+
+```bash
+cd desktop
+bash deploy/install-macos-services.sh              # 安装/更新
+bash deploy/install-macos-services.sh --uninstall  # 卸载
+```
+
+- `com.beav.desktop`：桌面端（`BEAV_SKIP_OFFICIAL_LOGIN=1`），登录自启、**崩溃重启**（手动退出不重启）；
+- `com.beav.web`：web 网关（`BEAV_SINGLE_DAEMON=1`，8090），常驻；
+- 日志：`~/Library/Logs/beav/{desktop,web}.log`；
+- 需要**图形登录会话**（`LimitLoadToSessionType=Aqua`），纯 SSH 不会启动；
+- 改了二进制/前端后：重启服务即可
+  ```bash
+  launchctl kickstart -k gui/$(id -u)/com.beav.desktop
+  launchctl kickstart -k gui/$(id -u)/com.beav.web
+  ```
+
 ## 三、多用户多实例（方案 B，每用户一个隐藏实例）
 
 ```
