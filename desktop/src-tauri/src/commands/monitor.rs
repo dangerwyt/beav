@@ -132,6 +132,8 @@ pub fn handle_monitor_channel(
         "monitor:chrome-shutdown",
         "monitor:chrome-launch",
         "monitor:chrome-test",
+        "monitor:chrome-qr-start",
+        "monitor:chrome-qr-status",
     ];
     if !crate::identity::is_admin() && ADMIN_ONLY.contains(&channel) {
         return Some(Err("该操作仅管理员可用".to_string()));
@@ -151,6 +153,8 @@ pub fn handle_monitor_channel(
             "monitor:chrome-status" => chrome_status(app, payload),
             "monitor:chrome-launch" => chrome_launch(app, payload),
             "monitor:chrome-test" => chrome_test(app, payload),
+            "monitor:chrome-qr-start" => chrome_qr_start(app, payload),
+            "monitor:chrome-qr-status" => chrome_qr_status(app, payload),
             "monitor:chrome-shutdown" => chrome_shutdown(),
             "monitor:clear" => clear_data(state),
             "monitor:post-remove" => post_remove(state, payload),
@@ -204,6 +208,47 @@ fn chrome_status(_app: &AppHandle, payload: &Value) -> Result<Value, String> {
         "debugReady": port != 0,
         "readyPlatforms": ready_platforms,
     }))
+}
+
+/// 小红书扫码登录：打开登录页并截图二维码，返回 data URL 给前端显示。
+fn chrome_qr_start(app: &AppHandle, payload: &Value) -> Result<Value, String> {
+    let platform = payload
+        .get("platform")
+        .and_then(Value::as_str)
+        .unwrap_or("xiaohongshu");
+    if platform != "xiaohongshu" {
+        return Err("暂时只支持小红书扫码登录".to_string());
+    }
+    let login_url = "https://www.xiaohongshu.com/login";
+    let mut port = headless_browser::active_chrome_port(platform);
+    if port == 0 {
+        chrome_launch(app, &json!({ "platform": platform, "url": login_url }))?;
+        port = headless_browser::active_chrome_port(platform);
+    }
+    if port == 0 {
+        return Err("Chrome 未就绪（启动失败）".to_string());
+    }
+    let ws_url = tauri::async_runtime::block_on(headless_browser::ws_url_for_port(port))?;
+    let image = tauri::async_runtime::block_on(headless_browser::capture_login_qr(
+        &ws_url, login_url,
+    ))?;
+    Ok(json!({ "success": true, "image": image, "port": port }))
+}
+
+/// 查询扫码登录是否完成（看平台会话 cookie）。
+fn chrome_qr_status(_app: &AppHandle, payload: &Value) -> Result<Value, String> {
+    let platform = payload
+        .get("platform")
+        .and_then(Value::as_str)
+        .unwrap_or("xiaohongshu");
+    let port = headless_browser::active_chrome_port(platform);
+    if port == 0 {
+        return Ok(json!({ "success": true, "loggedIn": false, "note": "Chrome 未启动" }));
+    }
+    let ws_url = tauri::async_runtime::block_on(headless_browser::ws_url_for_port(port))?;
+    let logged_in =
+        tauri::async_runtime::block_on(headless_browser::login_logged_in(&ws_url, platform))?;
+    Ok(json!({ "success": true, "loggedIn": logged_in }))
 }
 
 fn chrome_launch(app: &AppHandle, payload: &Value) -> Result<Value, String> {

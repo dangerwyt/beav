@@ -813,7 +813,7 @@ const ADMIN_HTML = `<!doctype html>
   <span>用户 <b id="total">-</b></span>
   <span>运行中 <b id="running">-</b></span>
   <span>总内存 <b id="mem">-</b></span>
-  <span class="right"><a href="/account">我的账号</a> · <a href="/logout">退出</a></span>
+  <span class="right"><a href="/admin/qr">扫码登录小红书</a> · <a href="/account">我的账号</a> · <a href="/logout">退出</a></span>
 </div>
 <table><thead><tr>
   <th>用户</th><th>端口</th><th>状态</th><th>PID</th><th>内存</th><th>启动时间</th><th>最近活跃</th><th></th>
@@ -853,6 +853,58 @@ async function refresh(){
   document.getElementById('mem').textContent=mem?mem+' MB':'-';
 }
 refresh(); setInterval(refresh, 5000);
+</script></body></html>`;
+
+const QR_PAGE_HTML = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>扫码登录 · 小红书</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;padding:32px;background:#1b1b1f;color:#e8e8ea;
+    font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
+  h1{font-size:20px;margin:0 0 6px}
+  .sub{color:#8a8a93;font-size:12px;margin-bottom:18px}
+  button{padding:8px 14px;border:1px solid #3a3a42;border-radius:8px;background:#232329;
+    color:#e8e8ea;font-size:13px;cursor:pointer}
+  button:hover{border-color:#c9a227;color:#c9a227}
+  #msg{color:#a0a0aa;font-size:12px;margin-left:10px}
+  #wrap{margin-top:20px;display:flex;justify-content:center}
+  #qr{max-width:320px;border-radius:12px;background:#fff;padding:10px;display:none}
+  a{color:#c9a227;text-decoration:none}
+</style></head><body>
+<h1>扫码登录 · 小红书</h1>
+<div class="sub">用**小红书 App** 扫描下方二维码；登录成功后自动保存 cookie（约 2 分钟过期）· <a href="/admin">返回</a></div>
+<button id="start">获取二维码 / 刷新</button><span id="msg"></span>
+<div id="wrap"><img id="qr" alt="小红书登录二维码" /></div>
+<script>
+let timer = null;
+async function refreshQr(){
+  document.getElementById('msg').textContent = '获取中…（首次启动 Chrome 约 10-30s）';
+  try{
+    const res = await fetch('/admin/api/qr-start',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({platform:'xiaohongshu'})});
+    const data = await res.json();
+    if(!data.success){ document.getElementById('msg').textContent = '失败：' + (data.error||''); return; }
+    const img = document.getElementById('qr');
+    img.src = data.image;
+    img.style.display = 'block';
+    document.getElementById('msg').textContent = '请用小红书 App 扫码';
+    if(!timer) timer = setInterval(poll, 2000);
+  }catch(e){ document.getElementById('msg').textContent = '失败：' + e.message; }
+}
+async function poll(){
+  try{
+    const res = await fetch('/admin/api/qr-status?platform=xiaohongshu');
+    const data = await res.json();
+    if(data.loggedIn){
+      document.getElementById('msg').textContent = '已登录 ✅ 可以关闭本页';
+      if(timer){ clearInterval(timer); timer = null; }
+    }
+  }catch(e){}
+}
+document.getElementById('start').onclick = refreshQr;
+refreshQr();
 </script></body></html>`;
 
 const USER_PAGE_HTML = `<!doctype html>
@@ -1254,6 +1306,55 @@ async function main() {
         }
         if (url.pathname === '/admin') {
           return sendHtml(res, 200, ADMIN_HTML.replace('__ROOT__', escapeHtml(USERS_ROOT)));
+        }
+        if (url.pathname === '/admin/qr') {
+          return sendHtml(res, 200, QR_PAGE_HTML);
+        }
+        if (url.pathname === '/admin/api/qr-start') {
+          if (!SINGLE_DAEMON) {
+            return sendJson(res, 400, {
+              success: false,
+              error: '扫码登录仅支持单实例模式（BEAV_SINGLE_DAEMON=1）',
+            });
+          }
+          if (req.method !== 'POST') {
+            return sendJson(res, 405, { success: false, error: 'method not allowed' });
+          }
+          const body = (await readBody(req)).toString('utf8');
+          let parsed = {};
+          try {
+            parsed = JSON.parse(body || '{}');
+          } catch {}
+          try {
+            const result = await callIpc(
+              null,
+              'monitor:chrome-qr-start',
+              { platform: parsed.platform || 'xiaohongshu' },
+              120_000,
+              true,
+            );
+            return sendJson(res, 200, result);
+          } catch (error) {
+            return sendJson(res, 500, { success: false, error: error.message });
+          }
+        }
+        if (url.pathname === '/admin/api/qr-status') {
+          if (!SINGLE_DAEMON) {
+            return sendJson(res, 400, { success: false, error: '仅单实例模式可用' });
+          }
+          const platform = url.searchParams.get('platform') || 'xiaohongshu';
+          try {
+            const result = await callIpc(
+              null,
+              'monitor:chrome-qr-status',
+              { platform },
+              20_000,
+              true,
+            );
+            return sendJson(res, 200, result);
+          } catch (error) {
+            return sendJson(res, 500, { success: false, error: error.message });
+          }
         }
         if (url.pathname.startsWith('/admin/user/')) {
           const uid = decodeURIComponent(url.pathname.slice('/admin/user/'.length));

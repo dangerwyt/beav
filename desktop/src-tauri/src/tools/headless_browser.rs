@@ -733,6 +733,121 @@ pub async fn navigate_and_eval_settle(
     outcome
 }
 
+/// 打开登录页并截取二维码（返回 data URL）。
+///
+/// 用于 Web 端扫码登录：管理员在浏览器里看到平台自己的登录二维码，
+/// 用手机 App 扫，登录态落在该平台 profile 里，之后抓取复用。
+pub async fn capture_login_qr(ws_url: &str, login_url: &str) -> Result<String, String> {
+    let client = CdpClient::connect(ws_url).await?;
+    let target_id = client.create_target("about:blank").await?;
+    let session_id = client.attach_to_target(&target_id).await?;
+    let _ = client
+        .send_request(
+            "Page.navigate",
+            Some(json!({ "url": login_url })),
+            Some(&session_id),
+        )
+        .await?;
+
+    // 等页面加载完成（最多 15s）
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state = client
+            .evaluate(
+                &session_id,
+                "(() => { try { return document.readyState; } catch (e) { return ''; } })()",
+                false,
+            )
+            .await;
+        if matches!(state.as_ref().ok().and_then(Value::as_str), Some("complete")) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // 给登录弹窗/二维码渲染留时间
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // 找二维码元素（最大且接近正方形的一张图/画布）
+    let rect = client
+        .evaluate(
+            &session_id,
+            r#"(() => {
+                const nodes = [...document.querySelectorAll('img,canvas')];
+                const items = nodes.map((el) => {
+                    const r = el.getBoundingClientRect();
+                    return { x: r.x, y: r.y, width: r.width, height: r.height };
+                }).filter((r) => r.width >= 120 && r.width <= 380
+                    && Math.abs(r.width - r.height) <= 24 && r.x >= 0 && r.y >= 0);
+                if (!items.length) return null;
+                items.sort((a, b) => b.width - a.width);
+                return items[0];
+            })()"#,
+            false,
+        )
+        .await
+        .ok()
+        .filter(|value| value.is_object());
+
+    let mut params = json!({ "format": "png", "captureBeyondViewport": true });
+    if let Some(rect) = rect {
+        params["clip"] = json!({
+            "x": rect.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+            "y": rect.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+            "width": rect.get("width").and_then(Value::as_f64).unwrap_or(320.0),
+            "height": rect.get("height").and_then(Value::as_f64).unwrap_or(320.0),
+            "scale": 1
+        });
+    }
+    let shot = client
+        .send_request("Page.captureScreenshot", Some(params), Some(&session_id))
+        .await?;
+    let data = shot
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "截图未返回数据".to_string())?;
+    let data_url = format!("data:image/png;base64,{data}");
+    // 保留该标签页（登录页还在），只关 WS
+    client.close().await;
+    Ok(data_url)
+}
+
+/// 检查某平台是否已登录（小红书看 `web_session` cookie）。
+pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, String> {
+    let client = CdpClient::connect(ws_url).await?;
+    let result = client.send_request("Storage.getCookies", None, None).await?;
+    let matched = result
+        .get("cookies")
+        .and_then(Value::as_array)
+        .map(|cookies| {
+            cookies.iter().any(|cookie| {
+                let name = cookie.get("name").and_then(Value::as_str).unwrap_or("");
+                let domain = cookie.get("domain").and_then(Value::as_str).unwrap_or("");
+                let value = cookie.get("value").and_then(Value::as_str).unwrap_or("");
+                let wanted = match platform {
+                    "xiaohongshu" => "web_session",
+                    "douyin" => "sessionid",
+                    "bilibili" => "SESSDATA",
+                    _ => "web_session",
+                };
+                name == wanted && !value.is_empty() && domain.contains(platform_domain(platform))
+            })
+        })
+        .unwrap_or(false);
+    client.close().await;
+    Ok(matched)
+}
+
+fn platform_domain(platform: &str) -> &'static str {
+    match platform {
+        "douyin" => "douyin.com",
+        "bilibili" => "bilibili.com",
+        _ => "xiaohongshu.com",
+    }
+}
+
 /// 剥掉 URL 里的 `modal_id` 查询参数（抖音视频弹窗）。
 ///
 /// 用户从浏览器复制抖音主页链接时若开着某个视频弹窗，链接会带上 `modal_id`；
