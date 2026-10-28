@@ -1495,7 +1495,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                           {' · 未启动'}
                           {isTauriRuntime()
                             ? '，请点下面「打开 Chrome 登录」'
-                            : '，请联系管理员在服务器端登录'}
+                            : '，可打开 /admin/qr 扫码登录'}
                         </span>
                       )}</>
                   ) : (
@@ -1557,7 +1557,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 </>
               ) : (
                 <p className="text-[11px] leading-relaxed text-text-tertiary">
-                  Chrome 登录由服务器端（桌面版）完成；Web 端只复用已登录的会话，需要重新登录请联系管理员。
+                  Chrome 登录由服务器端完成；Web 端复用已登录的会话。如需重新登录，浏览器打开 /admin/qr 扫码即可。
                 </p>
               )}
 
