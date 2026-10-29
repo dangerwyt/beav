@@ -1104,7 +1104,9 @@ async function main() {
   if (command === '--list') {
     const { users } = loadUsers();
     if (!users.length) log('（空）');
-    for (const user of users) log(`${user.username}  uid=${user.uid}  port=${user.port}`);
+    for (const user of users) {
+      log(`${user.username}  uid=${user.uid}  role=${user.role || 'user'}  port=${user.port}`);
+    }
     return;
   }
   if (command === '--create' || command === '--create-admin') {
@@ -1140,6 +1142,22 @@ async function main() {
     user.passwordHash = hashPassword(password);
     saveUsers(data);
     log(`已更新 ${username} 的密码`);
+    return;
+  }
+  if (command === '--set-role') {
+    // 把已有账号提升/降级为管理员。管理员账号在 web 端不加 x-beav-user 头 →
+    // daemon 视为管理员（看全部数据 + 可扫码登录平台账号）。
+    const username = process.argv[3];
+    const role = String(process.argv[4] || '').trim();
+    if (!username || !['admin', 'user'].includes(role)) {
+      throw new Error('用法：--set-role <用户名> <admin|user>');
+    }
+    const data = loadUsers();
+    const user = data.users.find((item) => item.username === username);
+    if (!user) throw new Error(`用户不存在：${username}`);
+    user.role = role;
+    saveUsers(data);
+    log(`已将 ${username} 的角色设为 ${role}`);
     return;
   }
   if (command === '--delete') {

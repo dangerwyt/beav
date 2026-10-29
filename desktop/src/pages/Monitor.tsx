@@ -1614,7 +1614,15 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 {CDP_PLATFORMS.map((p) => (
                   <button
                     key={p}
-                    onClick={() => setChromeLoginPlatform(p)}
+                    onClick={() => {
+                      setChromeLoginPlatform(p);
+                      // 点平台 = 选平台 + 扫码，一步到位（否则点了只有切换，没有反馈）
+                      if (isAdminUser) {
+                        openQrModal(p);
+                      } else {
+                        showToast('ok', '扫码登录需要管理员账号（服务器上的平台账号由管理员统一管理）');
+                      }
+                    }}
                     className={clsx(
                       'flex-1 text-xs px-2 py-1.5 rounded-md border transition-colors',
                       chromeLoginPlatform === p
@@ -1640,14 +1648,14 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 )}
 
                 <div className="flex gap-1.5">
-                  {isAdminUser && (
-                    <button
-                      onClick={() => openQrModal(chromeLoginPlatform)}
-                      className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
-                    >
-                      <Lock className="w-3 h-3" />扫码登录
-                    </button>
-                  )}
+                  <button
+                    onClick={() => (isAdminUser ? openQrModal(chromeLoginPlatform) : showToast('ok', '扫码登录需要管理员账号'))}
+                    disabled={!isAdminUser}
+                    title={isAdminUser ? '扫码登录' : '需要管理员账号'}
+                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-text-secondary disabled:hover:border-border"
+                  >
+                    <Lock className="w-3 h-3" />扫码登录
+                  </button>
                   <button
                     onClick={() => void handleChromeTest()}
                     disabled={chromeBusy}
@@ -1667,7 +1675,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 </div>
                 {!isAdminUser && (
                   <p className="text-[11px] text-text-tertiary">
-                    平台账号由管理员统一登录，所有用户共享该登录态。
+                    平台账号由管理员统一登录，所有用户共享该登录态（扫码登录需管理员账号）。
                   </p>
                 )}
               </div>
