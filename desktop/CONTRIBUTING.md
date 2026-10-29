@@ -24,6 +24,26 @@
 - 改脚本：至少运行对应脚本一次，确认输出路径和错误提示可用。
 - 改文档：补充相互链接，避免只有一篇孤立文档。
 
+## Rust Build Notes
+
+`src-tauri` 是**单 crate**（500+ 个 .rs / 23 万行），依赖图高度成环
+（`commands ↔ tools`、`media_runtime ↔ voice_service`、`commands ↔ knowledge`）。
+因此：
+
+- **迭代期用 `cargo check --bin beav`**：全目标会额外编 `src/bin/` 下两个探针
+  （`redbox_runtime_probe` / `image_api_probe`，4000+ 行）。
+- **改任何文件都要 ~1 分钟重新 check**：单 crate 的增量缓存基本失效，这是结构问题，
+  不是配置问题。实测无宏爆炸、无巨型常量、无病态模块。
+- **不要为此随手拆 crate**：依赖图成环，拆之前必须先打破环（改架构），
+  风险与工期远大于收益。确要拆，先只做「lib + bin」抽取验证工具链，再逐块剥离，
+  每步用「改一个文件后 check 耗时」当验收指标。
+- **profile 已调优**（见 `src-tauri/Cargo.toml`）：
+  - `[profile.dev] debug = 1` + `[profile.dev.package."*"] debug = 0`
+  - `[profile.release] incremental = true` / `codegen-units = 256` / `strip = "debuginfo"`
+  - 实测 `opt-level` 3 → 2 **没有收益**（7m25s vs 7m55s），别再折腾。
+- **服务器更新统一走 `deploy/update-server.sh`**：只编 `--bin beav`，
+  并按「产物时间 vs 最后一次相关提交」判断要不要重建（不要只看 pull 区间）。
+
 ## Documentation Rule
 
 下列情况必须同步写文档：
