@@ -88,18 +88,28 @@ setup_sccache() {
     return 0
   fi
   local bin=""
+  # 优先用 PATH 里的；再找 ~/.local/bin（install-sccache.sh 装的默认位置）
   if command -v sccache >/dev/null 2>&1; then
     bin="$(command -v sccache)"
-  elif command -v brew >/dev/null 2>&1 && [ "${BEAV_INSTALL_SCCACHE:-0}" = "1" ]; then
-    log "安装 sccache（brew install sccache）…"
-    if brew install sccache >/dev/null 2>&1 && command -v sccache >/dev/null 2>&1; then
-      bin="$(command -v sccache)"
+  elif [ -x "$HOME/.local/bin/sccache" ]; then
+    bin="$HOME/.local/bin/sccache"
+  elif [ "${BEAV_INSTALL_SCCACHE:-0}" = "1" ]; then
+    # 服务器可能没装 Homebrew → 优先用官方二进制安装器，其次 brew
+    if bash "$SCRIPT_DIR/install-sccache.sh" >/dev/null 2>&1 && [ -x "$HOME/.local/bin/sccache" ]; then
+      bin="$HOME/.local/bin/sccache"
+    elif command -v brew >/dev/null 2>&1; then
+      log "安装 sccache（brew install sccache）…"
+      if brew install sccache >/dev/null 2>&1 && command -v sccache >/dev/null 2>&1; then
+        bin="$(command -v sccache)"
+      else
+        warn "sccache 安装失败，继续用默认编译器"
+      fi
     else
-      warn "sccache 安装失败，继续用默认编译器"
+      warn "sccache 安装失败（无 brew），继续用默认编译器"
     fi
   fi
   if [ -z "$bin" ]; then
-    warn "未找到 sccache，本次构建不走编译缓存（可选：brew install sccache）"
+    warn "未找到 sccache，本次构建不走编译缓存（可选：bash deploy/install-sccache.sh）"
     return 0
   fi
   export RUSTC_WRAPPER="$bin"
