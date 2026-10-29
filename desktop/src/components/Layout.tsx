@@ -17,6 +17,7 @@ import { useLayoutSidebar } from '../features/app-shell/useLayoutSidebar';
 import { useWorkflowDrawerStore } from '../features/workflow/store';
 import { useLayoutSpaces } from '../features/app-shell/useLayoutSpaces';
 import { useLayoutTheme } from '../features/app-shell/useLayoutTheme';
+import { isTauriRuntime } from '../bridge/browserHost';
 import { ENTITLEMENTS } from '../features/membership/entitlementKeys';
 import { useMembership } from '../features/membership/useMembership';
 import { asRecord, resolveFounderSponsorState, valueContainsFounder } from '../utils/membership';
@@ -611,23 +612,27 @@ export function Layout({ children, currentView, onNavigate, immersiveMode = fals
                   </button>
                 </>
               )}
-              <div className="relative min-w-0">
-                <button
-                  type="button"
-                  onClick={() => void handlePickWorkspaceFolder()}
-                  disabled={isPickingWorkspaceFolder}
-                  className="h-7 max-w-[160px] px-2.5 text-[12px] flex items-center justify-between gap-1 rounded-lg border border-border bg-surface-primary text-text-primary hover:bg-surface-secondary transition-colors disabled:opacity-50"
-                  title={workspaceFolder || t('settings.general.workspaceRoot')}
-                >
-                  <span className="inline-flex min-w-0 items-center gap-1.5">
-                    <Folder className="w-[13px] h-[13px] shrink-0 text-text-tertiary" strokeWidth={1.75} />
-                    <span className="min-w-0 truncate">
-                      {isPickingWorkspaceFolder ? '选择中…' : (workspaceFolderLabel || t('settings.general.pickFolder'))}
+              {/* 工作目录（文件夹选择器）：只在桌面端有意义 ——
+                  Web 端工作区固定在服务器上，本地用户选不了目录，按钮只会调起服务器上的系统选择框。 */}
+              {isTauriRuntime() && (
+                <div className="relative min-w-0">
+                  <button
+                    type="button"
+                    onClick={() => void handlePickWorkspaceFolder()}
+                    disabled={isPickingWorkspaceFolder}
+                    className="h-7 max-w-[160px] px-2.5 text-[12px] flex items-center justify-between gap-1 rounded-lg border border-border bg-surface-primary text-text-primary hover:bg-surface-secondary transition-colors disabled:opacity-50"
+                    title={workspaceFolder || t('settings.general.workspaceRoot')}
+                  >
+                    <span className="inline-flex min-w-0 items-center gap-1.5">
+                      <Folder className="w-[13px] h-[13px] shrink-0 text-text-tertiary" strokeWidth={1.75} />
+                      <span className="min-w-0 truncate">
+                        {isPickingWorkspaceFolder ? '选择中…' : (workspaceFolderLabel || t('settings.general.pickFolder'))}
+                      </span>
                     </span>
-                  </span>
-                  <Pencil className="w-[11px] h-[11px] shrink-0 text-text-tertiary" strokeWidth={1.75} />
-                </button>
-              </div>
+                    <Pencil className="w-[11px] h-[11px] shrink-0 text-text-tertiary" strokeWidth={1.75} />
+                  </button>
+                </div>
+              )}
             </div>
           </div>
 
