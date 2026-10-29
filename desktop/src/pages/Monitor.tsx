@@ -587,6 +587,30 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [qrNeedForce, setQrNeedForce] = useState(false);
   // Web 普通用户不是管理员 → 隐藏扫码/退出等管理员专属操作
   const [isAdminUser, setIsAdminUser] = useState(true);
+  /** 平台登录态：null = 未知/未检测，true = 已登录，false = 未登录。
+   *  与「Chrome 已就绪」是两回事 —— Chrome 起着但平台没登录时，
+   *  抓取只会拿到游客视角的首屏几条（这是「只抓到 3-6 条」的根因）。 */
+  const [platformLoginState, setPlatformLoginState] = useState<boolean | null>(null);
+
+  // 轮询平台登录态（10s 一次；后端有 cookie 指纹缓存，不会频繁动浏览器）
+  useEffect(() => {
+    if (!isActive) return;
+    let cancelled = false;
+    const check = async () => {
+      try {
+        const status = await window.ipcRenderer.monitor.chromeQrStatus(chromeLoginPlatform);
+        if (!cancelled) setPlatformLoginState(status?.loggedIn === true);
+      } catch {
+        if (!cancelled) setPlatformLoginState(null);
+      }
+    };
+    void check();
+    const timer = window.setInterval(() => void check(), 10_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [isActive, chromeLoginPlatform]);
 
   useEffect(() => {
     if (isTauriRuntime()) return;
@@ -1633,6 +1657,13 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               ) : (
                 <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-secondary text-text-tertiary">未就绪</span>
               )}
+              {/* 登录态 ≠ Chrome 就绪：Chrome 起着但平台没登录时，抓取只能拿游客首屏几条 */}
+              {platformLoginState === false && (
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-600">平台未登录</span>
+              )}
+              {platformLoginState === true && (
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-600">已登录</span>
+              )}
             </div>
             <ChevronDown className={clsx('w-4 h-4 text-text-tertiary transition-transform', chromeOpen && 'rotate-180')} />
           </button>
@@ -1702,7 +1733,12 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 <div className="flex gap-1.5">
                   <button
                     onClick={() => openQrModal(chromeLoginPlatform)}
-                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                    className={clsx(
+                      'flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border transition-colors',
+                      platformLoginState === false
+                        ? 'border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100'
+                        : 'border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40',
+                    )}
                   >
                     <Lock className="w-3 h-3" />扫码登录
                   </button>
