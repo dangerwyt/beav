@@ -44,12 +44,17 @@ struct ChromeSession {
 
 static CHROME_SESSIONS: OnceLock<Mutex<HashMap<String, ChromeSession>>> = OnceLock::new();
 
-/// 登录态探针标签（platform → targetId）。
+/// **每个平台一个固定标签页**（platform → targetId）。
 ///
-/// 复用同一个标签页看登录态；每次都新建+关闭的话，服务器上会看到
-/// "Chrome 反复跳出小红书主页然后关闭"（扫码页是 5 秒轮询一次），
-/// 还会打断正在等待扫码的登录页。
-static PROBE_TABS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+/// 扫码登录与登录态检查共用这一个标签：小红书扫码后登录页会自己跳到主页，
+/// 同一个标签就能当探针用。之前分成"登录页标签 + 探针标签"两套逻辑，
+/// 会互相制造标签（用户看到 Chrome 里标签一个个冒出来，3 个后卡住），
+/// 而且关掉登录标签就断了扫码回调链（手机成功、网页端没登录）。
+static PLATFORM_TABS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn platform_tabs() -> &'static Mutex<HashMap<String, String>> {
+    PLATFORM_TABS.get_or_init(Default::default)
+}
 
 /// 登录态缓存（platform → (cookie 指纹, 结果, 检测时刻)）。
 ///
@@ -818,6 +823,8 @@ pub async fn navigate_and_eval_settle(
 /// - `cookie_name`：登录成功后该平台必然有的 cookie（游客不会有）
 /// - `home_url`：登录态检查用的首页
 pub struct QrPlatformSpec {
+    /// 平台标识（xiaohongshu / douyin / bilibili），用于按平台复用固定标签页
+    pub platform_key: &'static str,
     pub login_url: &'static str,
     pub prepare_js: &'static str,
     pub cookie_name: &'static str,
@@ -825,6 +832,7 @@ pub struct QrPlatformSpec {
 }
 
 const XHS_QR: QrPlatformSpec = QrPlatformSpec {
+    platform_key: "xiaohongshu",
     login_url: "https://www.xiaohongshu.com/login",
     prepare_js: "",
     cookie_name: "web_session",
@@ -832,6 +840,7 @@ const XHS_QR: QrPlatformSpec = QrPlatformSpec {
 };
 
 const DOUYIN_QR: QrPlatformSpec = QrPlatformSpec {
+    platform_key: "douyin",
     login_url: "https://www.douyin.com/",
     // 抖音首页右上角「登录」按钮 → 弹出二维码
     prepare_js: r#"(() => {
@@ -847,6 +856,7 @@ const DOUYIN_QR: QrPlatformSpec = QrPlatformSpec {
 };
 
 const BILIBILI_QR: QrPlatformSpec = QrPlatformSpec {
+    platform_key: "bilibili",
     login_url: "https://account.bilibili.com/login",
     // 登录页默认展示二维码；存在「扫码登录」页签时点一下
     prepare_js: r#"(() => {
@@ -1006,6 +1016,45 @@ pub struct QrCapture {
     pub snippet: String,
 }
 
+/// 取该平台的**固定标签页**：已存在且活着就复用，否则新建。
+///
+/// `background=true` 时用后台标签（不抢焦点）。注意**登录页必须前台创建**：
+/// Chrome 会节流后台标签的定时器（降到 1 分钟一次），而扫码回调靠页面自己轮询，
+/// 后台标签可能永远等不到回调 → 手机显示成功、网页端却没登录。
+async fn platform_tab(
+    client: &CdpClient,
+    platform: &str,
+    initial_url: &str,
+    background: bool,
+) -> Result<String, String> {
+    let existing = {
+        let tabs = platform_tabs()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tabs.get(platform).cloned()
+    };
+    if let Some(target) = existing {
+        let alive = client
+            .list_targets()
+            .await
+            .map(|targets| targets.iter().any(|(id, _)| *id == target))
+            .unwrap_or(false);
+        if alive {
+            return Ok(target);
+        }
+    }
+    let created = if background {
+        client.create_target_background(initial_url).await?
+    } else {
+        client.create_target(initial_url).await?
+    };
+    let mut tabs = platform_tabs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    tabs.insert(platform.to_string(), created.clone());
+    Ok(created)
+}
+
 pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrCapture, String> {
     let client = CdpClient::connect(ws_url).await?;
 
@@ -1014,46 +1063,10 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
     // 如果关掉它（或另开新标签），手机端会显示"登录成功"，但网页端什么也没拿到
     // —— 用户实测就是这样：手机成功、页面仍显示未登录。
     //
-    // 所以：同一个标签页**只创建一次并保留**；要换新码就在同一标签内
-    // 清 sessionStorage（二维码缓存在这里）后再导航。
-    let existing = {
-        let tabs = PROBE_TABS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        tabs.get(spec.login_url).cloned()
-    };
-
-    let target_id = match existing {
-        Some(target) => {
-            // 校验它是否还活着；死了就重建
-            let alive = client
-                .list_targets()
-                .await
-                .map(|targets| targets.iter().any(|(id, _)| *id == target))
-                .unwrap_or(false);
-            if alive {
-                target
-            } else {
-                let created = client.create_target("about:blank").await?;
-                let mut tabs = PROBE_TABS
-                    .get_or_init(Default::default)
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                tabs.insert(spec.login_url.to_string(), created.clone());
-                created
-            }
-        }
-        None => {
-            let created = client.create_target("about:blank").await?;
-            let mut tabs = PROBE_TABS
-                .get_or_init(Default::default)
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            tabs.insert(spec.login_url.to_string(), created.clone());
-            created
-        }
-    };
+    // 所以：同一个平台的标签页**只创建一次并保留**（扫码/探针共用）；
+    // 要换新码就在同一标签内清 sessionStorage（二维码缓存在这里）后再导航。
+    // 登录页用**前台**标签：后台标签会被 Chrome 节流，扫码回调轮询会卡住
+    let target_id = platform_tab(&client, spec.platform_key, spec.login_url, false).await?;
 
     let session_id = client.attach_to_target(&target_id).await?;
 
@@ -1299,30 +1312,11 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
     }
 
     // 会话变了（扫码成功/被登出）→ 才去看页面。
-    // 复用同一个探针标签页，不再每次新建+关闭。
-    let target_id = {
-        let mut tabs = PROBE_TABS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match tabs.get(platform).cloned() {
-            Some(existing) => existing,
-            None => {
-                let created = client.create_target_background(spec.home_url).await?;
-                tabs.insert(platform.to_string(), created.clone());
-                created
-            }
-        }
-    };
+    // **复用该平台的同一个标签页**（与扫码共用），且**绝不导航它** ——
+    // 扫码回调要靠这个页面自己轮询，导航/刷新会把它打断。
+    // 扫码成功后小红书登录页会自己跳到主页，这个标签天然就成了探针。
+    let target_id = platform_tab(&client, spec.platform_key, spec.home_url, true).await?;
     let session_id = client.attach_to_target(&target_id).await?;
-    // 每次检查都重新导航一次，保证 SSR 状态是最新的（登录后需要重载才看得到）
-    let _ = client
-        .send_request(
-            "Page.navigate",
-            Some(json!({ "url": spec.home_url })),
-            Some(&session_id),
-        )
-        .await;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -1396,19 +1390,8 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
         );
     }
 
-    // 登录成功后，那个登录页标签就没用了 → 关掉，别在 Chrome 里留着
-    if logged {
-        let login_target = {
-            let mut tabs = PROBE_TABS
-                .get_or_init(Default::default)
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            tabs.remove(spec.login_url)
-        };
-        if let Some(login_target) = login_target {
-            client.close_target(&login_target).await;
-        }
-    }
+    // 登录成功后**不要关标签**：小红书登录页会自己跳到主页，这个标签随后
+    // 就是登录态探针。关掉它会让下一次检查又新建一个（标签一个个冒出来的来源）。
 
     client.close().await;
     Ok(logged)
