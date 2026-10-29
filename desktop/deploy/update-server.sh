@@ -170,7 +170,9 @@ if [ "$SKIP_RUST" = "1" ]; then
   log "跳过 Rust 构建（--skip-rust）"
 elif [ "$need_rust" = "1" ]; then
   log "Rust 产物落后于源码 → cargo build --release（首次全量较慢，请耐心）…"
-  (cd "$DESKTOP_DIR/src-tauri" && cargo build --release) || die "cargo build 失败"
+  # 只编主 bin：src/bin/ 下还有两个探针（redbox_runtime_probe / image_api_probe，
+  # 共 4000+ 行），服务器用不到，编它们纯属浪费。
+  (cd "$DESKTOP_DIR/src-tauri" && cargo build --release --bin beav) || die "cargo build 失败"
   git rev-list -1 HEAD -- "$RUST_PATHS" 2>/dev/null | head -1 > "$STAMP_DIR/rust.commit"
   log "Rust 构建完成：$RUST_BIN"
 else
