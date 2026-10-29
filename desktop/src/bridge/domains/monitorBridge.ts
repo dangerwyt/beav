@@ -50,6 +50,22 @@ export interface MonitorChromeTestResult {
   error?: string;
 }
 
+export interface MonitorChromeQrResult {
+  success: boolean;
+  /** 二维码图像（data:image/png;base64,...） */
+  image?: string;
+  error?: string;
+  port?: number;
+  /** 诊断：来源（canvas/img-data/img-fetch/none） */
+  kind?: string;
+  /** 页面提示失效并已自动刷新过 */
+  refreshed?: boolean;
+  /** 页面文本提示二维码已失效 */
+  expired?: boolean;
+  /** 页面文本摘要（排查用） */
+  snippet?: string;
+}
+
 export interface MonitorPostDetailResult {
   success: boolean;
   post?: unknown;
@@ -165,6 +181,18 @@ export function createMonitorBridge(core: BridgeCore) {
         core.invokeChannelGuarded<T>('monitor:chrome-shutdown', {}, {
           timeoutMs: READ_TIMEOUT_MS,
           fallback: () => ({ success: false, note: '退出登录超时' }) as unknown as T,
+        }),
+      /** 扫码登录：取二维码图像（data URL）+ 诊断信息。 */
+      chromeQrStart: <T = MonitorChromeQrResult>(payload: { platform: string; force?: boolean }) =>
+        core.invokeChannelGuarded<T>('monitor:chrome-qr-start', payload, {
+          timeoutMs: CHROME_TIMEOUT_MS,
+          fallback: () => ({ success: false, error: '获取二维码超时' }) as unknown as T,
+        }),
+      /** 扫码登录：轮询是否已完成登录。 */
+      chromeQrStatus: <T = { success: boolean; loggedIn: boolean; note?: string }>(platform: string) =>
+        core.invokeChannelGuarded<T>('monitor:chrome-qr-status', { platform }, {
+          timeoutMs: CHROME_TIMEOUT_MS,
+          fallback: () => ({ success: false, loggedIn: false, note: '查询超时' }) as unknown as T,
         }),
       clear: <T = { success: boolean; removedWatchlist: number; removedPosts: number }>() =>
         core.invokeChannelGuarded<T>('monitor:clear', {}, {

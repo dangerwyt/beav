@@ -571,6 +571,33 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [chromeLoginPlatform, setChromeLoginPlatform] = useState<CdpPlatform>(CDP_PLATFORMS[0]);
   const [chromeTestResult, setChromeTestResult] = useState<string | null>(null);
 
+  // —— 扫码登录弹窗 ——
+  const [qrOpen, setQrOpen] = useState(false);
+  const [qrPlatform, setQrPlatform] = useState<CdpPlatform>('xiaohongshu');
+  const [qrImage, setQrImage] = useState<string | null>(null);
+  const [qrBusy, setQrBusy] = useState(false);
+  const [qrNote, setQrNote] = useState<string | null>(null);
+  const [qrDiag, setQrDiag] = useState<string | null>(null);
+  const [qrDone, setQrDone] = useState(false);
+  // Web 普通用户不是管理员 → 隐藏扫码/退出等管理员专属操作
+  const [isAdminUser, setIsAdminUser] = useState(true);
+
+  useEffect(() => {
+    if (isTauriRuntime()) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const flags = await window.ipcRenderer.runtimeFlags();
+        if (!cancelled) setIsAdminUser(flags?.isAdmin !== false);
+      } catch {
+        if (!cancelled) setIsAdminUser(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // —— 爆文拆解（详情弹窗内）——
   const [deconResult, setDeconResult] = useState<PostDeconstruction | null>(null);
   const [deconLoading, setDeconLoading] = useState(false);
@@ -677,6 +704,61 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       console.warn('chrome status failed:', e);
     }
   }, [chromeLoginPlatform]);
+
+  // 扫码登录：取二维码 → 轮询登录态
+  const loadQrCode = useCallback(async (platform: CdpPlatform) => {
+    setQrBusy(true);
+    setQrDone(false);
+    setQrNote(null);
+    try {
+      const result = await window.ipcRenderer.monitor.chromeQrStart({ platform });
+      if (!result?.success || !result.image) {
+        setQrImage(null);
+        setQrNote(result?.error || '获取二维码失败');
+        setQrDiag(null);
+        return;
+      }
+      setQrImage(result.image);
+      const bits: string[] = [];
+      if (result.kind) bits.push(`来源=${result.kind}`);
+      if (result.refreshed) bits.push('已自动点刷新');
+      if (result.expired) bits.push('页面提示二维码已失效');
+      if (result.snippet) bits.push(`页面文本：${String(result.snippet).slice(0, 120)}`);
+      setQrDiag(bits.length ? bits.join(' | ') : null);
+      setQrNote('请用对应 App 扫描二维码');
+    } catch (e) {
+      setQrImage(null);
+      setQrNote(`获取二维码失败：${String(e)}`);
+    } finally {
+      setQrBusy(false);
+    }
+  }, []);
+
+  const openQrModal = useCallback((platform: CdpPlatform = 'xiaohongshu') => {
+    setQrPlatform(platform);
+    setQrOpen(true);
+    void loadQrCode(platform);
+  }, [loadQrCode]);
+
+  // 弹窗打开时轮询登录态
+  useEffect(() => {
+    if (!qrOpen || qrDone) return;
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const status = await window.ipcRenderer.monitor.chromeQrStatus(qrPlatform);
+          if (status?.loggedIn) {
+            setQrDone(true);
+            setQrNote('已登录 ✅');
+            void loadChromeStatus();
+          }
+        } catch {
+          /* 轮询失败忽略 */
+        }
+      })();
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [qrOpen, qrDone, qrPlatform, loadChromeStatus]);
 
   useEffect(() => {
     if (!isActive) return;
@@ -1521,13 +1603,14 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 )}
               </div>
 
-              {isTauriRuntime() ? (
-                <>
-                  <p className="text-[11px] leading-relaxed text-text-tertiary">
-                    小红书 / 抖音 / B 站需要登录态抓取。先选平台点「打开登录页」，在弹出的 Chrome 内完成登录（cookie 仅存于本机独立 profile）。之后 Beav 复用登录态抓取。
-                  </p>
+              <p className="text-[11px] leading-relaxed text-text-tertiary">
+                小红书 / 抖音 / B 站需要登录态抓取。
+                {isTauriRuntime()
+                  ? '先选平台点「打开登录页」，在弹出的 Chrome 内完成登录（cookie 仅存于本机独立 profile）；也可点「扫码登录」用手机 App 扫。之后 Beav 复用登录态抓取。'
+                  : '点「扫码登录」用手机 App 扫服务器上的二维码即可（服务器上的账号对所有用户共享）。'}
+              </p>
 
-                  <div className="flex gap-1.5">
+              <div className="flex gap-1.5">
                 {CDP_PLATFORMS.map((p) => (
                   <button
                     key={p}
@@ -1545,16 +1628,26 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               </div>
 
               <div className="flex flex-col gap-1.5">
-                <button
-                  onClick={() => void handleChromeLaunch()}
-                  disabled={chromeBusy || !chromeStatus?.chromeInstalled}
-                  className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 text-sm rounded-lg bg-accent-primary text-white hover:bg-accent-primary/90 transition-colors disabled:opacity-50"
-                >
-                  {chromeBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Lock className="w-3.5 h-3.5" />}
-                  打开 Chrome 登录{platformLabel(chromeLoginPlatform)}
-                </button>
+                {isTauriRuntime() && (
+                  <button
+                    onClick={() => void handleChromeLaunch()}
+                    disabled={chromeBusy || !chromeStatus?.chromeInstalled}
+                    className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 text-sm rounded-lg bg-accent-primary text-white hover:bg-accent-primary/90 transition-colors disabled:opacity-50"
+                  >
+                    {chromeBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Lock className="w-3.5 h-3.5" />}
+                    打开 Chrome 登录{platformLabel(chromeLoginPlatform)}
+                  </button>
+                )}
 
                 <div className="flex gap-1.5">
+                  {isAdminUser && (
+                    <button
+                      onClick={() => openQrModal(chromeLoginPlatform)}
+                      className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                    >
+                      <Lock className="w-3 h-3" />扫码登录
+                    </button>
+                  )}
                   <button
                     onClick={() => void handleChromeTest()}
                     disabled={chromeBusy}
@@ -1562,21 +1655,22 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   >
                     <RefreshCw className={clsx('w-3 h-3', chromeBusy && 'animate-spin')} />测试连接
                   </button>
-                  <button
-                    onClick={() => void handleChromeLogout()}
-                    disabled={!chromeStatus?.debugReady}
-                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-red-500 hover:border-red-200 transition-colors disabled:opacity-50"
-                  >
-                    <LogOut className="w-3 h-3" />退出登录
-                  </button>
+                  {isAdminUser && (
+                    <button
+                      onClick={() => void handleChromeLogout()}
+                      disabled={!chromeStatus?.debugReady}
+                      className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-red-500 hover:border-red-200 transition-colors disabled:opacity-50"
+                    >
+                      <LogOut className="w-3 h-3" />退出登录
+                    </button>
+                  )}
                 </div>
+                {!isAdminUser && (
+                  <p className="text-[11px] text-text-tertiary">
+                    平台账号由管理员统一登录，所有用户共享该登录态。
+                  </p>
+                )}
               </div>
-                </>
-              ) : (
-                <p className="text-[11px] leading-relaxed text-text-tertiary">
-                  Chrome 登录由服务器端完成；Web 端复用已登录的会话。如需重新登录，浏览器打开 /admin/qr 扫码即可。
-                </p>
-              )}
 
               {chromeTestResult && (
                 <div className={clsx(
@@ -2475,6 +2569,82 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       )}
 
       {/* 添加监控弹窗 */}
+      {qrOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+          <div className="w-full max-w-md mx-4 bg-surface-primary rounded-xl border border-border shadow-2xl overflow-hidden">
+            <div className="px-6 py-4 border-b border-border flex items-center justify-between">
+              <h3 className="text-base font-semibold text-text-primary">扫码登录平台</h3>
+              <button
+                onClick={() => setQrOpen(false)}
+                className="text-text-tertiary hover:text-text-primary"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="px-6 py-4 space-y-3">
+              <p className="text-[11px] leading-relaxed text-text-tertiary">
+                服务器上的平台账号是<b className="text-text-secondary">所有用户共享</b>的：扫码会更换服务器上的账号（原会话被顶掉）。
+                已登录时默认拒绝扫码，需要先在下方「登录管理」点「退出登录」。
+              </p>
+
+              <div className="flex gap-1.5">
+                {CDP_PLATFORMS.map((p) => (
+                  <button
+                    key={p}
+                    onClick={() => { setQrPlatform(p); void loadQrCode(p); }}
+                    className={clsx(
+                      'flex-1 text-xs px-2 py-1.5 rounded-md border transition-colors',
+                      qrPlatform === p
+                        ? 'bg-accent-primary/10 text-accent-primary border-accent-primary/30'
+                        : 'border-border text-text-secondary hover:text-text-primary',
+                    )}
+                  >
+                    {platformLabel(p)}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex items-center justify-center py-2 min-h-[220px]">
+                {qrBusy ? (
+                  <div className="flex items-center gap-2 text-xs text-text-tertiary">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    获取中…（首次启动 Chrome 约 10-30s）
+                  </div>
+                ) : qrImage ? (
+                  <img
+                    src={qrImage}
+                    alt="登录二维码"
+                    className="max-w-[240px] rounded-lg bg-white p-2"
+                  />
+                ) : (
+                  <div className="text-xs text-text-tertiary text-center px-4">
+                    {qrNote || '暂无二维码'}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => void loadQrCode(qrPlatform)}
+                  disabled={qrBusy}
+                  className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                >
+                  <RefreshCw className={clsx('w-3 h-3', qrBusy && 'animate-spin')} />刷新二维码
+                </button>
+                {qrDone && (
+                  <span className="flex-1 text-center text-xs text-emerald-600">{qrNote}</span>
+                )}
+              </div>
+
+              {qrDiag && (
+                <div className="text-[11px] text-text-tertiary/80 break-all">{qrDiag}</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {addOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
           <div className="w-full max-w-md mx-4 bg-surface-primary rounded-xl border border-border shadow-2xl overflow-hidden">

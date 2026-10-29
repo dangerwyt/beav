@@ -70,7 +70,9 @@ pub fn handle_system_channel(
                     "localMode": std::env::var("BEAV_SKIP_OFFICIAL_LOGIN")
                         .ok()
                         .as_deref()
-                        == Some("1")
+                        == Some("1"),
+                    // 是否管理员：桌面端恒为 true；web 用户按请求身份判断。
+                    "isAdmin": crate::identity::is_admin()
                 })),
                 "settings:pick-workspace-dir" => app_actions::pick_workspace_dir(),
                 "ai-model-manager:snapshot" => ai_model_ops::snapshot(state),

@@ -29,7 +29,11 @@ export function createSystemBridge(core: BridgeCore) {
   return {
     /** 运行时开关：localMode=true 表示跳过官方登录/扫码闸门（Web 受管多用户）。 */
     runtimeFlags: () =>
-      core.invokeChannel('app:runtime-flags', {}) as Promise<{ localMode?: boolean }>,
+      core.invokeChannel('app:runtime-flags', {}) as Promise<{
+        localMode?: boolean;
+        /** 是否管理员（桌面端恒 true；web 普通用户为 false）。 */
+        isAdmin?: boolean;
+      }>,
     files: {
       showInFolder: (payload: { source: string }) => core.invokeChannel('file:show-in-folder', payload),
       copyImage: (payload: { source: string }) => core.invokeChannel('file:copy-image', payload),
