@@ -277,6 +277,8 @@ fn chrome_qr_start(app: &AppHandle, payload: &Value) -> Result<Value, String> {
         "refreshed": capture.refreshed,
         "expired": capture.expired,
         "snippet": capture.snippet,
+        // 小红书风控态：需要扫弹窗里的"请通过验证"二维码
+        "needVerify": capture.need_verify,
     }))
 }
 

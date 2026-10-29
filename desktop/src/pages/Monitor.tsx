@@ -764,7 +764,11 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       if (result.expired) bits.push('页面提示二维码已失效');
       if (result.snippet) bits.push(`页面文本：${String(result.snippet).slice(0, 120)}`);
       setQrDiag(bits.length ? bits.join(' | ') : null);
-      setQrNote('请用对应 App 扫描二维码');
+      setQrNote(
+        result.needVerify
+          ? '⚠️ 小红书要求身份验证：请用**已登录该账号的小红书 App** 扫这张码完成验证（验证后才会真正登录）'
+          : '请用对应 App 扫描二维码',
+      );
     } catch (e) {
       setQrImage(null);
       setQrNote(`获取二维码失败：${String(e)}`);

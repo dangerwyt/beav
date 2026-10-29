@@ -930,6 +930,43 @@ const EXTRACT_QR_JS: &str = r#"(async () => {
   // 它同样满足"近正方形、尺寸合适" → 会被误当成二维码截出来，用户扫了永远提示过期。
   // 所以：先认过期态 → 点"点击刷新" → 等新码 → 再提取；仍过期就明确报错。
   const EXPIRED_RE = /二维码已过期|二维码已失效|二维码过期|二维码失效/;
+  // 小红书的**风控身份验证**弹窗：新设备/异地登录时会出现，
+  // 要求用已登录该账号的 App 扫码验证。此时登录页那张码是无效的，
+  // **弹窗里的码才是该扫的** —— 必须优先在弹窗容器内取码。
+  const VERIFY_RE = /请通过验证|扫码验证身份|为保护账号安全/;
+  const needVerify = VERIFY_RE.test(bodyText());
+  // 定位验证弹窗的容器（从提示文字往上找第一个够大的块）
+  const verifyRoot = (() => {
+    if (!needVerify) return null;
+    const hint = [...document.querySelectorAll('div,span,p,h1,h2,h3')]
+      .find((el) => {
+        const t = (el.textContent || '').trim();
+        return t.length < 200 && VERIFY_RE.test(t);
+      });
+    let node = hint || null;
+    for (let i = 0; i < 6 && node; i++) {
+      const r = node.getBoundingClientRect();
+      if (r.width > 260 && r.height > 260) return node;
+      node = node.parentElement;
+    }
+    return null;
+  })();
+  // 有验证弹窗就只在弹窗里找码，否则全页找
+  const scope = verifyRoot || document;
+  const candidateRoots = () => {
+    const els = new Set();
+    els.add(scope);
+    // 弹窗没定位到时，退回全页（避免完全取不到）
+    if (verifyRoot) els.add(verifyRoot);
+    return [...els];
+  };
+  const queryAll = (selector) => {
+    const out = [];
+    for (const root of candidateRoots()) {
+      for (const el of root.querySelectorAll(selector)) out.push(el);
+    }
+    return out;
+  };
   const clickRefresh = () => {
     const cands = [...document.querySelectorAll('span,a,div,i,button,em,p')]
       .filter((el) => {
@@ -958,13 +995,14 @@ const EXTRACT_QR_JS: &str = r#"(async () => {
     return true;
   };
   let refreshed = false;
-  if (EXPIRED_RE.test(bodyText())) {
+  // 验证弹窗开着时不要点刷新：换掉验证码反而让用户扫到失效的
+  if (!needVerify && EXPIRED_RE.test(bodyText())) {
     if (clickRefresh()) {
       refreshed = true;
       await sleep(2500);
     }
   }
-  const stillExpired = EXPIRED_RE.test(bodyText());
+  const stillExpired = needVerify ? false : EXPIRED_RE.test(bodyText());
   const isQrBox = (el) => {
     const r = el.getBoundingClientRect();
     return r.width >= 110 && r.width <= 460
@@ -983,14 +1021,14 @@ const EXTRACT_QR_JS: &str = r#"(async () => {
     return s;
   };
   // 2) canvas 直接导出
-  for (const c of [...document.querySelectorAll('canvas')].filter(isQrBox)) {
+  for (const c of queryAll('canvas').filter(isQrBox)) {
     try {
       const d = c.toDataURL('image/png');
       if (d && d.length > 2000) return { dataUrl: d, kind: 'canvas', refreshed, expired: stillExpired };
     } catch (e) {}
   }
   // 3) img：data URL 直接用；普通 URL 带 cookie 取回转 base64
-  const imgs = [...document.querySelectorAll('img')].filter(isQrBox);
+  const imgs = queryAll('img').filter(isQrBox);
   imgs.sort((a, b) => score(b) - score(a));
   for (const img of imgs) {
     const src = img.currentSrc || img.src || '';
@@ -1017,6 +1055,7 @@ const EXTRACT_QR_JS: &str = r#"(async () => {
     kind: 'none',
     refreshed,
     expired: stillExpired || EXPIRED_RE.test(text),
+    needVerify,
     snippet: text.replace(/\s+/g, ' ').slice(0, 240),
   };
 })()"#;
@@ -1028,6 +1067,8 @@ pub struct QrCapture {
     pub refreshed: bool,
     pub expired: bool,
     pub snippet: String,
+    /// 页面处于小红书的「请通过验证」风控态：此时要扫的是弹窗里的验证码
+    pub need_verify: bool,
 }
 
 /// 取该平台的**固定标签页**：已存在且活着就复用，否则新建。
@@ -1252,6 +1293,11 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
         .and_then(|value| value.get("expired"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let need_verify = extracted
+        .as_ref()
+        .and_then(|value| value.get("needVerify"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let snippet = extracted
         .as_ref()
         .and_then(|value| value.get("snippet"))
@@ -1326,6 +1372,7 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
         refreshed,
         expired,
         snippet,
+        need_verify,
     })
 }
 

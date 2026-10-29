@@ -62,6 +62,8 @@ export interface MonitorChromeQrResult {
   refreshed?: boolean;
   /** 页面文本提示二维码已失效 */
   expired?: boolean;
+  /** 小红书风控态：需要扫弹窗里的"请通过验证"二维码 */
+  needVerify?: boolean;
   /** 页面文本摘要（排查用） */
   snippet?: string;
 }
