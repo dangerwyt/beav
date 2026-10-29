@@ -259,10 +259,22 @@ fn chrome_qr_start(app: &AppHandle, payload: &Value) -> Result<Value, String> {
         }
     }
 
-    let image = tauri::async_runtime::block_on(headless_browser::capture_login_qr(
+    let capture = tauri::async_runtime::block_on(headless_browser::capture_login_qr(
         &ws_url, &spec,
     ))?;
-    Ok(json!({ "success": true, "image": image, "port": port }))
+    let image = capture
+        .data_url
+        .ok_or_else(|| "未能获取二维码图像".to_string())?;
+    Ok(json!({
+        "success": true,
+        "image": image,
+        "port": port,
+        // 诊断信息：便于定位"扫出来是过期码"这类问题
+        "kind": capture.kind,
+        "refreshed": capture.refreshed,
+        "expired": capture.expired,
+        "snippet": capture.snippet,
+    }))
 }
 
 /// 查询扫码登录是否完成（看平台会话 cookie）。

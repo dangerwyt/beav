@@ -889,6 +889,7 @@ const QR_PAGE_HTML = `<!doctype html>
   <button class="tab" data-p="bilibili">B 站</button>
 </div>
 <button id="start">获取二维码 / 刷新</button><span id="msg"></span>
+<div id="diag" style="margin-top:8px;color:#6f6f78;font-size:11px;max-width:640px;word-break:break-all"></div>
 <div id="wrap"><img id="qr" alt="登录二维码" /></div>
 <script>
 const APPS = { xiaohongshu:'小红书', douyin:'抖音', bilibili:'哔哩哔哩' };
@@ -907,13 +908,25 @@ async function refreshQr(){
     const res = await fetch('/admin/api/qr-start',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({platform})});
     const data = await res.json();
-    if(!data.success){ document.getElementById('msg').textContent = '失败：' + (data.error||''); return; }
+    if(!data.success){ document.getElementById('msg').textContent = '失败：' + (data.error||''); showDiag(data); return; }
     const img = document.getElementById('qr');
     img.src = data.image;
     img.style.display = 'block';
     document.getElementById('msg').textContent = '请用' + APPS[platform] + ' App 扫码';
+    showDiag(data);
     if(!timer) timer = setInterval(poll, 5000);
   }catch(e){ document.getElementById('msg').textContent = '失败：' + e.message; }
+}
+function showDiag(data){
+  const el = document.getElementById('diag');
+  if(!data) { el.textContent = ''; return; }
+  const bits = [];
+  if (data.kind) bits.push('来源=' + data.kind);
+  if (data.refreshed) bits.push('已自动点刷新');
+  if (data.expired) bits.push('页面提示二维码已失效');
+  if (data.error) bits.push('错误=' + data.error);
+  if (data.snippet) bits.push('页面文本：' + String(data.snippet).slice(0,120));
+  el.textContent = bits.join(' | ');
 }
 async function poll(){
   try{

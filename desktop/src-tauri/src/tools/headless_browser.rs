@@ -825,7 +825,93 @@ const FIND_QR_JS: &str = r#"(() => {
 ///
 /// 用于 Web 端扫码登录：管理员在浏览器里看到平台自己的登录二维码，
 /// 用手机 App 扫，登录态落在该平台 profile 里，之后抓取复用。
-pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<String, String> {
+/// 从 DOM 里**直接取出二维码图像数据**（而不是截图裁剪）。
+///
+/// 截图裁剪有两个硬伤：
+/// 1. 页面上常同时存在多个二维码（登录码、"扫码下载 App"码），按"最大近正方形"选容易选错；
+/// 2. 截到的是失效占位图时，用户扫码永远提示过期 —— 看起来"刷新了还是过期"。
+///
+/// 这里改为：canvas 用 `toDataURL()`，img 用 data URL 或 `fetch`（带 cookie）转 base64，
+/// 并对"已失效/点击刷新"文案先点一次刷新。
+const EXTRACT_QR_JS: &str = r#"(async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const bodyText = () => ((document.body && document.body.innerText) || '');
+  const classOf = (el) => {
+    const c = el.className;
+    if (!c) return '';
+    return (typeof c === 'string') ? c : (c.baseVal || '');
+  };
+  // 1) 页面提示二维码失效 → 先点刷新
+  let refreshed = false;
+  if (/二维码已失效|二维码过期|已失效|点击刷新|重新加载/.test(bodyText())) {
+    const btn = [...document.querySelectorAll('div,span,button,a')]
+      .find((el) => /点击刷新|刷新二维码|重新加载/.test((el.textContent || '').trim()));
+    if (btn) { btn.click(); refreshed = true; await sleep(2000); }
+  }
+  const isQrBox = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width >= 110 && r.width <= 460
+      && Math.abs(r.width - r.height) <= 36 && r.x >= 0 && r.y >= 0;
+  };
+  const score = (el) => {
+    let s = 0;
+    const src = (el.currentSrc || el.src || '');
+    if (/qrcode|qr-code|qr_|login-?qr|scan/i.test(src + ' ' + classOf(el))) s += 100;
+    if (src.startsWith('data:image')) s += 60;
+    const near = el.parentElement ? (el.parentElement.innerText || '') : '';
+    if (/扫码登录|手机号登录|登录/.test(near)) s += 30;
+    if (/下载.*APP|下载客户端|扫码下载/i.test(near)) s -= 120;
+    return s;
+  };
+  // 2) canvas 直接导出
+  for (const c of [...document.querySelectorAll('canvas')].filter(isQrBox)) {
+    try {
+      const d = c.toDataURL('image/png');
+      if (d && d.length > 2000) return { dataUrl: d, kind: 'canvas', refreshed };
+    } catch (e) {}
+  }
+  // 3) img：data URL 直接用；普通 URL 带 cookie 取回转 base64
+  const imgs = [...document.querySelectorAll('img')].filter(isQrBox);
+  imgs.sort((a, b) => score(b) - score(a));
+  for (const img of imgs) {
+    const src = img.currentSrc || img.src || '';
+    if (!src) continue;
+    if (src.startsWith('data:image')) {
+      if (src.length > 2000) return { dataUrl: src, kind: 'img-data', refreshed };
+      continue;
+    }
+    try {
+      const resp = await fetch(src, { credentials: 'include' });
+      const blob = await resp.blob();
+      const d = await new Promise((res) => {
+        const fr = new FileReader();
+        fr.onload = () => res(fr.result);
+        fr.onerror = () => res(null);
+        fr.readAsDataURL(blob);
+      });
+      if (d && d.length > 2000) return { dataUrl: d, kind: 'img-fetch', refreshed };
+    } catch (e) {}
+  }
+  const text = bodyText();
+  return {
+    dataUrl: null,
+    kind: 'none',
+    refreshed,
+    expired: /二维码已失效|二维码过期|已失效/.test(text),
+    snippet: text.replace(/\s+/g, ' ').slice(0, 240),
+  };
+})()"#;
+
+/// 扫码结果：图像 + 诊断信息。
+pub struct QrCapture {
+    pub data_url: Option<String>,
+    pub kind: String,
+    pub refreshed: bool,
+    pub expired: bool,
+    pub snippet: String,
+}
+
+pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrCapture, String> {
     let client = CdpClient::connect(ws_url).await?;
     let target_id = client.create_target("about:blank").await?;
     let session_id = client.attach_to_target(&target_id).await?;
@@ -863,34 +949,94 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<Str
     // 给登录弹窗/二维码渲染留时间
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // 找二维码元素
-    let rect = client
-        .evaluate(&session_id, FIND_QR_JS, false)
-        .await
-        .ok()
-        .filter(|value| value.is_object());
-
-    let mut params = json!({ "format": "png", "captureBeyondViewport": true });
-    if let Some(rect) = rect {
-        params["clip"] = json!({
-            "x": rect.get("x").and_then(Value::as_f64).unwrap_or(0.0),
-            "y": rect.get("y").and_then(Value::as_f64).unwrap_or(0.0),
-            "width": rect.get("width").and_then(Value::as_f64).unwrap_or(320.0),
-            "height": rect.get("height").and_then(Value::as_f64).unwrap_or(320.0),
-            "scale": 1
-        });
-    }
-    let shot = client
-        .send_request("Page.captureScreenshot", Some(params), Some(&session_id))
-        .await?;
-    let data = shot
-        .get("data")
+    // 直接从 DOM 取图像数据
+    let mut extracted = client.evaluate(&session_id, EXTRACT_QR_JS, true).await.ok();
+    // 没取到 → 可能是登录弹窗没打开（小红书首页要先点「登录」）→ 点一下再取
+    if extracted
+        .as_ref()
+        .and_then(|value| value.get("dataUrl"))
         .and_then(Value::as_str)
-        .ok_or_else(|| "截图未返回数据".to_string())?;
-    let data_url = format!("data:image/png;base64,{data}");
-    // 保留该标签页（登录页还在），只关 WS
+        .is_none()
+    {
+        const OPEN_LOGIN_JS: &str = r#"(async () => {
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            const hit = [...document.querySelectorAll('button,div,span,a')]
+                .find((el) => { const t = (el.textContent || '').trim(); return t === '登录' || t.startsWith('登录'); });
+            if (hit) { hit.click(); await sleep(2500); return true; }
+            return false;
+        })()"#;
+        let _ = client.evaluate(&session_id, OPEN_LOGIN_JS, true).await;
+        extracted = client.evaluate(&session_id, EXTRACT_QR_JS, true).await.ok();
+    }
+    let kind = extracted
+        .as_ref()
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("none")
+        .to_string();
+    let refreshed = extracted
+        .as_ref()
+        .and_then(|value| value.get("refreshed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let expired = extracted
+        .as_ref()
+        .and_then(|value| value.get("expired"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let snippet = extracted
+        .as_ref()
+        .and_then(|value| value.get("snippet"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let data_url = extracted
+        .as_ref()
+        .and_then(|value| value.get("dataUrl"))
+        .and_then(Value::as_str)
+        .map(|value| value.to_string());
+
+    // 兜底：DOM 取不到就退回"找元素 + 截图裁剪"
+    let (data_url, kind) = match data_url {
+        Some(url) => (url, kind),
+        None => {
+            let rect = client
+                .evaluate(&session_id, FIND_QR_JS, false)
+                .await
+                .ok()
+                .filter(|value| value.is_object());
+            let mut params = json!({ "format": "png", "captureBeyondViewport": true });
+            if let Some(rect) = rect {
+                params["clip"] = json!({
+                    "x": rect.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+                    "y": rect.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+                    "width": rect.get("width").and_then(Value::as_f64).unwrap_or(320.0),
+                    "height": rect.get("height").and_then(Value::as_f64).unwrap_or(320.0),
+                    "scale": 1
+                });
+            }
+            let shot = client
+                .send_request("Page.captureScreenshot", Some(params), Some(&session_id))
+                .await?;
+            let data = shot
+                .get("data")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "截图未返回数据".to_string())?;
+            (
+                format!("data:image/png;base64,{data}"),
+                format!("{kind}-screenshot"),
+            )
+        }
+    };
+
     client.close().await;
-    Ok(data_url)
+    Ok(QrCapture {
+        data_url: Some(data_url),
+        kind,
+        refreshed,
+        expired,
+        snippet,
+    })
 }
 
 /// 检查某平台是否**真实登录**。
