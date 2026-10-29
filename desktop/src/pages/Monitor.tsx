@@ -1705,12 +1705,15 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   >
                     <RefreshCw className="w-3 h-3" />检测登录状态
                   </button>
-                  <button
-                    onClick={() => openQrModal(chromeLoginPlatform)}
-                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
-                  >
-                    <Lock className="w-3 h-3" />扫码登录
-                  </button>
+                  {/* 桌面端不用扫码：它自己就有「打开 Chrome 登录」，扫码只是冗余入口 */}
+                  {!isTauriRuntime() && (
+                    <button
+                      onClick={() => openQrModal(chromeLoginPlatform)}
+                      className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                    >
+                      <Lock className="w-3 h-3" />扫码登录
+                    </button>
+                  )}
                   {isAdminUser && (
                     <button
                       onClick={() => void handleChromeLogout()}

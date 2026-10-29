@@ -974,7 +974,12 @@ fn handle_assistant_connection(app: AppHandle, mut stream: TcpStream, addr: Sock
             );
             return;
         }
-        if let Err(error) = serve_local_file(&app, &mut stream, &path) {
+        if let Err(error) = serve_local_file(
+            &app,
+            &mut stream,
+            &path,
+            headers.get("range").map(String::as_str),
+        ) {
             let _ = http_json_response(
                 &mut stream,
                 404,
@@ -1234,9 +1239,52 @@ fn mime_for_path(path: &std::path::Path) -> &'static str {
     }
 }
 
+/// 解析 `Range: bytes=start-end`，返回闭区间（含首尾）。
+///
+/// 支持三种写法：`bytes=0-1023`、`bytes=1000-`（到末尾）、`bytes=-1000`（末尾 1000 字节）。
+/// 多段 range 不处理（视频播放器不会用）；无效或不满足时返回 None，由调用方回 200 全量。
+fn parse_byte_range(header: &str, total: u64) -> Option<(u64, u64)> {
+    if total == 0 {
+        return None;
+    }
+    let value = header.trim();
+    let value = value.strip_prefix("bytes=")?;
+    let first = value.split(',').next()?.trim();
+    let (start_raw, end_raw) = first.split_once('-')?;
+    let (start, end) = if start_raw.trim().is_empty() {
+        let n: u64 = end_raw.trim().parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        (total.saturating_sub(n), total - 1)
+    } else {
+        let start: u64 = start_raw.trim().parse().ok()?;
+        let end = if end_raw.trim().is_empty() {
+            total - 1
+        } else {
+            end_raw.trim().parse::<u64>().ok()?.min(total - 1)
+        };
+        (start, end)
+    };
+    if start > end || start >= total {
+        return None;
+    }
+    Some((start, end))
+}
+
 /// Web 版文件代理：`GET /api/file?path=<绝对路径>`，仅允许工作区 / 导出根内的文件。
 /// 浏览器读不了 `file://`，Web 端图片/视频/字幕都靠它。
-fn serve_local_file(app: &AppHandle, stream: &mut TcpStream, path: &str) -> Result<(), String> {
+///
+/// **必须支持 Range**：浏览器播视频是分段请求（`Range: bytes=...`），
+/// 只会 200 全量返回的话，播放器只能播开头几秒就开始无限缓冲
+/// （用户实测：视频播几秒一直加载中）。这里同时改成**流式发送**，
+/// 不再把整个视频读进内存。
+fn serve_local_file(
+    app: &AppHandle,
+    stream: &mut TcpStream,
+    path: &str,
+    range_header: Option<&str>,
+) -> Result<(), String> {
     let query = path.split_once('?').map(|(_, value)| value).unwrap_or("");
     let mut raw_path = None;
     for pair in query.split('&') {
@@ -1274,20 +1322,51 @@ fn serve_local_file(app: &AppHandle, stream: &mut TcpStream, path: &str) -> Resu
         return Err("路径不在允许的目录内".to_string());
     }
 
-    let bytes = std::fs::read(&canonical).map_err(|error| error.to_string())?;
-    let response = http_response_bytes(
-        200,
-        "OK",
-        &[
-            ("Content-Type", mime_for_path(&canonical)),
-            ("Access-Control-Allow-Origin", "*"),
-            ("Cache-Control", "private, max-age=3600"),
-        ],
-        Some(&bytes),
-    );
+    let metadata = std::fs::metadata(&canonical).map_err(|error| error.to_string())?;
+    let total = metadata.len();
+    let mime = mime_for_path(&canonical);
+    let range = range_header.and_then(|value| parse_byte_range(value, total));
+
+    let (status_line, content_length, content_range) = match range {
+        Some((start, end)) => (
+            "HTTP/1.1 206 Partial Content\r\n".to_string(),
+            end - start + 1,
+            Some(format!("Content-Range: bytes {start}-{end}/{total}\r\n")),
+        ),
+        None => (
+            "HTTP/1.1 200 OK\r\n".to_string(),
+            total,
+            None,
+        ),
+    };
+
+    let mut head = status_line;
+    head.push_str(&format!("Content-Type: {mime}\r\n"));
+    head.push_str(&format!("Content-Length: {content_length}\r\n"));
+    // 让浏览器知道可以按段请求（视频拖动进度条依赖它）
+    head.push_str("Accept-Ranges: bytes\r\n");
+    if let Some(content_range) = content_range {
+        head.push_str(&content_range);
+    }
+    head.push_str("Access-Control-Allow-Origin: *\r\n");
+    head.push_str("Cache-Control: private, max-age=3600\r\n");
+    head.push_str("Connection: close\r\n\r\n");
     stream
-        .write_all(&response)
-        .map_err(|error| error.to_string())
+        .write_all(head.as_bytes())
+        .map_err(|error| error.to_string())?;
+
+    // 流式发送：视频可能上百 MB，不能再整进内存
+    let mut file = std::fs::File::open(&canonical).map_err(|error| error.to_string())?;
+    if let Some((start, end)) = range {
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(start))
+            .map_err(|error| error.to_string())?;
+        let mut limited = std::io::Read::take(file, end - start + 1);
+        std::io::copy(&mut limited, stream).map_err(|error| error.to_string())?;
+    } else {
+        std::io::copy(&mut file, stream).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn stream_sse(stream: &mut TcpStream) {
@@ -1612,6 +1691,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("Feishu 加密事件"));
+    }
+
+    #[test]
+    fn parses_byte_range_variants() {
+        // 闭区间
+        assert_eq!(parse_byte_range("bytes=0-1023", 10000), Some((0, 1023)));
+        // 开区间到末尾
+        assert_eq!(parse_byte_range("bytes=9000-", 10000), Some((9000, 9999)));
+        // 末尾 N 字节
+        assert_eq!(parse_byte_range("bytes=-500", 10000), Some((9500, 9999)));
+        // 超出末尾 → 截到末尾
+        assert_eq!(parse_byte_range("bytes=9000-99999", 10000), Some((9000, 9999)));
+        // 多段只取第一段
+        assert_eq!(parse_byte_range("bytes=0-99,200-299", 10000), Some((0, 99)));
+        // 无效 / 越界 → None（调用方回 200 全量）
+        assert_eq!(parse_byte_range("bytes=10000-", 10000), None);
+        assert_eq!(parse_byte_range("bytes=abc-def", 10000), None);
+        assert_eq!(parse_byte_range("items=0-10", 10000), None);
+        assert_eq!(parse_byte_range("bytes=0-10", 0), None);
     }
 
     #[test]
