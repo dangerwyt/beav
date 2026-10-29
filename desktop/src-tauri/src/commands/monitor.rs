@@ -4866,7 +4866,6 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
             };
             if !logged_in {
                 stats.not_logged_in += 1;
-                login_state = Some(false);
                 let note = format!(
                     "服务器未登录{}，只拿到游客视角的首屏；请先扫码登录平台账号再补历史",
                     platform.label()

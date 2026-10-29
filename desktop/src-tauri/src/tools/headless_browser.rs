@@ -56,7 +56,13 @@ fn platform_tabs() -> &'static Mutex<HashMap<String, String>> {
     PLATFORM_TABS.get_or_init(Default::default)
 }
 
-/// 登录态缓存（platform → (cookie 指纹, 结果, 检测时刻)）。
+/// 扫码开始时的登录 cookie 基线（platform → 值）。
+///
+/// 小红书登录成功后 `web_session` 的值会变（绑定到账号），以此判断"扫码是否完成"，
+/// 避免用"页面有没有登录按钮"这种在登录页必然误判的启发式。
+static SESSION_BASELINE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+/// 登录态缓存（platform → (cookie 值, 结果, 检测时刻)）。
 ///
 /// cookie 没变 → 会话没变 → 直接用上次结果，**完全不碰浏览器**。
 /// 但**"未登录"结果只缓存 15 秒**：扫码成功后 cookie 可能稍晚才写进来，
@@ -925,22 +931,30 @@ const EXTRACT_QR_JS: &str = r#"(async () => {
   // 所以：先认过期态 → 点"点击刷新" → 等新码 → 再提取；仍过期就明确报错。
   const EXPIRED_RE = /二维码已过期|二维码已失效|二维码过期|二维码失效/;
   const clickRefresh = () => {
-    const cands = [...document.querySelectorAll('span,a,div,i,button,em')]
+    const cands = [...document.querySelectorAll('span,a,div,i,button,em,p')]
       .filter((el) => {
         const t = (el.textContent || '').trim();
-        // 只认明确的"刷新二维码"语义，不认"重新加载"这类泛化文案（会误点页面别处）
-        if (t !== '点击刷新' && t !== '刷新二维码' && t !== '重新获取二维码' && t !== '点击刷新二维码') return false;
+        // 允许包含匹配（元素里可能还带图标/额外文字），但要足够短，避免命中整块容器
+        if (!/点击刷新|刷新二维码|重新获取二维码/.test(t)) return false;
+        if (t.length > 16) return false;
         const r = el.getBoundingClientRect();
-        return r.width > 0 && r.height > 0 && r.width < 160;
+        return r.width > 0 && r.height > 0 && r.width < 200;
       });
     if (!cands.length) return false;
-    // 面积最小的 = 真正的链接/按钮（外层容器文本也含它）
+    // 面积最小的 = 最内层
     cands.sort((a, b) => {
       const ra = a.getBoundingClientRect();
       const rb = b.getBoundingClientRect();
       return ra.width * ra.height - rb.width * rb.height;
     });
-    cands[0].click();
+    const target = cands[0];
+    target.click();
+    // 有些站点的点击处理器挂在外层容器上 → 再往上一层层点，最多 3 层
+    let node = target.parentElement;
+    for (let i = 0; i < 3 && node && node !== document.body; i++) {
+      node.click();
+      node = node.parentElement;
+    }
     return true;
   };
   let refreshed = false;
@@ -1070,14 +1084,10 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
 
     let session_id = client.attach_to_target(&target_id).await?;
 
-    // 清掉二维码缓存（sessionStorage）→ 否则重新导航还是那张过期图
-    let _ = client
-        .evaluate(
-            &session_id,
-            "(() => { try { sessionStorage.clear(); } catch (e) {} return true; })()",
-            false,
-        )
-        .await;
+    // 顺序很重要：**必须先导航到登录页，再清 sessionStorage**。
+    // sessionStorage 是按 origin 隔离的 —— 在 about:blank 上 clear() 清的是空白页，
+    // 小红书的缓存丝毫不动，于是重新加载还是那张"二维码已过期"的占位图
+    // （用户实测：两个标签全是过期图，就是这么来的）。
     let _ = client
         .send_request(
             "Page.navigate",
@@ -1103,6 +1113,52 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
             break;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // 现在页面已经在小红书域下 → 清二维码缓存才有意义（sessionStorage 按 origin 隔离）。
+    // 清完再强制重载（忽略 HTTP 缓存），拿到一个**全新生成**的二维码。
+    let _ = client
+        .evaluate(
+            &session_id,
+            "(() => { try { sessionStorage.clear(); } catch (e) {} return true; })()",
+            false,
+        )
+        .await;
+    let _ = client
+        .send_request(
+            "Page.reload",
+            Some(json!({ "ignoreCache": true })),
+            Some(&session_id),
+        )
+        .await;
+    // 等重载完成
+    let reload_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state = client
+            .evaluate(
+                &session_id,
+                "(() => { try { return document.readyState; } catch (e) { return ''; } })()",
+                false,
+            )
+            .await;
+        if matches!(state.as_ref().ok().and_then(Value::as_str), Some("complete")) {
+            break;
+        }
+        if std::time::Instant::now() >= reload_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // 记录扫码前的登录 cookie 基线：登录成功后该值会变（绑定到账号），
+    // 用它判断"扫码是否完成"，避免用"页面上有没有登录按钮"在登录页上必然误判。
+    {
+        let baseline = login_cookie_value(&client, spec.cookie_name, spec.platform_key).await;
+        let mut map = SESSION_BASELINE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.insert(spec.platform_key.to_string(), baseline);
     }
 
     // 平台特有的前置操作（抖音要点「登录」弹窗）
@@ -1290,33 +1346,54 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
         return Ok(matched);
     }
 
-    // 小红书：游客也会拿到 web_session，只能看页面状态。
+    // 小红书：游客也会拿到 web_session（所以"有没有 cookie"不能用），
+    // 但**登录成功后这个 cookie 的值会变**（绑定到账号）。
     //
-    // 但**不要每次都开一个标签页**：扫码页轮询是 5 秒一次，每次都开小红书首页再关掉，
-    // 服务器上会看到"窗口反复跳出小红书主页然后关闭"，还会打断正在等待扫码的登录页。
-    // 做法：先用 cookie 签名判断会话有没有变；没变就直接用上次的结果，**完全不动浏览器**。
-    let signature = cookie_signature(&client, platform).await;
+    // 判定策略：
+    //   1) 记录扫码开始时 web_session 的基线值（capture_login_qr 里写入）
+    //   2) 值没变 → 还没登录 → 直接返回 false，**完全不动浏览器**（不打断扫码回调）
+    //   3) 值变了 → 登录已完成 → 把该标签导航到主页做一次真实判定
+    //      （此时导航是安全的：回调已经完成）
+    let current = login_cookie_value(&client, spec.cookie_name, platform).await;
+    let baseline = SESSION_BASELINE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(platform)
+        .cloned()
+        .unwrap_or_default();
+
+    if !baseline.is_empty() && current == baseline {
+        client.close().await;
+        return Ok(false);
+    }
+    // 会话变了（或还没有基线）→ 到主页做真实判定
     {
         let cache = LOGIN_STATE_CACHE
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((cached_signature, cached_result, checked_at)) = cache.get(platform) {
-            let fresh_enough =
-                *cached_result || checked_at.elapsed() < NOT_LOGGED_IN_CACHE_TTL;
-            if *cached_signature == signature && fresh_enough {
+        if let Some((cached_value, cached_result, checked_at)) = cache.get(platform) {
+            let fresh_enough = *cached_result || checked_at.elapsed() < NOT_LOGGED_IN_CACHE_TTL;
+            if *cached_value == current && fresh_enough {
                 client.close().await;
                 return Ok(*cached_result);
             }
         }
     }
 
-    // 会话变了（扫码成功/被登出）→ 才去看页面。
-    // **复用该平台的同一个标签页**（与扫码共用），且**绝不导航它** ——
-    // 扫码回调要靠这个页面自己轮询，导航/刷新会把它打断。
-    // 扫码成功后小红书登录页会自己跳到主页，这个标签天然就成了探针。
+    // **复用该平台的同一个标签页**（与扫码共用），此刻登录已完成 → 导航到主页是安全的。
+    // 注意：登录页 `/login` 上本来就有个红色「登录」提交按钮，
+    // 停在登录页做"页头有没有登录按钮"的判定必然误判为未登录 —— 必须换到主页再判。
     let target_id = platform_tab(&client, spec.platform_key, spec.home_url, true).await?;
     let session_id = client.attach_to_target(&target_id).await?;
+    let _ = client
+        .send_request(
+            "Page.navigate",
+            Some(json!({ "url": spec.home_url })),
+            Some(&session_id),
+        )
+        .await;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -1386,7 +1463,7 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.insert(
             platform.to_string(),
-            (signature, logged, std::time::Instant::now()),
+            (current, logged, std::time::Instant::now()),
         );
     }
 
@@ -1425,6 +1502,35 @@ async fn cookie_signature(client: &CdpClient, platform: &str) -> String {
         .unwrap_or_default();
     parts.sort();
     parts.join("|")
+}
+
+/// 取该平台**登录态 cookie 的值**（不是全部 cookie 的指纹）。
+///
+/// 用单个关键 cookie 的值做基线判断，比"全部 cookie 指纹"稳：
+/// 小红书会频繁轮换 `acw_tc` 之类与登录无关的 cookie，用全量指纹会误判"会话变了"，
+/// 进而在用户扫码过程中去导航标签、打断回调链。
+async fn login_cookie_value(client: &CdpClient, name: &str, platform: &str) -> String {
+    let Ok(result) = client.send_request("Storage.getCookies", None, None).await else {
+        return String::new();
+    };
+    let domain = platform_domain(platform);
+    result
+        .get("cookies")
+        .and_then(Value::as_array)
+        .map(|cookies| {
+            cookies
+                .iter()
+                .find_map(|cookie| {
+                    let cookie_domain = cookie.get("domain").and_then(Value::as_str)?;
+                    let cookie_name = cookie.get("name").and_then(Value::as_str)?;
+                    if cookie_name != name || !cookie_domain.contains(domain) {
+                        return None;
+                    }
+                    cookie.get("value").and_then(Value::as_str).map(str::to_string)
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
 }
 
 /// 该平台是否存在登录态 cookie。
