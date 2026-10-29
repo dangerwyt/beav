@@ -603,6 +603,57 @@ impl CdpClient {
             .ok_or_else(|| "createTarget 返回无 targetId".to_string())
     }
 
+    /// 创建一个**后台**标签页（不抢前台焦点）。
+    ///
+    /// 探针标签用它：登录态轮询时新建前台标签会让服务器上的 Chrome 窗口
+    /// 反复切到小红书主页（用户看到"窗口自己跳走"）。
+    pub async fn create_target_background(&self, url: &str) -> Result<String, String> {
+        let result = self
+            .send_request(
+                "Target.createTarget",
+                Some(json!({ "url": url, "background": true })),
+                None,
+            )
+            .await?;
+        result
+            .get("targetId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "createTarget 返回无 targetId".to_string())
+    }
+
+    /// 列出所有标签页（targetId + url），用于清理遗留页面。
+    pub async fn list_targets(&self) -> Result<Vec<(String, String)>, String> {
+        let result = self
+            .send_request("Target.getTargets", None, None)
+            .await?;
+        let mut out = Vec::new();
+        if let Some(items) = result.get("targetInfos").and_then(Value::as_array) {
+            for item in items {
+                let id = item.get("targetId").and_then(Value::as_str);
+                let url = item.get("url").and_then(Value::as_str);
+                let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+                if let (Some(id), Some(url)) = (id, url) {
+                    if kind == "page" {
+                        out.push((id.to_string(), url.to_string()));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 关闭指定标签页（失败不致命）。
+    pub async fn close_target(&self, target_id: &str) {
+        let _ = self
+            .send_request(
+                "Target.closeTarget",
+                Some(json!({ "targetId": target_id })),
+                None,
+            )
+            .await;
+    }
+
     /// 附加到指定 target，建立该 target 的 sessionId。（浏览器级命令，无 session）
     pub async fn attach_to_target(&self, target_id: &str) -> Result<String, String> {
         let result = self
@@ -951,22 +1002,47 @@ pub struct QrCapture {
 
 pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrCapture, String> {
     let client = CdpClient::connect(ws_url).await?;
-    // 复用同一个登录页标签：每次新建的话，服务器 Chrome 会堆一排 /login 标签，
-    // 用户看着很乱，而且旧标签的二维码早就过期了。
-    let target_id = {
+
+    // 登录页**每次都要新标签**：小红书把二维码缓存在 sessionStorage 里，
+    // 复用旧标签会一直拿到那张过期的（reload 也不换，sessionStorage 还在）。
+    // 新标签 = 新 sessionStorage = 新二维码。
+    // 同时把遗留的登录页标签全部关掉，避免 Chrome 里堆一排（用户看到的"3 个窗口"）。
+    let old_target = {
         let mut tabs = PROBE_TABS
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match tabs.get(spec.login_url).cloned() {
-            Some(existing) => existing,
-            None => {
-                let created = client.create_target("about:blank").await?;
-                tabs.insert(spec.login_url.to_string(), created.clone());
-                created
+        tabs.remove(spec.login_url)
+    };
+    if let Ok(targets) = client.list_targets().await {
+        let login_marker = if spec.login_url.contains("/login") {
+            "/login"
+        } else {
+            ""
+        };
+        for (target_id, url) in targets {
+            if Some(target_id.as_str()) == old_target.as_deref() {
+                continue;
+            }
+            let is_login_tab = url.starts_with(spec.login_url)
+                || (!login_marker.is_empty() && url.contains(login_marker));
+            if is_login_tab {
+                client.close_target(&target_id).await;
             }
         }
-    };
+    }
+    if let Some(old) = old_target {
+        client.close_target(&old).await;
+    }
+
+    let target_id = client.create_target("about:blank").await?;
+    {
+        let mut tabs = PROBE_TABS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tabs.insert(spec.login_url.to_string(), target_id.clone());
+    }
     let session_id = client.attach_to_target(&target_id).await?;
     let _ = client
         .send_request(
@@ -1209,7 +1285,7 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
         match tabs.get(platform).cloned() {
             Some(existing) => existing,
             None => {
-                let created = client.create_target(spec.home_url).await?;
+                let created = client.create_target_background(spec.home_url).await?;
                 tabs.insert(platform.to_string(), created.clone());
                 created
             }
