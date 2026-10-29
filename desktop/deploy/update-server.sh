@@ -215,28 +215,63 @@ need_web=0
 needs_build "$STAMP_DIR/rust.commit" "$RUST_BIN" "$RUST_PATHS" && need_rust=1
 needs_build "$STAMP_DIR/web.commit" "$WEB_OUT" "$WEB_PATHS" && need_web=1
 
-if [ "$SKIP_RUST" = "1" ]; then
-  log "跳过 Rust 构建（--skip-rust）"
-elif [ "$need_rust" = "1" ]; then
-  log "Rust 产物落后于源码 → cargo build --release（首次全量较慢，请耐心）…"
-  # 只编主 bin：src/bin/ 下还有两个探针（redbox_runtime_probe / image_api_probe，
-  # 共 4000+ 行），服务器用不到，编它们纯属浪费。
-  (cd "$DESKTOP_DIR/src-tauri" && cargo build --release --bin beav) || die "cargo build 失败"
-  git rev-list -1 HEAD -- "$RUST_PATHS" 2>/dev/null | head -1 > "$STAMP_DIR/rust.commit"
-  log "Rust 构建完成：$RUST_BIN"
-else
-  log "Rust 产物已是最新，跳过构建"
+# 自检：二进制里必须含有前端产物，否则 Tauri 会以 dev 模式启动（去连 devUrl）→ 白屏。
+# 详见 tauri/build.rs：`dev = !has_feature("custom-protocol")`，该 feature 只有
+# tauri-cli 构建时才会加；裸 `cargo build --release` 编出来的二进制**不嵌前端**。
+assets_embedded() {
+  local bin="$1"
+  [ -f "$bin" ] || return 1
+  local marker
+  marker="$(ls -t "$DESKTOP_DIR"/dist/assets/*.js 2>/dev/null | head -1)"
+  [ -n "$marker" ] || return 1
+  local base
+  base="$(basename "$marker")"
+  # 二进制里应能搜到该资源文件名（Tauri 把资源路径当 key 嵌进去）
+  if grep -a -q "$base" "$bin" 2>/dev/null; then return 0; fi
+  return 1
+}
+
+if ! assets_embedded "$RUST_BIN"; then
+  warn "当前二进制**未嵌入前端资源**（会白屏）→ 强制重建"
+  need_rust=1
 fi
 
 if [ "$SKIP_WEB" = "1" ]; then
   log "跳过前端构建（--skip-web）"
 elif [ "$need_web" = "1" ]; then
-  log "前端产物落后于源码 → vite build…"
-  (cd "$DESKTOP_DIR" && pnpm web:build) || die "vite build 失败"
+  # 用完整的 pnpm build（sync-brand + sync-version + tsc + vite build），
+  # 不是 pnpm web:build —— 后者会跳过品牌/版本同步。
+  log "前端产物落后于源码 → pnpm build…"
+  (cd "$DESKTOP_DIR" && node ./scripts/run-with-brand.mjs beav pnpm build) || die "前端构建失败"
   git rev-list -1 HEAD -- $WEB_PATHS 2>/dev/null | head -1 > "$STAMP_DIR/web.commit"
   log "前端构建完成：$WEB_OUT"
 else
   log "前端产物已是最新，跳过构建"
+fi
+
+if [ "$SKIP_RUST" = "1" ]; then
+  log "跳过 Rust 构建（--skip-rust）"
+elif [ "$need_rust" = "1" ]; then
+  log "Rust 产物落后于源码 → cargo build --release（首次全量较慢，请耐心）…"
+  # ⚠️ 必须带 `--features tauri/custom-protocol`：
+  #   tauri/build.rs 里 `dev = !has_feature("custom-protocol")`。不开这个 feature 时
+  #   dev=true → Tauri 不嵌入前端资源、改为去连 devUrl(http://localhost:1420)
+  #   → 服务器上没人监听 → **桌面端白屏**。
+  #   （只有 tauri-cli 构建时才会自动加这个 feature，裸 cargo build 不会。）
+  # 必须在前端构建**之后**执行：dist 会被编译进二进制。
+  (cd "$DESKTOP_DIR/src-tauri" \
+    && cargo build --release --bin beav --features tauri/custom-protocol) \
+    || die "cargo build 失败"
+  git rev-list -1 HEAD -- "$RUST_PATHS" 2>/dev/null | head -1 > "$STAMP_DIR/rust.commit"
+  log "Rust 构建完成：$RUST_BIN"
+  if assets_embedded "$RUST_BIN"; then
+    log "已确认前端资源已嵌入二进制 ✅"
+  else
+    err "⚠️ 未检测到前端资源嵌入 —— 桌面端可能白屏。"
+    err "   排查：1) dist/ 是否生成  2) 构建是否带了 --features tauri/custom-protocol"
+  fi
+else
+  log "Rust 产物已是最新，跳过构建"
 fi
 
 # ---------- 4. 重启 ----------
