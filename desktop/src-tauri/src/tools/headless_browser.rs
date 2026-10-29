@@ -51,10 +51,16 @@ static CHROME_SESSIONS: OnceLock<Mutex<HashMap<String, ChromeSession>>> = OnceLo
 /// 还会打断正在等待扫码的登录页。
 static PROBE_TABS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
-/// 登录态缓存（platform → (cookie 指纹, 结果)）。
+/// 登录态缓存（platform → (cookie 指纹, 结果, 检测时刻)）。
 ///
 /// cookie 没变 → 会话没变 → 直接用上次结果，**完全不碰浏览器**。
-static LOGIN_STATE_CACHE: OnceLock<Mutex<HashMap<String, (String, bool)>>> = OnceLock::new();
+/// 但**"未登录"结果只缓存 15 秒**：扫码成功后 cookie 可能稍晚才写进来，
+/// 若把"过早检测到的未登录"永久缓存，就会一直显示未登录（用户实测踩到过）。
+static LOGIN_STATE_CACHE: OnceLock<Mutex<HashMap<String, (String, bool, std::time::Instant)>>> =
+    OnceLock::new();
+
+/// 「未登录」结果的缓存有效期
+const NOT_LOGGED_IN_CACHE_TTL: Duration = Duration::from_secs(15);
 
 /// 探测系统已装的 Chrome / Edge / Chromium 路径。
 ///
@@ -1003,47 +1009,62 @@ pub struct QrCapture {
 pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrCapture, String> {
     let client = CdpClient::connect(ws_url).await?;
 
-    // 登录页**每次都要新标签**：小红书把二维码缓存在 sessionStorage 里，
-    // 复用旧标签会一直拿到那张过期的（reload 也不换，sessionStorage 还在）。
-    // 新标签 = 新 sessionStorage = 新二维码。
-    // 同时把遗留的登录页标签全部关掉，避免 Chrome 里堆一排（用户看到的"3 个窗口"）。
-    let old_target = {
-        let mut tabs = PROBE_TABS
+    // 登录标签页的生命周期很关键：
+    // 小红书扫码登录靠**这个标签页**轮询二维码状态、拿到会话后写 cookie。
+    // 如果关掉它（或另开新标签），手机端会显示"登录成功"，但网页端什么也没拿到
+    // —— 用户实测就是这样：手机成功、页面仍显示未登录。
+    //
+    // 所以：同一个标签页**只创建一次并保留**；要换新码就在同一标签内
+    // 清 sessionStorage（二维码缓存在这里）后再导航。
+    let existing = {
+        let tabs = PROBE_TABS
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        tabs.remove(spec.login_url)
+        tabs.get(spec.login_url).cloned()
     };
-    if let Ok(targets) = client.list_targets().await {
-        let login_marker = if spec.login_url.contains("/login") {
-            "/login"
-        } else {
-            ""
-        };
-        for (target_id, url) in targets {
-            if Some(target_id.as_str()) == old_target.as_deref() {
-                continue;
-            }
-            let is_login_tab = url.starts_with(spec.login_url)
-                || (!login_marker.is_empty() && url.contains(login_marker));
-            if is_login_tab {
-                client.close_target(&target_id).await;
+
+    let target_id = match existing {
+        Some(target) => {
+            // 校验它是否还活着；死了就重建
+            let alive = client
+                .list_targets()
+                .await
+                .map(|targets| targets.iter().any(|(id, _)| *id == target))
+                .unwrap_or(false);
+            if alive {
+                target
+            } else {
+                let created = client.create_target("about:blank").await?;
+                let mut tabs = PROBE_TABS
+                    .get_or_init(Default::default)
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                tabs.insert(spec.login_url.to_string(), created.clone());
+                created
             }
         }
-    }
-    if let Some(old) = old_target {
-        client.close_target(&old).await;
-    }
+        None => {
+            let created = client.create_target("about:blank").await?;
+            let mut tabs = PROBE_TABS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tabs.insert(spec.login_url.to_string(), created.clone());
+            created
+        }
+    };
 
-    let target_id = client.create_target("about:blank").await?;
-    {
-        let mut tabs = PROBE_TABS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        tabs.insert(spec.login_url.to_string(), target_id.clone());
-    }
     let session_id = client.attach_to_target(&target_id).await?;
+
+    // 清掉二维码缓存（sessionStorage）→ 否则重新导航还是那张过期图
+    let _ = client
+        .evaluate(
+            &session_id,
+            "(() => { try { sessionStorage.clear(); } catch (e) {} return true; })()",
+            false,
+        )
+        .await;
     let _ = client
         .send_request(
             "Page.navigate",
@@ -1267,8 +1288,10 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((cached_signature, cached_result)) = cache.get(platform) {
-            if *cached_signature == signature {
+        if let Some((cached_signature, cached_result, checked_at)) = cache.get(platform) {
+            let fresh_enough =
+                *cached_result || checked_at.elapsed() < NOT_LOGGED_IN_CACHE_TTL;
+            if *cached_signature == signature && fresh_enough {
                 client.close().await;
                 return Ok(*cached_result);
             }
@@ -1325,17 +1348,35 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
         .evaluate(
             &session_id,
             r#"(() => {
+                // 判据要稳：不能"页面上出现扫码登录字样"就判未登录 ——
+                // 小红书登录后页面上仍可能残留登录弹窗相关文案，导致误判。
+                // 主判据：页头是否还有「登录」按钮（未登录才显示）。
+                const visible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 && r.width < 160;
+                };
+                const loginButtons = [...document.querySelectorAll('button,a,span,div')]
+                    .filter((el) => {
+                        const t = (el.textContent || '').trim();
+                        if (t !== '登录' && t !== '登录/注册') return false;
+                        if (!visible(el)) return false;
+                        // 最内层才算（外层容器文本也可能等于"登录"）
+                        return ![...el.children].some((c) => {
+                            const ct = (c.textContent || '').trim();
+                            return ct === '登录' || ct === '登录/注册';
+                        });
+                    });
+                // INITIAL_STATE 有明确布尔值时以它为准
                 try {
                     const s = window.__INITIAL_STATE__;
                     const u = s && s.user;
                     if (u && typeof u.loggedIn === 'boolean') return u.loggedIn;
                     if (u && u.userInfo && (u.userInfo.nickname || u.userInfo.userId)) return true;
                 } catch (e) {}
-                const text = (document.body && document.body.innerText) || '';
-                if (text.includes('登录后查看') || text.includes('手机号登录') || text.includes('扫码登录')) {
-                    return false;
-                }
-                return (document.cookie || '').includes('web_session=');
+                const hasSession = (document.cookie || '').includes('web_session=');
+                // 页头还有「登录」按钮 → 未登录
+                if (loginButtons.length > 0) return false;
+                return hasSession;
             })()"#,
             false,
         )
@@ -1349,7 +1390,24 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.insert(platform.to_string(), (signature, logged));
+        cache.insert(
+            platform.to_string(),
+            (signature, logged, std::time::Instant::now()),
+        );
+    }
+
+    // 登录成功后，那个登录页标签就没用了 → 关掉，别在 Chrome 里留着
+    if logged {
+        let login_target = {
+            let mut tabs = PROBE_TABS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tabs.remove(spec.login_url)
+        };
+        if let Some(login_target) = login_target {
+            client.close_target(&login_target).await;
+        }
     }
 
     client.close().await;

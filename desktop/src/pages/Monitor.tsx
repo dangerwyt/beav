@@ -790,6 +790,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
             setQrDone(true);
             setQrNote('已登录 ✅');
             void loadChromeStatus();
+            // 登录成功后自动关掉弹窗（用户反馈"手机显示成功，弹窗没关"）
+            window.setTimeout(() => setQrOpen(false), 1200);
           }
         } catch {
           /* 轮询失败忽略 */
@@ -799,15 +801,10 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
     return () => window.clearInterval(timer);
   }, [qrOpen, qrDone, qrPlatform, loadChromeStatus]);
 
-  // 二维码有效期很短（小红书约 1 分钟），用户掏手机的功夫就过期了 →
-  // 弹窗打开期间定期换一张新的（40s），保证扫到的永远是有效码。
-  useEffect(() => {
-    if (!qrOpen || qrDone || qrNeedForce) return;
-    const timer = window.setInterval(() => {
-      void loadQrCode(qrPlatform);
-    }, 40_000);
-    return () => window.clearInterval(timer);
-  }, [qrOpen, qrDone, qrNeedForce, qrPlatform, loadQrCode]);
+  // 注意：**不要**定时自动换码。
+  // 小红书扫码登录靠登录页标签自己轮询状态、拿到会话后写 cookie；
+  // 定时刷新/换标签会把正在等待回调的页面打断 → 手机提示成功、网页端却没登录。
+  // 二维码过期时页面上就有「点击刷新」，后端提取时会自动点它。
 
   useEffect(() => {
     if (!isActive) return;
