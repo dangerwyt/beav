@@ -9,6 +9,7 @@ import { clsx } from 'clsx';
 import { APP_BRAND } from '../../config/brand';
 import type { ThemeMode } from '../../config/theme';
 import { useI18n } from '../../i18n';
+import { isTauriRuntime } from '../../bridge/browserHost';
 import type { ImmersiveMode } from './types';
 
 export type AppTitleBarPlatform = 'mac' | 'windows' | null;
@@ -57,6 +58,9 @@ export function AppTitleBar({
   if (!enabled) return null;
 
   const startWindowDrag = (event: ReactMouseEvent<HTMLElement>) => {
+    // Web 端没有可拖动的原生窗口：调用会把**服务器**上的窗口拖走，
+    // 而且 preventDefault 会让用户无法在标题栏里选中文字。
+    if (!isTauriRuntime()) return;
     if (event.button !== 0) return;
     const target = event.target as HTMLElement | null;
     if (target?.closest('button,a,input,textarea,select,[role="button"],[data-no-window-drag]')) return;
@@ -73,6 +77,7 @@ export function AppTitleBar({
   };
 
   const handleTitleBarDoubleClick = (event: ReactMouseEvent<HTMLElement>) => {
+    if (!isTauriRuntime()) return;
     if (platform !== 'windows' || event.button !== 0) return;
     const target = event.target as HTMLElement | null;
     if (target?.closest('button,a,input,textarea,select,[role="button"],[data-no-window-drag]')) return;
@@ -144,7 +149,10 @@ export function AppTitleBar({
             ? <Sun className="w-[13px] h-[13px]" strokeWidth={1.75} />
             : <Moon className="w-[13px] h-[13px]" strokeWidth={1.75} />}
         </button>
-        {platform === 'windows' && (
+        {/* 窗口最小化/最大化/关闭只在 Tauri 桌面端有意义 ——
+            Web 端 `platform` 判的是**浏览器所在机器**（在 Windows 上访问 web 也会判成 windows），
+            但浏览器里根本没有可控制的原生窗口。 */}
+        {platform === 'windows' && isTauriRuntime() && (
           <div className="app-titlebar-window-controls" data-no-window-drag>
             <button
               type="button"
