@@ -84,7 +84,8 @@ bash deploy/update-server.sh --skip-web   # 跳过前端构建
 bash deploy/update-server.sh --no-restart # 只构建不重启
 ```
 
-- 增量判断：只有 `desktop/src-tauri/` 变了才 `cargo build --release`；只有前端变了才 `vite build`；
+- 增量判断：**按产物时间 vs 最后一次相关提交**（不是 pull 区间 —— 你若已手动 pull 过，区间会是空的），
+  构建成功后写入 `~/.beav-deploy/{rust,web}.commit` 标记；
 - 构建走 `cargo build --release`（服务器不需要 dmg，不跑 `tauri build`）；
 - 健康检查：`31937/api/ipc/health` 与 `8090/login` 都 200 才算成功，失败自动打印日志尾部。
 
