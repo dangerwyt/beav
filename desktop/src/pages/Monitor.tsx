@@ -579,6 +579,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [qrNote, setQrNote] = useState<string | null>(null);
   const [qrDiag, setQrDiag] = useState<string | null>(null);
   const [qrDone, setQrDone] = useState(false);
+  // 服务器已登录该平台 → 需要用户确认是否强制更换账号
+  const [qrNeedForce, setQrNeedForce] = useState(false);
   // Web 普通用户不是管理员 → 隐藏扫码/退出等管理员专属操作
   const [isAdminUser, setIsAdminUser] = useState(true);
 
@@ -706,15 +708,24 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   }, [chromeLoginPlatform]);
 
   // 扫码登录：取二维码 → 轮询登录态
-  const loadQrCode = useCallback(async (platform: CdpPlatform) => {
+  // force=true：服务器该平台已登录时仍然更换账号（扫码本来就是换号的行为，
+  // 普通 web 用户没有「退出登录」权限，硬拦会让她无路可走）。
+  const loadQrCode = useCallback(async (platform: CdpPlatform, force = false) => {
     setQrBusy(true);
     setQrDone(false);
     setQrNote(null);
+    setQrNeedForce(false);
     try {
-      const result = await window.ipcRenderer.monitor.chromeQrStart({ platform });
+      const result = await window.ipcRenderer.monitor.chromeQrStart({ platform, force });
       if (!result?.success || !result.image) {
         setQrImage(null);
-        setQrNote(result?.error || '获取二维码失败');
+        const error = result?.error || '获取二维码失败';
+        if (error.includes('已登录')) {
+          setQrNote('服务器该平台已登录（账号对所有用户共享）。继续扫码会更换服务器上的账号。');
+          setQrNeedForce(true);
+        } else {
+          setQrNote(error);
+        }
         setQrDiag(null);
         return;
       }
@@ -1616,12 +1627,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                     key={p}
                     onClick={() => {
                       setChromeLoginPlatform(p);
-                      // 点平台 = 选平台 + 扫码，一步到位（否则点了只有切换，没有反馈）
-                      if (isAdminUser) {
-                        openQrModal(p);
-                      } else {
-                        showToast('ok', '扫码登录需要管理员账号（服务器上的平台账号由管理员统一管理）');
-                      }
+                      // 点平台 = 选平台 + 扫码，一步到位
+                      openQrModal(p);
                     }}
                     className={clsx(
                       'flex-1 text-xs px-2 py-1.5 rounded-md border transition-colors',
@@ -1649,10 +1656,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
 
                 <div className="flex gap-1.5">
                   <button
-                    onClick={() => (isAdminUser ? openQrModal(chromeLoginPlatform) : showToast('ok', '扫码登录需要管理员账号'))}
-                    disabled={!isAdminUser}
-                    title={isAdminUser ? '扫码登录' : '需要管理员账号'}
-                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-text-secondary disabled:hover:border-border"
+                    onClick={() => openQrModal(chromeLoginPlatform)}
+                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
                   >
                     <Lock className="w-3 h-3" />扫码登录
                   </button>
@@ -1675,7 +1680,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 </div>
                 {!isAdminUser && (
                   <p className="text-[11px] text-text-tertiary">
-                    平台账号由管理员统一登录，所有用户共享该登录态（扫码登录需管理员账号）。
+                    平台账号由服务器统一维护，所有用户共享该登录态。
                   </p>
                 )}
               </div>
@@ -2593,7 +2598,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
             <div className="px-6 py-4 space-y-3">
               <p className="text-[11px] leading-relaxed text-text-tertiary">
                 服务器上的平台账号是<b className="text-text-secondary">所有用户共享</b>的：扫码会更换服务器上的账号（原会话被顶掉）。
-                已登录时默认拒绝扫码，需要先在下方「登录管理」点「退出登录」。
+                抓取本身所有用户都共用这个登录态，所以 web 端也能直接扫码续期。
               </p>
 
               <div className="flex gap-1.5">
@@ -2640,6 +2645,15 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 >
                   <RefreshCw className={clsx('w-3 h-3', qrBusy && 'animate-spin')} />刷新二维码
                 </button>
+                {qrNeedForce && (
+                  <button
+                    onClick={() => void loadQrCode(qrPlatform, true)}
+                    disabled={qrBusy}
+                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs rounded-md border border-amber-300 text-amber-700 hover:bg-amber-50 transition-colors disabled:opacity-50"
+                  >
+                    仍然更换账号
+                  </button>
+                )}
                 {qrDone && (
                   <span className="flex-1 text-center text-xs text-emerald-600">{qrNote}</span>
                 )}

@@ -116,6 +116,12 @@ pub fn handle_monitor_channel(
         return None;
     }
     // 全局/危险操作仅管理员（桌面端）可用；web 用户只能操作自己的数据。
+    //
+    // 注意：扫码登录（chrome-qr-start/status）与连接测试（chrome-test）**不**在此列表里。
+    // 平台账号是服务器上所有用户共享的，抓取本身对所有 web 用户开放；
+    // cookie 过期时必须能在 web 端续上登录态（管理员不一定在服务器前）。
+    // 退出登录（chrome-shutdown）与打开服务器 Chrome（chrome-launch）仍限管理员：
+    // 前者会断掉所有人共用的会话，后者会在服务器上弹窗口。
     const ADMIN_ONLY: &[&str] = &[
         "monitor:clear",
         "monitor:clear-posts",
@@ -131,9 +137,6 @@ pub fn handle_monitor_channel(
         "monitor:set-spike-threshold",
         "monitor:chrome-shutdown",
         "monitor:chrome-launch",
-        "monitor:chrome-test",
-        "monitor:chrome-qr-start",
-        "monitor:chrome-qr-status",
     ];
     if !crate::identity::is_admin() && ADMIN_ONLY.contains(&channel) {
         return Some(Err("该操作仅管理员可用".to_string()));
