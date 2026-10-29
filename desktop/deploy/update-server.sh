@@ -198,16 +198,19 @@ last_commit_ts() {
 }
 
 # 产物是否落后于源码：stamp 记录上次构建时的 commit，不一致就重建
+# 注意：源码路径要**逐个**传给 git（"$@"），不能打包成一个字符串再引号包住 ——
+# 后者会被当成单个 pathspec，git 返回空 → 永远判定"已是最新" → 前端永不重建。
 needs_build() {
-  local stamp_file="$1" artifact="$2" src_path="$3"
+  local stamp_file="$1" artifact="$2"
+  shift 2
   local head_commit last_ts artifact_ts
-  head_commit="$(git rev-list -1 HEAD -- "$src_path" 2>/dev/null | head -1)"
+  head_commit="$(git rev-list -1 HEAD -- "$@" 2>/dev/null | head -1)"
   [ -z "$head_commit" ] && return 1
   if [ -f "$stamp_file" ] && [ "$(cat "$stamp_file" 2>/dev/null)" = "$head_commit" ]; then
     return 1
   fi
   # 没有 stamp（首次使用脚本）→ 退化为比较文件时间
-  last_ts="$(last_commit_ts "$src_path")"
+  last_ts="$(last_commit_ts "$@")"
   artifact_ts="$(file_mtime "$artifact")"
   if [ -z "$last_ts" ] || [ "$last_ts" -eq 0 ]; then return 1; fi
   [ "$artifact_ts" -lt "$last_ts" ]
@@ -215,8 +218,8 @@ needs_build() {
 
 need_rust=0
 need_web=0
-needs_build "$STAMP_DIR/rust.commit" "$RUST_BIN" "$RUST_PATHS" && need_rust=1
-needs_build "$STAMP_DIR/web.commit" "$WEB_OUT" "$WEB_PATHS" && need_web=1
+needs_build "$STAMP_DIR/rust.commit" "$RUST_BIN" $RUST_PATHS && need_rust=1
+needs_build "$STAMP_DIR/web.commit" "$WEB_OUT" $WEB_PATHS && need_web=1
 
 # 自检：二进制里必须含有前端产物，否则 Tauri 会以 dev 模式启动（去连 devUrl）→ 白屏。
 # 详见 tauri/build.rs：`dev = !has_feature("custom-protocol")`，该 feature 只有
