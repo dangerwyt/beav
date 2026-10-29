@@ -949,8 +949,22 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
     // 给登录弹窗/二维码渲染留时间
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // 直接从 DOM 取图像数据
-    let mut extracted = client.evaluate(&session_id, EXTRACT_QR_JS, true).await.ok();
+    // 直接从 DOM 取图像数据（轮询几次，等二维码渲染完）
+    let mut extracted = None;
+    for _ in 0..3 {
+        let value = client.evaluate(&session_id, EXTRACT_QR_JS, true).await.ok();
+        let has_image = value
+            .as_ref()
+            .and_then(|v| v.get("dataUrl"))
+            .and_then(Value::as_str)
+            .is_some();
+        extracted = value;
+        if has_image {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+
     // 没取到 → 可能是登录弹窗没打开（小红书首页要先点「登录」）→ 点一下再取
     if extracted
         .as_ref()
@@ -960,13 +974,48 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
     {
         const OPEN_LOGIN_JS: &str = r#"(async () => {
             const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-            const hit = [...document.querySelectorAll('button,div,span,a')]
-                .find((el) => { const t = (el.textContent || '').trim(); return t === '登录' || t.startsWith('登录'); });
-            if (hit) { hit.click(); await sleep(2500); return true; }
-            return false;
+            // 必须点**最内层**的那个"登录"：外层容器（整个 header div）的文本也包含"登录"，
+            // 点它不会打开登录弹窗 —— 这是"点了没反应"的根因。
+            const cands = [...document.querySelectorAll('button,a,span,div,i')]
+                .filter((el) => {
+                    const t = (el.textContent || '').trim();
+                    if (t !== '登录' && !t.startsWith('登录')) return false;
+                    if (el.querySelector('button,a,span,div,i')) {
+                        // 含子元素 → 可能是容器；只有当子元素文本不同时才算候选
+                        const kids = [...el.children].some((c) => {
+                            const ct = (c.textContent || '').trim();
+                            return ct === '登录' || ct.startsWith('登录');
+                        });
+                        if (kids) return false;
+                    }
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                });
+            if (!cands.length) return false;
+            // 面积最小的 = 最内层 = 真正的按钮
+            cands.sort((a, b) => {
+                const ra = a.getBoundingClientRect();
+                const rb = b.getBoundingClientRect();
+                return ra.width * ra.height - rb.width * rb.height;
+            });
+            cands[0].click();
+            await sleep(2500);
+            return true;
         })()"#;
         let _ = client.evaluate(&session_id, OPEN_LOGIN_JS, true).await;
-        extracted = client.evaluate(&session_id, EXTRACT_QR_JS, true).await.ok();
+        for _ in 0..3 {
+            let value = client.evaluate(&session_id, EXTRACT_QR_JS, true).await.ok();
+            let has_image = value
+                .as_ref()
+                .and_then(|v| v.get("dataUrl"))
+                .and_then(Value::as_str)
+                .is_some();
+            extracted = value;
+            if has_image {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
     }
     let kind = extracted
         .as_ref()
@@ -996,7 +1045,9 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
         .and_then(Value::as_str)
         .map(|value| value.to_string());
 
-    // 兜底：DOM 取不到就退回"找元素 + 截图裁剪"
+    // 兜底：DOM 取不到就退回"找元素 + 截图裁剪"。
+    // 注意：**没有找到元素就不要截图** —— 整页截图会得到一张白图（用户扫不了，
+    // 还以为是"二维码过期"）。此时直接报错并带上诊断信息。
     let (data_url, kind) = match data_url {
         Some(url) => (url, kind),
         None => {
@@ -1005,16 +1056,28 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
                 .await
                 .ok()
                 .filter(|value| value.is_object());
-            let mut params = json!({ "format": "png", "captureBeyondViewport": true });
-            if let Some(rect) = rect {
-                params["clip"] = json!({
+            let Some(rect) = rect else {
+                client.close().await;
+                return Err(format!(
+                    "未在登录页找到二维码（诊断：{}）",
+                    if snippet.is_empty() {
+                        "页面无可见文本".to_string()
+                    } else {
+                        format!("页面文本「{}」", snippet)
+                    }
+                ));
+            };
+            let params = json!({
+                "format": "png",
+                "captureBeyondViewport": true,
+                "clip": {
                     "x": rect.get("x").and_then(Value::as_f64).unwrap_or(0.0),
                     "y": rect.get("y").and_then(Value::as_f64).unwrap_or(0.0),
                     "width": rect.get("width").and_then(Value::as_f64).unwrap_or(320.0),
                     "height": rect.get("height").and_then(Value::as_f64).unwrap_or(320.0),
                     "scale": 1
-                });
-            }
+                }
+            });
             let shot = client
                 .send_request("Page.captureScreenshot", Some(params), Some(&session_id))
                 .await?;

@@ -186,7 +186,7 @@ node scripts/web-instances.mjs --delete alice
 | `/register` | 公开（可关） | 注册并自动登录 |
 | `/account` | 登录用户 | 自己的端口/状态/PID/内存/数据目录 |
 | `/admin` | `role=admin` | 所有用户实例状态、内存、启动时间、最近活跃、停止按钮（5s 刷新） |
-| `/admin/qr` | admin | **小红书扫码登录**：浏览器里显示官方二维码，扫码后自动保存 cookie（仅单实例模式） |
+| `/admin/qr` | — | **已移除**：扫码登录改为**应用内弹窗**（桌面端 / 监控页 → 登录管理 → 扫码登录），支持小红书 / 抖音 / B 站 |
 | `/admin/user/<uid>` | admin | 该用户的**只读**数据：监控博主 + **视频下载异常** + 最近动态 +「立即跑每日任务」 |
 | `/admin/api/instances` | admin | 上述数据 JSON |
 | `/admin/api/user/<uid>` | admin | 该用户的 watches + posts + `issues`（失败/卡住）+ `pendingVideos` |
