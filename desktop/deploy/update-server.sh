@@ -14,7 +14,9 @@
 #   bash deploy/update-server.sh --no-restart # 只构建，不重启服务
 #   bash deploy/update-server.sh --status     # 只看当前状态
 
-set -uo pipefail
+# 不用 `set -u`：部署脚本里变量可能因分支/环境差异为空，nounset 会直接中断更新。
+# 宁可少一道保险，也别让脚本在服务器上崩在半路。
+set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DESKTOP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -81,22 +83,30 @@ cd "$REPO_DIR" || die "找不到仓库目录：$REPO_DIR"
 
 # ---------- 1. 拉取 ----------
 log "拉取最新代码…"
-BEFORE_HEAD="$(git rev-parse HEAD 2>/dev/null || echo '')"
+BEFORE_HEAD="$(git rev-parse HEAD 2>/dev/null || true)"
+BEFORE_HEAD="${BEFORE_HEAD:-}"
 if ! git pull --ff-only; then
   err "git pull 失败（可能有本地改动或冲突）"
   git status --short | head -20
   die "已中止，未做任何构建"
 fi
-AFTER_HEAD="$(git rev-parse HEAD)"
-if [ "$BEFORE_HEAD" = "$AFTER_HEAD" ]; then
+AFTER_HEAD="$(git rev-parse HEAD 2>/dev/null || true)"
+AFTER_HEAD="${AFTER_HEAD:-}"
+if [ -z "$AFTER_HEAD" ] || [ -z "$BEFORE_HEAD" ]; then
+  warn "无法解析 git HEAD，按全量重建处理"
+  CHANGED="desktop/src-tauri/
+desktop/src/"
+elif [ "$BEFORE_HEAD" = "$AFTER_HEAD" ]; then
   log "代码无变化（HEAD=$AFTER_HEAD）"
+  CHANGED=""
 else
-  log "已更新到 $AFTER_HEAD"
-  git log --oneline "$BEFORE_HEAD..$AFTER_HEAD" | sed 's/^/    /'
+  log "已更新到 ${AFTER_HEAD:0:8}"
+  git log --oneline "${BEFORE_HEAD}..${AFTER_HEAD}" 2>/dev/null | sed 's/^/    /'
+  CHANGED="$(git diff --name-only "${BEFORE_HEAD}" "${AFTER_HEAD}" 2>/dev/null || true)"
 fi
 
 # ---------- 2. 依赖 ----------
-if [ -n "$(git diff --name-only "$BEFORE_HEAD" "$AFTER_HEAD" -- desktop/package.json desktop/pnpm-lock.yaml 2>/dev/null)" ]; then
+if [ -n "$(git diff --name-only "${BEFORE_HEAD:-HEAD}" "${AFTER_HEAD:-HEAD}" -- desktop/package.json desktop/pnpm-lock.yaml 2>/dev/null || true)" ]; then
   log "依赖有变化，安装中…"
   (cd "$DESKTOP_DIR" && pnpm install --frozen-lockfile) || die "pnpm install 失败"
 else
@@ -104,8 +114,6 @@ else
 fi
 
 # ---------- 3. 构建 ----------
-CHANGED="$(git diff --name-only "$BEFORE_HEAD" "$AFTER_HEAD" 2>/dev/null || true)"
-
 if [ "$SKIP_RUST" = "1" ]; then
   log "跳过 Rust 构建"
 elif echo "$CHANGED" | grep -q '^desktop/src-tauri/'; then
