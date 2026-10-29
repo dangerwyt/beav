@@ -10,8 +10,6 @@ use crate::platform::Platform;
 
 /// 一个平台的抓取差异。所有方法都应是纯常量，便于静态注册。
 pub trait PlatformAdapter: Send + Sync {
-    fn platform(&self) -> Platform;
-
     /// 列表页等待「帖子锚点」出现的 CSS 选择器。
     fn list_wait_selector(&self) -> &'static str;
 
@@ -21,17 +19,10 @@ pub trait PlatformAdapter: Send + Sync {
     /// 详情页等待「正文文本真正填充」的选择器（客户端渲染有延迟）。
     fn content_wait_selector(&self) -> &'static str;
 
-    /// 下载/登录用的站点主页（Referer）。
-    fn home_url(&self) -> &'static str {
-        self.platform().home_url()
-    }
 }
 
 pub struct XiaohongshuAdapter;
 impl PlatformAdapter for XiaohongshuAdapter {
-    fn platform(&self) -> Platform {
-        Platform::Xiaohongshu
-    }
     fn list_wait_selector(&self) -> &'static str {
         "a[href*=\"/explore/\"]"
     }
@@ -45,9 +36,6 @@ impl PlatformAdapter for XiaohongshuAdapter {
 
 pub struct DouyinAdapter;
 impl PlatformAdapter for DouyinAdapter {
-    fn platform(&self) -> Platform {
-        Platform::Douyin
-    }
     fn list_wait_selector(&self) -> &'static str {
         "a[href*=\"/video/\"]"
     }
@@ -65,9 +53,6 @@ impl PlatformAdapter for DouyinAdapter {
 /// 播放量/时长在 `.bili-video-card__stats`。详情页标题 `h1.video-title`，简介 `.desc-info-text`。
 pub struct BilibiliAdapter;
 impl PlatformAdapter for BilibiliAdapter {
-    fn platform(&self) -> Platform {
-        Platform::Bilibili
-    }
     fn list_wait_selector(&self) -> &'static str {
         "a[href*=\"/video/BV\"]"
     }

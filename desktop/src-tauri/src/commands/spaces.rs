@@ -2,7 +2,6 @@ use serde_json::{json, Value};
 use std::fs;
 use tauri::{AppHandle, State};
 
-use crate::membership::{ensure_entitlement, ENTITLEMENT_SPACES_CREATE};
 use crate::persistence::{
     apply_workspace_hydration_snapshot, load_workspace_hydration_snapshot, with_store,
     with_store_mut,

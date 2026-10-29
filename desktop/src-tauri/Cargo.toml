@@ -33,7 +33,6 @@ reqwest = { version = "0.12.8", default-features = false, features = ["blocking"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
 sha2 = "0.10.8"
 shell-words = "1.1.0"
 tauri = { version = "2.0.0", features = ["protocol-asset"] }
@@ -44,9 +43,6 @@ tar = "0.4.43"
 time = { version = "0.3.36", features = ["formatting", "parsing"] }
 tokio = { version = "1.48.0", features = ["time", "net", "io-util", "sync", "rt", "rt-multi-thread", "macros"] }
 tokio-tungstenite = { version = "0.24.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-tracing = "0.1.41"
-tracing-appender = "0.2.3"
-tracing-subscriber = { version = "0.3.19", features = ["fmt", "json"] }
 url = "2.5.2"
 urlencoding = "2.1.3"
 zstd = "0.13.2"
@@ -57,3 +53,23 @@ tauri = { version = "2.0.0", features = ["test"] }
 
 [features]
 default = []
+
+# —— 编译速度 ——
+# 本 crate 有 500+ 个 .rs / 23 万行，单 crate 编译是耗时主因。
+# 这里只调 profile，不动依赖版本与代码语义。
+[profile.dev]
+# 只保留行号表（不做 DWARF）：backtrace 仍能看到文件+行号，
+# 但省掉大量调试信息生成与链接时间。
+debug = 1
+# 依赖 crate 不需要调试信息 —— 这是 dev 构建提速最明显的一项
+[profile.dev.package."*"]
+debug = 0
+
+[profile.release]
+# 服务器每次更新都要重编本 crate：开启增量编译后，
+# 只有改动涉及的模块会重编，重复部署的耗时下降明显。
+incremental = true
+# 默认 16 → 256：把单个 crate 的 codegen 拆得更细，交给更多线程并行
+codegen-units = 256
+# 去掉调试符号：链接更快、二进制更小（服务器不需要调试符号）
+strip = "debuginfo"

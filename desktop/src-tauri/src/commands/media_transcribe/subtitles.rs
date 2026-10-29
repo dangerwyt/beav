@@ -105,7 +105,7 @@ fn is_punctuation_only(text: &str) -> bool {
             .all(|c| "。！？；，、.!?;,、".contains(c))
 }
 
-pub(super) fn render_subtitles_from_words(
+pub(crate) fn render_subtitles_from_words(
     words: &[serde_json::Value],
     format: &str,
 ) -> Option<String> {
