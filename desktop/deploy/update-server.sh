@@ -73,6 +73,41 @@ file_mtime() {
   esac
 }
 
+# 启用编译缓存（sccache）：把编译产物缓存到磁盘。
+#
+# 解决的是「首次/清缓存构建」——依赖有 400+ 个 crate，全量构建约 50-70 分钟；
+# 装了 sccache 后，同一份依赖在不同机器/不同 target 目录之间也能复用。
+# 注意：cargo 自身的 incremental 缓存解决的是「重复构建」，两者互补。
+#
+# 环境变量：
+#   BEAV_USE_SCCACHE=0      关闭（默认开启，找不到 sccache 就自动跳过）
+#   BEAV_INSTALL_SCCACHE=1  没装时自动 brew install sccache（默认不装）
+setup_sccache() {
+  if [ "${BEAV_USE_SCCACHE:-1}" = "0" ]; then
+    log "sccache：已按 BEAV_USE_SCCACHE=0 跳过"
+    return 0
+  fi
+  local bin=""
+  if command -v sccache >/dev/null 2>&1; then
+    bin="$(command -v sccache)"
+  elif command -v brew >/dev/null 2>&1 && [ "${BEAV_INSTALL_SCCACHE:-0}" = "1" ]; then
+    log "安装 sccache（brew install sccache）…"
+    if brew install sccache >/dev/null 2>&1 && command -v sccache >/dev/null 2>&1; then
+      bin="$(command -v sccache)"
+    else
+      warn "sccache 安装失败，继续用默认编译器"
+    fi
+  fi
+  if [ -z "$bin" ]; then
+    warn "未找到 sccache，本次构建不走编译缓存（可选：brew install sccache）"
+    return 0
+  fi
+  export RUSTC_WRAPPER="$bin"
+  export SCCACHE_DIR="${SCCACHE_DIR:-$HOME/.cache/sccache}"
+  mkdir -p "$SCCACHE_DIR" 2>/dev/null || true
+  log "sccache：$bin（缓存目录 $SCCACHE_DIR）"
+}
+
 show_status() {
   log "仓库：$REPO_DIR"
   printf '  git HEAD : %s\n' "$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo '?')"
@@ -88,6 +123,9 @@ show_status() {
   done
   printf '  daemon    : %s\n' "$(http_code http://127.0.0.1:31937/api/ipc/health 5)"
   printf '  web       : %s\n' "$(http_code http://127.0.0.1:8090/login 5)"
+  if command -v sccache >/dev/null 2>&1; then
+    printf '  sccache   : %s\n' "$(sccache --show-stats 2>/dev/null | grep -E 'Hits|Misses|Cache size' | tr '\n' ' ' | sed 's/  */ /g')"
+  fi
 }
 
 if [ "$STATUS_ONLY" = "1" ]; then
@@ -130,6 +168,7 @@ else
 fi
 
 # ---------- 3. 构建（按"产物时间 vs 最后一次相关提交"判断，而不是 pull 区间） ----------
+setup_sccache
 #
 # 为什么不用 pull 区间：如果用户已经手动 git pull 过，区间就是空的 → 会误判"无变化"
 # → 跳过构建 → 新功能根本没编译进去。这里改成对比**产物**与**最后一次相关提交**。

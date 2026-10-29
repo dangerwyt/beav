@@ -88,6 +88,12 @@ bash deploy/update-server.sh --no-restart # 只构建不重启
   构建成功后写入 `~/.beav-deploy/{rust,web}.commit` 标记；
 - 构建走 `cargo build --release`（服务器不需要 dmg，不跑 `tauri build`）；
 - 健康检查：`31937/api/ipc/health` 与 `8090/login` 都 200 才算成功，失败自动打印日志尾部。
+- **编译缓存**：脚本会自动启用 `sccache`（若已安装），把编译产物缓存到 `~/.cache/sccache`。
+  依赖有 400+ crate，全量构建约 50–70 分钟，装了 sccache 后首次/清缓存重建能复用缓存。
+  - 手动安装：`brew install sccache`
+  - 想让脚本自动装：`BEAV_INSTALL_SCCACHE=1 bash deploy/update-server.sh`
+  - 想关掉：`BEAV_USE_SCCACHE=0 bash deploy/update-server.sh`
+  - `bash deploy/update-server.sh --status` 会显示 sccache 命中统计。
 
 ### macOS 常驻（launchd，开机/登录自启）
 
