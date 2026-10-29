@@ -190,9 +190,12 @@ export function createMonitorBridge(core: BridgeCore) {
           timeoutMs: CHROME_TIMEOUT_MS,
           fallback: () => ({ success: false, error: '获取二维码超时' }) as unknown as T,
         }),
-      /** 扫码登录：轮询是否已完成登录。 */
-      chromeQrStatus: <T = { success: boolean; loggedIn: boolean; note?: string }>(platform: string) =>
-        core.invokeChannelGuarded<T>('monitor:chrome-qr-status', { platform }, {
+      /** 扫码登录：轮询是否已完成登录。refresh=true 跳过缓存强制重检。 */
+      chromeQrStatus: <T = { success: boolean; loggedIn: boolean; note?: string }>(
+        platform: string,
+        refresh = false,
+      ) =>
+        core.invokeChannelGuarded<T>('monitor:chrome-qr-status', { platform, refresh }, {
           timeoutMs: CHROME_TIMEOUT_MS,
           fallback: () => ({ success: false, loggedIn: false, note: '查询超时' }) as unknown as T,
         }),

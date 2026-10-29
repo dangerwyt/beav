@@ -593,24 +593,26 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [platformLoginState, setPlatformLoginState] = useState<boolean | null>(null);
 
   // 轮询平台登录态（10s 一次；后端有 cookie 指纹缓存，不会频繁动浏览器）
+  const checkPlatformLogin = useCallback(async (refresh = false) => {
+    try {
+      const status = await window.ipcRenderer.monitor.chromeQrStatus(
+        chromeLoginPlatform,
+        refresh,
+      );
+      setPlatformLoginState(status?.loggedIn === true);
+      return status?.loggedIn === true;
+    } catch {
+      setPlatformLoginState(null);
+      return false;
+    }
+  }, [chromeLoginPlatform]);
+
   useEffect(() => {
     if (!isActive) return;
-    let cancelled = false;
-    const check = async () => {
-      try {
-        const status = await window.ipcRenderer.monitor.chromeQrStatus(chromeLoginPlatform);
-        if (!cancelled) setPlatformLoginState(status?.loggedIn === true);
-      } catch {
-        if (!cancelled) setPlatformLoginState(null);
-      }
-    };
-    void check();
-    const timer = window.setInterval(() => void check(), 10_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [isActive, chromeLoginPlatform]);
+    void checkPlatformLogin(false);
+    const timer = window.setInterval(() => void checkPlatformLogin(false), 10_000);
+    return () => window.clearInterval(timer);
+  }, [isActive, checkPlatformLogin]);
 
   useEffect(() => {
     if (isTauriRuntime()) return;
@@ -1319,41 +1321,6 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
     }
   }, [chromeLoginPlatform, loadChromeStatus, showToast]);
 
-  const handleChromeTest = useCallback(async () => {
-    setChromeBusy(true);
-    setChromeTestResult(null);
-    const testUrl = PLATFORM_HOME[chromeLoginPlatform];
-    try {
-      const result = (await window.ipcRenderer.monitor.chromeTest({
-        platform: chromeLoginPlatform,
-        url: testUrl,
-      })) as MonitorChromeTestResult & { result?: { title?: string; loggedOut?: boolean } };
-      if (result.success && result.result && typeof result.result === 'object') {
-        const title = result.result.title || '';
-        const loggedOut = result.result.loggedOut;
-        const platformLabelText = platformLabel(chromeLoginPlatform);
-        if (loggedOut) {
-          setChromeTestResult(`已连上 ${platformLabelText} Chrome，但页面显示「${title}」—— 看起来还没登录（登录页无个人主页/消息入口）。请先完成登录再点测试。`);
-          showToast('err', `${platformLabelText} 该页面似乎未登录`);
-        } else {
-          setChromeTestResult(`连接成功 · ${platformLabelText} 页面标题：${title}`);
-          showToast('ok', `CDP 连接成功（${platformLabelText}）`);
-        }
-      } else if (result.success) {
-        setChromeTestResult(`连接成功 · 结果：${JSON.stringify(result.result ?? result)}`);
-        showToast('ok', 'CDP 连接成功');
-      } else {
-        setChromeTestResult(`连接失败：${result.error || '未知错误'}`);
-        showToast('err', 'CDP 连接失败');
-      }
-    } catch (e) {
-      console.error('chrome test failed:', e);
-      setChromeTestResult(e instanceof Error ? e.message : '连接异常');
-      showToast('err', e instanceof Error ? e.message : '连接异常');
-    } finally {
-      setChromeBusy(false);
-    }
-  }, [chromeLoginPlatform, showToast]);
 
   const handleChromeLogout = useCallback(async () => {
     try {
@@ -1733,22 +1700,16 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
 
                 <div className="flex gap-1.5">
                   <button
-                    onClick={() => openQrModal(chromeLoginPlatform)}
-                    className={clsx(
-                      'flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border transition-colors',
-                      platformLoginState === false
-                        ? 'border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100'
-                        : 'border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40',
-                    )}
+                    onClick={() => void checkPlatformLogin(true)}
+                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
                   >
-                    <Lock className="w-3 h-3" />扫码登录
+                    <RefreshCw className="w-3 h-3" />检测登录状态
                   </button>
                   <button
-                    onClick={() => void handleChromeTest()}
-                    disabled={chromeBusy}
-                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                    onClick={() => openQrModal(chromeLoginPlatform)}
+                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
                   >
-                    <RefreshCw className={clsx('w-3 h-3', chromeBusy && 'animate-spin')} />测试连接
+                    <Lock className="w-3 h-3" />扫码登录
                   </button>
                   {isAdminUser && (
                     <button
@@ -1760,10 +1721,19 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                     </button>
                   )}
                 </div>
-                {!isAdminUser && (
-                  <p className="text-[11px] text-text-tertiary">
-                    平台账号由服务器统一维护，所有用户共享该登录态。
-                  </p>
+
+                {/* 平台登录态：主要靠管理员在服务器上登录，web 端只做检测与展示 */}
+                {platformLoginState === false && (
+                  <div className="rounded-md border border-amber-200 bg-amber-50/60 px-2.5 py-2 text-[11px] leading-relaxed text-amber-800">
+                    平台未登录。请在<b>服务器桌面端</b>完成登录：
+                    <br />
+                    桌面端 → 对标监控 → 登录管理 → <b>打开 Chrome 登录</b>
+                    <br />
+                    登录完成后点上面「检测登录状态」即可（web 端无需扫码）。
+                  </div>
+                )}
+                {platformLoginState === true && (
+                  <div className="text-[11px] text-emerald-600">平台已登录，抓取会使用该账号的完整视角。</div>
                 )}
               </div>
 

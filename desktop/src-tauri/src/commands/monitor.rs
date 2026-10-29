@@ -288,6 +288,14 @@ fn chrome_qr_status(_app: &AppHandle, payload: &Value) -> Result<Value, String> 
         .get("platform")
         .and_then(Value::as_str)
         .unwrap_or("xiaohongshu");
+    // refresh=true：跳过缓存强制重检（用户/管理员刚在服务器上手动登录完，想立即确认）
+    let refresh = payload
+        .get("refresh")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if refresh {
+        headless_browser::invalidate_login_state(platform);
+    }
     let port = headless_browser::active_chrome_port(platform);
     if port == 0 {
         return Ok(json!({ "success": true, "loggedIn": false, "note": "Chrome 未启动" }));

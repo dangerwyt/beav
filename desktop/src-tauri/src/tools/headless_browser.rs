@@ -72,6 +72,24 @@ static LOGIN_STATE_CACHE: OnceLock<Mutex<HashMap<String, (String, bool, std::tim
 
 /// 「未登录」结果的缓存有效期
 const NOT_LOGGED_IN_CACHE_TTL: Duration = Duration::from_secs(15);
+/// 「已登录」结果的缓存有效期（登录态很少变，缓存久一点避免反复导航标签页）
+const LOGGED_IN_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// 让某个平台的登录态缓存失效（管理员刚手动登录完 / 用户点「重新检测」时用）。
+pub fn invalidate_login_state(platform: &str) {
+    if let Some(cache) = LOGIN_STATE_CACHE.get() {
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.remove(platform);
+    }
+    if let Some(baseline) = SESSION_BASELINE.get() {
+        let mut baseline = baseline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        baseline.remove(platform);
+    }
+}
 
 /// 探测系统已装的 Chrome / Edge / Chromium 路径。
 ///
@@ -1421,8 +1439,12 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some((cached_value, cached_result, checked_at)) = cache.get(platform) {
-            let fresh_enough = *cached_result || checked_at.elapsed() < NOT_LOGGED_IN_CACHE_TTL;
-            if *cached_value == current && fresh_enough {
+            let ttl = if *cached_result {
+                LOGGED_IN_CACHE_TTL
+            } else {
+                NOT_LOGGED_IN_CACHE_TTL
+            };
+            if *cached_value == current && checked_at.elapsed() < ttl {
                 client.close().await;
                 return Ok(*cached_result);
             }
