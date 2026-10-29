@@ -775,6 +775,16 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
     return () => window.clearInterval(timer);
   }, [qrOpen, qrDone, qrPlatform, loadChromeStatus]);
 
+  // 二维码有效期很短（小红书约 1 分钟），用户掏手机的功夫就过期了 →
+  // 弹窗打开期间定期换一张新的（40s），保证扫到的永远是有效码。
+  useEffect(() => {
+    if (!qrOpen || qrDone || qrNeedForce) return;
+    const timer = window.setInterval(() => {
+      void loadQrCode(qrPlatform);
+    }, 40_000);
+    return () => window.clearInterval(timer);
+  }, [qrOpen, qrDone, qrNeedForce, qrPlatform, loadQrCode]);
+
   useEffect(() => {
     if (!isActive) return;
     void loadWatches();

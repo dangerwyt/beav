@@ -44,6 +44,18 @@ struct ChromeSession {
 
 static CHROME_SESSIONS: OnceLock<Mutex<HashMap<String, ChromeSession>>> = OnceLock::new();
 
+/// 登录态探针标签（platform → targetId）。
+///
+/// 复用同一个标签页看登录态；每次都新建+关闭的话，服务器上会看到
+/// "Chrome 反复跳出小红书主页然后关闭"（扫码页是 5 秒轮询一次），
+/// 还会打断正在等待扫码的登录页。
+static PROBE_TABS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+/// 登录态缓存（platform → (cookie 指纹, 结果)）。
+///
+/// cookie 没变 → 会话没变 → 直接用上次结果，**完全不碰浏览器**。
+static LOGIN_STATE_CACHE: OnceLock<Mutex<HashMap<String, (String, bool)>>> = OnceLock::new();
+
 /// 探测系统已装的 Chrome / Edge / Chromium 路径。
 ///
 /// 各平台按自己的安装约定搜索；找不到返回 None，由调用方提示用户。
@@ -841,13 +853,37 @@ const EXTRACT_QR_JS: &str = r#"(async () => {
     if (!c) return '';
     return (typeof c === 'string') ? c : (c.baseVal || '');
   };
-  // 1) 页面提示二维码失效 → 先点刷新
+  // 小红书的**过期占位图本身就是一张图**（图上写着"二维码已过期 点击刷新"），
+  // 它同样满足"近正方形、尺寸合适" → 会被误当成二维码截出来，用户扫了永远提示过期。
+  // 所以：先认过期态 → 点"点击刷新" → 等新码 → 再提取；仍过期就明确报错。
+  const EXPIRED_RE = /二维码已过期|二维码已失效|二维码过期|二维码失效/;
+  const clickRefresh = () => {
+    const cands = [...document.querySelectorAll('span,a,div,i,button,em')]
+      .filter((el) => {
+        const t = (el.textContent || '').trim();
+        // 只认明确的"刷新二维码"语义，不认"重新加载"这类泛化文案（会误点页面别处）
+        if (t !== '点击刷新' && t !== '刷新二维码' && t !== '重新获取二维码' && t !== '点击刷新二维码') return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && r.width < 160;
+      });
+    if (!cands.length) return false;
+    // 面积最小的 = 真正的链接/按钮（外层容器文本也含它）
+    cands.sort((a, b) => {
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      return ra.width * ra.height - rb.width * rb.height;
+    });
+    cands[0].click();
+    return true;
+  };
   let refreshed = false;
-  if (/二维码已失效|二维码过期|已失效|点击刷新|重新加载/.test(bodyText())) {
-    const btn = [...document.querySelectorAll('div,span,button,a')]
-      .find((el) => /点击刷新|刷新二维码|重新加载/.test((el.textContent || '').trim()));
-    if (btn) { btn.click(); refreshed = true; await sleep(2000); }
+  if (EXPIRED_RE.test(bodyText())) {
+    if (clickRefresh()) {
+      refreshed = true;
+      await sleep(2500);
+    }
   }
+  const stillExpired = EXPIRED_RE.test(bodyText());
   const isQrBox = (el) => {
     const r = el.getBoundingClientRect();
     return r.width >= 110 && r.width <= 460
@@ -861,13 +897,15 @@ const EXTRACT_QR_JS: &str = r#"(async () => {
     const near = el.parentElement ? (el.parentElement.innerText || '') : '';
     if (/扫码登录|手机号登录|登录/.test(near)) s += 30;
     if (/下载.*APP|下载客户端|扫码下载/i.test(near)) s -= 120;
+    // 过期占位图：所在容器里会出现"二维码已过期 / 点击刷新" → 强烈排除
+    if (EXPIRED_RE.test(near)) s -= 200;
     return s;
   };
   // 2) canvas 直接导出
   for (const c of [...document.querySelectorAll('canvas')].filter(isQrBox)) {
     try {
       const d = c.toDataURL('image/png');
-      if (d && d.length > 2000) return { dataUrl: d, kind: 'canvas', refreshed };
+      if (d && d.length > 2000) return { dataUrl: d, kind: 'canvas', refreshed, expired: stillExpired };
     } catch (e) {}
   }
   // 3) img：data URL 直接用；普通 URL 带 cookie 取回转 base64
@@ -877,7 +915,7 @@ const EXTRACT_QR_JS: &str = r#"(async () => {
     const src = img.currentSrc || img.src || '';
     if (!src) continue;
     if (src.startsWith('data:image')) {
-      if (src.length > 2000) return { dataUrl: src, kind: 'img-data', refreshed };
+      if (src.length > 2000) return { dataUrl: src, kind: 'img-data', refreshed, expired: stillExpired };
       continue;
     }
     try {
@@ -889,7 +927,7 @@ const EXTRACT_QR_JS: &str = r#"(async () => {
         fr.onerror = () => res(null);
         fr.readAsDataURL(blob);
       });
-      if (d && d.length > 2000) return { dataUrl: d, kind: 'img-fetch', refreshed };
+      if (d && d.length > 2000) return { dataUrl: d, kind: 'img-fetch', refreshed, expired: stillExpired };
     } catch (e) {}
   }
   const text = bodyText();
@@ -897,7 +935,7 @@ const EXTRACT_QR_JS: &str = r#"(async () => {
     dataUrl: null,
     kind: 'none',
     refreshed,
-    expired: /二维码已失效|二维码过期|已失效/.test(text),
+    expired: stillExpired || EXPIRED_RE.test(text),
     snippet: text.replace(/\s+/g, ' ').slice(0, 240),
   };
 })()"#;
@@ -913,7 +951,22 @@ pub struct QrCapture {
 
 pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrCapture, String> {
     let client = CdpClient::connect(ws_url).await?;
-    let target_id = client.create_target("about:blank").await?;
+    // 复用同一个登录页标签：每次新建的话，服务器 Chrome 会堆一排 /login 标签，
+    // 用户看着很乱，而且旧标签的二维码早就过期了。
+    let target_id = {
+        let mut tabs = PROBE_TABS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match tabs.get(spec.login_url).cloned() {
+            Some(existing) => existing,
+            None => {
+                let created = client.create_target("about:blank").await?;
+                tabs.insert(spec.login_url.to_string(), created.clone());
+                created
+            }
+        }
+    };
     let session_id = client.attach_to_target(&target_id).await?;
     let _ = client
         .send_request(
@@ -1045,6 +1098,14 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
         .and_then(Value::as_str)
         .map(|value| value.to_string());
 
+    // 提取到的若是**过期占位图**（小红书把"二维码已过期 点击刷新"画成一张图），
+    // 绝不能返回给用户 —— 他扫了只会再看到"已过期"，还以为是自己手慢。
+    // 此时明确报错，让前端提示"二维码已过期，请重试"。
+    if expired {
+        client.close().await;
+        return Err("二维码已过期，请重试（点「刷新二维码」重新获取）".to_string());
+    }
+
     // 兜底：DOM 取不到就退回"找元素 + 截图裁剪"。
     // 注意：**没有找到元素就不要截图** —— 整页截图会得到一张白图（用户扫不了，
     // 还以为是"二维码过期"）。此时直接报错并带上诊断信息。
@@ -1119,9 +1180,50 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
         return Ok(matched);
     }
 
-    // 小红书：必须看页面状态。
-    let target_id = client.create_target(spec.home_url).await?;
+    // 小红书：游客也会拿到 web_session，只能看页面状态。
+    //
+    // 但**不要每次都开一个标签页**：扫码页轮询是 5 秒一次，每次都开小红书首页再关掉，
+    // 服务器上会看到"窗口反复跳出小红书主页然后关闭"，还会打断正在等待扫码的登录页。
+    // 做法：先用 cookie 签名判断会话有没有变；没变就直接用上次的结果，**完全不动浏览器**。
+    let signature = cookie_signature(&client, platform).await;
+    {
+        let cache = LOGIN_STATE_CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((cached_signature, cached_result)) = cache.get(platform) {
+            if *cached_signature == signature {
+                client.close().await;
+                return Ok(*cached_result);
+            }
+        }
+    }
+
+    // 会话变了（扫码成功/被登出）→ 才去看页面。
+    // 复用同一个探针标签页，不再每次新建+关闭。
+    let target_id = {
+        let mut tabs = PROBE_TABS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match tabs.get(platform).cloned() {
+            Some(existing) => existing,
+            None => {
+                let created = client.create_target(spec.home_url).await?;
+                tabs.insert(platform.to_string(), created.clone());
+                created
+            }
+        }
+    };
     let session_id = client.attach_to_target(&target_id).await?;
+    // 每次检查都重新导航一次，保证 SSR 状态是最新的（登录后需要重载才看得到）
+    let _ = client
+        .send_request(
+            "Page.navigate",
+            Some(json!({ "url": spec.home_url })),
+            Some(&session_id),
+        )
+        .await;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -1166,15 +1268,46 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
 
-    let _ = client
-        .send_request(
-            "Target.closeTarget",
-            Some(json!({ "targetId": target_id })),
-            None,
-        )
-        .await;
+    {
+        let mut cache = LOGIN_STATE_CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(platform.to_string(), (signature, logged));
+    }
+
     client.close().await;
     Ok(logged)
+}
+
+/// 该平台 cookie 的指纹（只看该域名的 cookie 名+值）。
+///
+/// 用于判断"会话有没有变"：变了才需要重新加载页面看登录态。
+async fn cookie_signature(client: &CdpClient, platform: &str) -> String {
+    let Ok(result) = client.send_request("Storage.getCookies", None, None).await else {
+        return String::new();
+    };
+    let domain = platform_domain(platform);
+    let mut parts: Vec<String> = result
+        .get("cookies")
+        .and_then(Value::as_array)
+        .map(|cookies| {
+            cookies
+                .iter()
+                .filter_map(|cookie| {
+                    let cookie_domain = cookie.get("domain").and_then(Value::as_str)?;
+                    if !cookie_domain.contains(domain) {
+                        return None;
+                    }
+                    let name = cookie.get("name").and_then(Value::as_str)?;
+                    let value = cookie.get("value").and_then(Value::as_str)?;
+                    Some(format!("{name}={value}"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    parts.sort();
+    parts.join("|")
 }
 
 /// 该平台是否存在登录态 cookie。
