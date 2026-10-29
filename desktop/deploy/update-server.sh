@@ -115,7 +115,10 @@ setup_sccache() {
   export RUSTC_WRAPPER="$bin"
   export SCCACHE_DIR="${SCCACHE_DIR:-$HOME/.cache/sccache}"
   mkdir -p "$SCCACHE_DIR" 2>/dev/null || true
-  log "sccache：$bin（缓存目录 $SCCACHE_DIR）"
+  # 路径单独一行、用 ASCII 标签输出：全角括号里夹变量在部分终端/编码下会显示成 ??
+  log "sccache 已启用"
+  printf '        bin   = %s\n' "$bin"
+  printf '        cache = %s\n' "$SCCACHE_DIR"
 }
 
 show_status() {
