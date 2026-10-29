@@ -534,6 +534,10 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [historyBusyId, setHistoryBusyId] = useState<string | null>(null);
   /** 补历史实时进度：watchId -> { scanned, total }，驱动「已抓 X / 共 Y」进度条。 */
   const [backfillProgress, setBackfillProgress] = useState<Record<string, { scanned: number; total: number; phase?: string }>>({});
+  /** 上次补历史的诊断（常驻显示，不靠一闪而过的 toast）：
+   *  后端已经能算出「页面没有发生滚动 / 滚动后没有加载出更多内容（停在 N 条）」，
+   *  但只弹 toast 会让人完全错过 —— 「只抓到 3 条」这类问题必须看得见。 */
+  const [backfillDiag, setBackfillDiag] = useState<Record<string, { hint: string; scanned: number; detail?: string }>>({});
   const [adhocUrl, setAdhocUrl] = useState('');
   const [fetchNote, setFetchNote] = useState<string | null>(null);
   const [toast, setToast] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
@@ -985,6 +989,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
         detailSkipped?: number;
         skipNote?: string | null;
         pendingVideos?: number;
+        notLoggedIn?: number;
         hint?: string | null;
         failed?: number;
       };
@@ -1014,9 +1019,39 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       if ((result?.pendingVideos ?? 0) > 0) {
         showToast('ok', `已开始后台处理 ${result?.pendingVideos} 个历史视频（下载+转写），完成后列表自动刷新`);
       }
+      if ((result?.notLoggedIn ?? 0) > 0) {
+        showToast(
+          'err',
+          `服务器未登录该平台（${result?.notLoggedIn} 位博主）：游客视角只能拿到首屏几条，请先扫码登录再补历史`,
+        );
+      }
       if (result?.hint) {
         showToast('err', result.hint);
       }
+      // 诊断常驻：toast 2.6 秒就没了，而"只抓到 N 条"这类问题需要事后还能看到
+      const diagDetail = (() => {
+        const diags = (result as { scrollDiags?: { name?: string; diag?: Record<string, unknown> }[] })?.scrollDiags;
+        const first = diags?.[0]?.diag;
+        if (!first) return undefined;
+        const scroller = typeof first.scroller === 'string' ? first.scroller : '';
+        const scrolled = first.scrolled === true;
+        const loggedIn = first.loggedIn !== false;
+        const counts = Array.isArray(first.counts) ? (first.counts as number[]) : [];
+        return [
+          loggedIn ? '已登录' : '未登录',
+          scrolled ? '发生了滚动' : '页面没有发生滚动',
+          scroller ? `容器 ${scroller}` : '',
+          counts.length ? `每轮条数 ${counts.slice(0, 6).join('→')}` : '',
+        ].filter(Boolean).join(' · ');
+      })();
+      setBackfillDiag((prev) => ({
+        ...prev,
+        [watchId]: {
+          hint: result?.hint || '滚动加载正常，未发现异常',
+          scanned,
+          detail: diagDetail,
+        },
+      }));
     } catch (e) {
       console.error('backfill history failed:', e);
       showToast('err', e instanceof Error ? e.message : '补历史失败');
@@ -1843,6 +1878,13 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                     <History className="w-3.5 h-3.5" />
                   )}
                 </button>
+                {/* 上次补历史的诊断（常驻）：只抓到 N 条时能直接看出是"没滚动"还是"滚不动"。 */}
+                {backfillDiag[watch.id] && (
+                  <div className="mt-1 text-[10px] leading-relaxed text-amber-700/90 dark:text-amber-500/90">
+                    补历史诊断：{backfillDiag[watch.id].hint}
+                    {backfillDiag[watch.id].detail ? `（${backfillDiag[watch.id].detail}）` : ''}
+                  </div>
+                )}
                 <div className="flex items-center gap-1 mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
                   <button
                     onClick={() => {

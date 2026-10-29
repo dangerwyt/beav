@@ -4284,6 +4284,8 @@ struct MonitorFetchStats {
     pending_videos: i64,
     /// 因已有「已补历史」标记而被跳过的博主数
     already_backfilled: i64,
+    /// 服务器该平台未登录而跳过的博主数（游客视角只能拿到首屏）
+    not_logged_in: i64,
     /// 触到深翻上限（BACKFILL_MAX=500）、历史可能还有更多的博主数
     limit_reached: i64,
 }
@@ -4836,12 +4838,55 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
     let mut scroll_diags: Vec<(String, Value)> = Vec::new();
 
     for watch in &watches {
+        // 该平台本次的登录态（写进滚动诊断，便于一次判断「未登录」还是「页面不给更多」）
+        let mut login_state: Option<bool> = None;
         // 已补过且不是强制 → 跳过（避免每晚重复深翻）
         if !force && history_backfill_valid(watch.history_backfilled_at.as_deref()) {
             stats.already_backfilled += 1;
             continue;
         }
         stats.watched += 1;
+
+        // 前置检查：服务器该平台未登录时，深翻只能拿到**游客视角的首屏**（通常 3-5 条），
+        // 表现和"翻页坏了"一模一样。账号被顶掉/cookie 过期都会走到这里，
+        // 所以先说清楚，别让人误判成抓取 bug。
+        if let Some(platform) = crate::platform::Platform::parse(&watch.platform) {
+            let platform_key = platform.as_str();
+            let port = headless_browser::active_chrome_port(platform_key);
+            let logged_in = if port == 0 {
+                false
+            } else {
+                match tauri::async_runtime::block_on(headless_browser::ws_url_for_port(port)) {
+                    Ok(ws_url) => tauri::async_runtime::block_on(
+                        headless_browser::login_logged_in(&ws_url, platform_key),
+                    )
+                    .unwrap_or(false),
+                    Err(_) => false,
+                }
+            };
+            if !logged_in {
+                stats.not_logged_in += 1;
+                login_state = Some(false);
+                let note = format!(
+                    "服务器未登录{}，只拿到游客视角的首屏；请先扫码登录平台账号再补历史",
+                    platform.label()
+                );
+                if stats.skip_note.is_none() {
+                    stats.skip_note = Some(note.clone());
+                }
+                crate::logging::emit_legacy_line(
+                    crate::logging::event::LogSource::Host,
+                    crate::logging::event::LogLevel::Warn,
+                    "monitor",
+                    "monitor.history.not_logged_in",
+                    format!("[monitor history] {}: {}", watch.name, note),
+                    json!({ "watchId": watch.id, "platform": platform_key }),
+                    None,
+                );
+                continue;
+            }
+            login_state = Some(true);
+        }
 
         // 深翻：limit 拉满，滚动加载直到翻不动
         let result = match fetch_monitor(
@@ -4875,7 +4920,25 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
             .unwrap_or(false);
         // 滚动诊断：告诉用户「为什么只翻到 N 条」（首屏就停 / 滚错容器 / 页面不给更多）
         if let Some(diag) = result.get("scrollDiag").filter(|value| !value.is_null()) {
+            // 带上登录态：游客视角只能拿到首屏几条，有登录态还停在几条 = 页面不给更多
+            let mut diag = diag.clone();
+            if let Some(obj) = diag.as_object_mut() {
+                obj.insert(
+                    "loggedIn".to_string(),
+                    json!(login_state.unwrap_or(false)),
+                );
+            }
             scroll_diags.push((watch.name.clone(), diag.clone()));
+            // 落日志：桌面端补历史时也能直接 grep 到，不用靠界面
+            crate::logging::emit_legacy_line(
+                crate::logging::event::LogSource::Host,
+                crate::logging::event::LogLevel::Warn,
+                "monitor",
+                "monitor.history.scroll_diag",
+                format!("[monitor history] {} scroll diag: {}", watch.name, diag),
+                json!({ "watchId": watch.id, "diag": diag }),
+                None,
+            );
         }
         scanned_total += scanned;
         // 主页声明的作品总数（进度条分母）：取各博主中的最大值
@@ -5067,6 +5130,8 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
         "backfilled": stats.backfilled,
         // 因已有标记被跳过的博主数（手动 force 时恒为 0）
         "alreadyBackfilled": stats.already_backfilled,
+        // 服务器未登录平台而跳过的博主数（游客视角只能拿到首屏）
+        "notLoggedIn": stats.not_logged_in,
         // 触到 200 上限（历史可能还有更多）的博主数
         "limitReached": stats.limit_reached,
         // 滚动诊断明细（每个博主：滚了多少轮 / 每轮锚点数 / 实际滚动的容器）
