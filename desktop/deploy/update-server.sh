@@ -57,6 +57,22 @@ http_code() {
   [ -n "$out" ] && echo "$out" || echo "000"
 }
 
+# 文件最后修改时间（unix 秒）；不存在返回 0
+# GNU stat 用 -c %Y，BSD(macOS) 用 -f %m —— 两者语法不同且**都会成功返回**，
+# 所以不能靠退出码判断，必须校验输出是不是纯数字。
+file_mtime() {
+  if [ ! -e "$1" ]; then echo 0; return; fi
+  local ts
+  ts="$(stat -c %Y "$1" 2>/dev/null || true)"
+  case "$ts" in
+    ''|*[!0-9]*) ts="$(stat -f %m "$1" 2>/dev/null || true)" ;;
+  esac
+  case "$ts" in
+    ''|*[!0-9]*) echo 0 ;;
+    *) echo "$ts" ;;
+  esac
+}
+
 show_status() {
   log "仓库：$REPO_DIR"
   printf '  git HEAD : %s\n' "$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo '?')"
@@ -93,45 +109,83 @@ fi
 AFTER_HEAD="$(git rev-parse HEAD 2>/dev/null || true)"
 AFTER_HEAD="${AFTER_HEAD:-}"
 if [ -z "$AFTER_HEAD" ] || [ -z "$BEFORE_HEAD" ]; then
-  warn "无法解析 git HEAD，按全量重建处理"
-  CHANGED="desktop/src-tauri/
-desktop/src/"
+  warn "无法解析 git HEAD（构建判断改用产物时间戳，不受影响）"
 elif [ "$BEFORE_HEAD" = "$AFTER_HEAD" ]; then
-  log "代码无变化（HEAD=$AFTER_HEAD）"
-  CHANGED=""
+  log "代码无新提交（HEAD=${AFTER_HEAD:0:8}）"
 else
   log "已更新到 ${AFTER_HEAD:0:8}"
   git log --oneline "${BEFORE_HEAD}..${AFTER_HEAD}" 2>/dev/null | sed 's/^/    /'
-  CHANGED="$(git diff --name-only "${BEFORE_HEAD}" "${AFTER_HEAD}" 2>/dev/null || true)"
 fi
 
 # ---------- 2. 依赖 ----------
-if [ -n "$(git diff --name-only "${BEFORE_HEAD:-HEAD}" "${AFTER_HEAD:-HEAD}" -- desktop/package.json desktop/pnpm-lock.yaml 2>/dev/null || true)" ]; then
+# 同样不用 pull 区间（用户可能已手动 pull）：直接看 package.json / lock 是否比 node_modules 新
+pkg_ts="$(file_mtime "$DESKTOP_DIR/package.json")"
+lock_ts="$(file_mtime "$DESKTOP_DIR/pnpm-lock.yaml")"
+mods_ts="$(file_mtime "$DESKTOP_DIR/node_modules")"
+if [ "$mods_ts" -eq 0 ] || [ "$pkg_ts" -gt "$mods_ts" ] || [ "$lock_ts" -gt "$mods_ts" ]; then
   log "依赖有变化，安装中…"
   (cd "$DESKTOP_DIR" && pnpm install --frozen-lockfile) || die "pnpm install 失败"
 else
-  log "依赖未变化，跳过 pnpm install"
+  log "依赖已是最新，跳过 pnpm install"
 fi
 
-# ---------- 3. 构建 ----------
+# ---------- 3. 构建（按"产物时间 vs 最后一次相关提交"判断，而不是 pull 区间） ----------
+#
+# 为什么不用 pull 区间：如果用户已经手动 git pull 过，区间就是空的 → 会误判"无变化"
+# → 跳过构建 → 新功能根本没编译进去。这里改成对比**产物**与**最后一次相关提交**。
+RUST_PATHS="desktop/src-tauri"
+WEB_PATHS="desktop/src desktop/vite.config.ts desktop/index.html"
+RUST_BIN="$DESKTOP_DIR/src-tauri/target/release/beav"
+WEB_OUT="$DESKTOP_DIR/dist/index.html"
+STAMP_DIR="$HOME/.beav-deploy"
+mkdir -p "$STAMP_DIR"
+
+# 某路径最后一次被改动的提交时间（unix 秒）
+last_commit_ts() {
+  git log -1 --format=%ct -- "$@" 2>/dev/null | head -1
+}
+
+# 产物是否落后于源码：stamp 记录上次构建时的 commit，不一致就重建
+needs_build() {
+  local stamp_file="$1" artifact="$2" src_path="$3"
+  local head_commit last_ts artifact_ts
+  head_commit="$(git rev-list -1 HEAD -- "$src_path" 2>/dev/null | head -1)"
+  [ -z "$head_commit" ] && return 1
+  if [ -f "$stamp_file" ] && [ "$(cat "$stamp_file" 2>/dev/null)" = "$head_commit" ]; then
+    return 1
+  fi
+  # 没有 stamp（首次使用脚本）→ 退化为比较文件时间
+  last_ts="$(last_commit_ts "$src_path")"
+  artifact_ts="$(file_mtime "$artifact")"
+  if [ -z "$last_ts" ] || [ "$last_ts" -eq 0 ]; then return 1; fi
+  [ "$artifact_ts" -lt "$last_ts" ]
+}
+
+need_rust=0
+need_web=0
+needs_build "$STAMP_DIR/rust.commit" "$RUST_BIN" "$RUST_PATHS" && need_rust=1
+needs_build "$STAMP_DIR/web.commit" "$WEB_OUT" "$WEB_PATHS" && need_web=1
+
 if [ "$SKIP_RUST" = "1" ]; then
-  log "跳过 Rust 构建"
-elif echo "$CHANGED" | grep -q '^desktop/src-tauri/'; then
-  log "Rust 源码有变化 → cargo build --release（首次全量较慢，请耐心）…"
+  log "跳过 Rust 构建（--skip-rust）"
+elif [ "$need_rust" = "1" ]; then
+  log "Rust 产物落后于源码 → cargo build --release（首次全量较慢，请耐心）…"
   (cd "$DESKTOP_DIR/src-tauri" && cargo build --release) || die "cargo build 失败"
-  log "Rust 构建完成：$DESKTOP_DIR/src-tauri/target/release/beav"
+  git rev-list -1 HEAD -- "$RUST_PATHS" 2>/dev/null | head -1 > "$STAMP_DIR/rust.commit"
+  log "Rust 构建完成：$RUST_BIN"
 else
-  log "Rust 源码未变化，跳过构建"
+  log "Rust 产物已是最新，跳过构建"
 fi
 
 if [ "$SKIP_WEB" = "1" ]; then
-  log "跳过前端构建"
-elif echo "$CHANGED" | grep -qE '^desktop/src/|^desktop/src-tauri/tauri.conf.json|^desktop/vite'; then
-  log "前端有变化 → vite build…"
+  log "跳过前端构建（--skip-web）"
+elif [ "$need_web" = "1" ]; then
+  log "前端产物落后于源码 → vite build…"
   (cd "$DESKTOP_DIR" && pnpm web:build) || die "vite build 失败"
-  log "前端构建完成：$DESKTOP_DIR/dist"
+  git rev-list -1 HEAD -- $WEB_PATHS 2>/dev/null | head -1 > "$STAMP_DIR/web.commit"
+  log "前端构建完成：$WEB_OUT"
 else
-  log "前端未变化，跳过构建（dist 保持原样）"
+  log "前端产物已是最新，跳过构建"
 fi
 
 # ---------- 4. 重启 ----------
