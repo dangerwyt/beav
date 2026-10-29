@@ -73,6 +73,21 @@ BEAV_SINGLE_DAEMON=1 pnpm web:instances            # 8090
 - 旧数据 `owner` 为空 → 归 admin；新数据写入当前用户；
 - **已知限制**：图片/视频/导出仍共用一个工作区，未按 owner 分目录（适合 2–3 个可信用户）。
 
+### 一键更新（服务器）
+
+```bash
+cd ~/beav/desktop
+bash deploy/update-server.sh              # 拉取 → 按需重建 → 重启 → 健康检查
+bash deploy/update-server.sh --status     # 只看当前状态
+bash deploy/update-server.sh --skip-rust  # 跳过 Rust 重建
+bash deploy/update-server.sh --skip-web   # 跳过前端构建
+bash deploy/update-server.sh --no-restart # 只构建不重启
+```
+
+- 增量判断：只有 `desktop/src-tauri/` 变了才 `cargo build --release`；只有前端变了才 `vite build`；
+- 构建走 `cargo build --release`（服务器不需要 dmg，不跑 `tauri build`）；
+- 健康检查：`31937/api/ipc/health` 与 `8090/login` 都 200 才算成功，失败自动打印日志尾部。
+
 ### macOS 常驻（launchd，开机/登录自启）
 
 ```bash
