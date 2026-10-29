@@ -591,6 +591,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
    *  与「Chrome 已就绪」是两回事 —— Chrome 起着但平台没登录时，
    *  抓取只会拿到游客视角的首屏几条（这是「只抓到 3-6 条」的根因）。 */
   const [platformLoginState, setPlatformLoginState] = useState<boolean | null>(null);
+  /** 登录诊断原始证据（点了「诊断」才取，避免频繁打扰页面） */
+  const [loginDebug, setLoginDebug] = useState<string | null>(null);
 
   // 轮询平台登录态（10s 一次；后端有 cookie 指纹缓存，不会频繁动浏览器）
   const checkPlatformLogin = useCallback(async (refresh = false) => {
@@ -1733,6 +1735,42 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                     桌面端 → 对标监控 → 登录管理 → <b>打开 Chrome 登录</b>
                     <br />
                     登录完成后点上面「检测登录状态」即可（web 端无需扫码）。
+                    <button
+                      onClick={() => {
+                        void (async () => {
+                          try {
+                            const result = await window.ipcRenderer.monitor.chromeLoginDebug(chromeLoginPlatform);
+                            setLoginDebug(JSON.stringify(result, null, 2));
+                          } catch (e) {
+                            setLoginDebug(`诊断失败：${String(e)}`);
+                          }
+                        })();
+                      }}
+                      className="mt-1.5 underline decoration-dotted hover:text-amber-900"
+                    >
+                      查看登录诊断
+                    </button>
+                  </div>
+                )}
+                {loginDebug && (
+                  <div className="rounded-md border border-border bg-surface-secondary/60 px-2 py-1.5">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-[10px] text-text-tertiary">登录诊断（可复制发我）</span>
+                      <button
+                        onClick={() => {
+                          void navigator.clipboard.writeText(loginDebug).then(
+                            () => showToast('ok', '诊断已复制'),
+                            () => showToast('err', '复制失败'),
+                          );
+                        }}
+                        className="text-[10px] text-accent-primary hover:underline"
+                      >
+                        复制
+                      </button>
+                    </div>
+                    <pre className="text-[10px] leading-relaxed text-text-secondary whitespace-pre-wrap break-all max-h-48 overflow-auto">
+                      {loginDebug}
+                    </pre>
                   </div>
                 )}
                 {platformLoginState === true && (

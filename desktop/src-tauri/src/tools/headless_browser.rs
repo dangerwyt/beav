@@ -60,7 +60,13 @@ fn platform_tabs() -> &'static Mutex<HashMap<String, String>> {
 ///
 /// 小红书登录成功后 `web_session` 的值会变（绑定到账号），以此判断"扫码是否完成"，
 /// 避免用"页面有没有登录按钮"这种在登录页必然误判的启发式。
-static SESSION_BASELINE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static SESSION_BASELINE: OnceLock<Mutex<HashMap<String, (String, std::time::Instant)>>> =
+    OnceLock::new();
+
+/// 扫码窗口：只有在这个时间窗内才走"基线未变=未登录"的短路。
+/// 超过窗口（用户其实是在服务器上手动登录的）就必须做真实检查，
+/// 否则手动登录永远检测不到。
+const SCAN_WINDOW: Duration = Duration::from_secs(180);
 
 /// 登录态缓存（platform → (cookie 值, 结果, 检测时刻)）。
 ///
@@ -1217,7 +1223,10 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        map.insert(spec.platform_key.to_string(), baseline);
+        map.insert(
+            spec.platform_key.to_string(),
+            (baseline, std::time::Instant::now()),
+        );
     }
 
     // 平台特有的前置操作（抖音要点「登录」弹窗）
@@ -1394,6 +1403,102 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
     })
 }
 
+/// 采集登录态诊断证据（**只回 cookie 名称，不回值**，避免泄露会话）。
+///
+/// 用于定位"明明登录了却检测不通过"：把页面真实状态（URL / 标题 / 是否还有登录按钮 /
+/// 是否有风控验证弹窗 / INITIAL_STATE.user 的关键字段）一次性取出来，不用靠猜。
+pub async fn login_debug(ws_url: &str, platform: &str) -> Result<Value, String> {
+    let spec = qr_platform_spec(platform).ok_or_else(|| format!("不支持的平台：{platform}"))?;
+    let client = CdpClient::connect(ws_url).await?;
+
+    const DEBUG_JS: &str = r#"(() => {
+        const text = (document.body && document.body.innerText) || '';
+        const visible = (el) => {
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && r.width < 160;
+        };
+        const loginButtons = [...document.querySelectorAll('button,a,span,div')].filter((el) => {
+            const t = (el.textContent || '').trim();
+            if (t !== '登录' && t !== '登录/注册') return false;
+            if (!visible(el)) return false;
+            return ![...el.children].some((c) => {
+                const ct = (c.textContent || '').trim();
+                return ct === '登录' || ct === '登录/注册';
+            });
+        });
+        let userState = null;
+        try {
+            const s = window.__INITIAL_STATE__;
+            const u = s && s.user;
+            if (u) {
+                userState = {
+                    keys: Object.keys(u).slice(0, 20),
+                    loggedIn: typeof u.loggedIn === 'boolean' ? u.loggedIn : null,
+                    hasUserInfo: !!(u.userInfo && (u.userInfo.userId || u.userInfo.nickname)),
+                    nickname: u.userInfo && u.userInfo.nickname ? String(u.userInfo.nickname).slice(0, 24) : null,
+                };
+            }
+        } catch (e) {}
+        return {
+            url: location.href,
+            title: document.title,
+            loginButtonCount: loginButtons.length,
+            cookieHasSession: (document.cookie || '').includes('web_session='),
+            hasVerifyModal: /请通过验证|扫码验证身份|为保护账号安全/.test(text),
+            hasPhoneLogin: /手机号登录|获取验证码/.test(text),
+            textSnippet: text.replace(/\s+/g, ' ').slice(0, 160),
+            userState,
+        };
+    })()"#;
+
+    let target_id = platform_tab(&client, spec.platform_key, spec.home_url, true).await?;
+    let session_id = client.attach_to_target(&target_id).await?;
+    let _ = client
+        .send_request(
+            "Page.navigate",
+            Some(json!({ "url": spec.home_url })),
+            Some(&session_id),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let evidence = client.evaluate(&session_id, DEBUG_JS, false).await.ok();
+
+    // 只取 cookie 名字 + 关键会话 cookie 的长度，不泄露值
+    let cookie_names = client
+        .send_request("Storage.getCookies", None, None)
+        .await
+        .ok()
+        .and_then(|value| value.get("cookies").and_then(Value::as_array).cloned())
+        .map(|cookies| {
+            let domain = platform_domain(platform);
+            let mut names: Vec<String> = cookies
+                .iter()
+                .filter_map(|cookie| {
+                    let d = cookie.get("domain").and_then(Value::as_str)?;
+                    if !d.contains(domain) {
+                        return None;
+                    }
+                    cookie.get("name").and_then(Value::as_str).map(str::to_string)
+                })
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        })
+        .unwrap_or_default();
+    let session_len = login_cookie_value(&client, spec.cookie_name, platform)
+        .await
+        .len();
+
+    client.close().await;
+    Ok(json!({
+        "platform": platform,
+        "evidence": evidence,
+        "cookieNames": cookie_names,
+        "sessionCookieLength": session_len,
+    }))
+}
+
 /// 检查某平台是否**真实登录**。
 ///
 /// 各平台判定方式不同：
@@ -1426,13 +1531,20 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(platform)
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or_else(|| (String::new(), std::time::Instant::now()));
+    let (baseline_value, baseline_at) = baseline;
 
-    if !baseline.is_empty() && current == baseline {
+    // 只有**扫码窗口内**才走"基线没变 = 未登录"的短路：
+    // 窗口外（比如用户是在服务器上手动登录的，根本没有扫码基线）必须做真实检查，
+    // 否则手动登录永远检测不到 —— 这正是用户遇到的情况。
+    if !baseline_value.is_empty()
+        && current == baseline_value
+        && baseline_at.elapsed() < SCAN_WINDOW
+    {
         client.close().await;
         return Ok(false);
     }
-    // 会话变了（或还没有基线）→ 到主页做真实判定
+    // 会话变了 / 没有基线 / 已过扫码窗口 → 到主页做真实判定
     {
         let cache = LOGIN_STATE_CACHE
             .get_or_init(Default::default)

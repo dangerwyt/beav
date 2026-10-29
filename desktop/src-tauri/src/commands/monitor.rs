@@ -158,6 +158,7 @@ pub fn handle_monitor_channel(
             "monitor:chrome-test" => chrome_test(app, payload),
             "monitor:chrome-qr-start" => chrome_qr_start(app, payload),
             "monitor:chrome-qr-status" => chrome_qr_status(app, payload),
+            "monitor:chrome-login-debug" => chrome_login_debug(app, payload),
             "monitor:chrome-shutdown" => chrome_shutdown(),
             "monitor:clear" => clear_data(state),
             "monitor:post-remove" => post_remove(state, payload),
@@ -304,6 +305,20 @@ fn chrome_qr_status(_app: &AppHandle, payload: &Value) -> Result<Value, String> 
     let logged_in =
         tauri::async_runtime::block_on(headless_browser::login_logged_in(&ws_url, platform))?;
     Ok(json!({ "success": true, "loggedIn": logged_in }))
+}
+
+/// 登录态诊断：把服务器 Chrome 里该平台页面的真实状态取回来（只回 cookie 名，不回值）。
+fn chrome_login_debug(_app: &AppHandle, payload: &Value) -> Result<Value, String> {
+    let platform = payload
+        .get("platform")
+        .and_then(Value::as_str)
+        .unwrap_or("xiaohongshu");
+    let port = headless_browser::active_chrome_port(platform);
+    if port == 0 {
+        return Err("Chrome 未启动".to_string());
+    }
+    let ws_url = tauri::async_runtime::block_on(headless_browser::ws_url_for_port(port))?;
+    tauri::async_runtime::block_on(headless_browser::login_debug(&ws_url, platform))
 }
 
 fn chrome_launch(app: &AppHandle, payload: &Value) -> Result<Value, String> {
