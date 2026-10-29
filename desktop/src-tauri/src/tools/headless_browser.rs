@@ -366,7 +366,7 @@ pub fn ready_platforms() -> Vec<String> {
     let sessions = CHROME_SESSIONS.get_or_init(Default::default).lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     sessions
         .iter()
-        .filter(|(platform, session)| session.port != 0 && debug_port_alive(session.port))
+        .filter(|(_, session)| session.port != 0 && debug_port_alive(session.port))
         .map(|(platform, _)| platform.clone())
         .collect()
 }

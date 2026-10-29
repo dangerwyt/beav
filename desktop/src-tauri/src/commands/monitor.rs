@@ -3420,7 +3420,8 @@ fn first_date_in(text: &str) -> Option<String> {
             // YYYYMMDD
             if i + 8 <= n && chars[i..i + 8].iter().all(|c| c.is_ascii_digit()) {
                 let s: String = chars[i..i + 8].iter().copied().collect();
-                if let (Ok(y), Ok(m), Ok(d)) = (
+                // 年份只做格式校验（月份/日期才有取值范围）
+                if let (Ok(_y), Ok(m), Ok(d)) = (
                     s[0..4].parse::<u32>(),
                     s[4..6].parse::<u32>(),
                     s[6..8].parse::<u32>(),

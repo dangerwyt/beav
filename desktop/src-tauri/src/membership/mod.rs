@@ -1,3 +1,12 @@
+//! 会员权益（付费墙）判定。
+//!
+//! 当前状态：**整个模块在应用内没有调用点** —— 付费墙被临时放开
+//! （见 `commands/spaces.rs` 的 `[PAYWALL-BYPASS]` 注释），权益判定不再被执行。
+//! 代码保留是为了后续恢复付费墙时不丢逻辑，故整块显式允许 dead_code，
+//! 避免每次编译刷 21 条告警淹没真正的告警。
+
+#![allow(dead_code)]
+
 use serde_json::Value;
 use std::collections::BTreeMap;
 use tauri::State;

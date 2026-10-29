@@ -2,7 +2,7 @@ use crate::cli_runtime::CliVerifyRule;
 use crate::command_execution::{run_app_managed_argv, AppManagedArgvRequest};
 use crate::desktop_io::{
     is_service_unavailable_error, resolve_transcription_settings,
-    run_curl_transcription_request, run_curl_transcription_with_parse_format,
+    run_curl_transcription_with_parse_format,
 };
 use crate::store::settings as settings_store;
 use crate::{ffmpeg_program, make_id, now_ms, payload_string, workspace_root, AppState};
@@ -14,9 +14,9 @@ use tauri::{AppHandle, State};
 const OFFICIAL_AGENT_SRT_TRANSCRIPTION_MODEL: &str = "fun-asr";
 
 #[path = "media_transcribe/subtitles.rs"]
-mod subtitles;
+pub(crate) mod subtitles;
 
-use subtitles::{render_estimated_subtitles, render_subtitles_from_words, wav_duration_seconds};
+use subtitles::{render_estimated_subtitles, wav_duration_seconds};
 
 fn resolve_media_transcribe_path(
     state: &State<'_, AppState>,
@@ -234,54 +234,6 @@ fn transcribe_with_subtitle_fallback(
         Err(error) => errors.push(format!("text: {error}")),
     }
     Err(format!("无法生成字幕：{}", errors.join("；")))
-}
-
-/// ElevenLabs `POST /v1/speech-to-text` 的专用调用链。
-///
-/// 响应形如 `{ language_code, language_probability, text, words: [{ text, start, end, type }] }`：
-/// 优先用 `words` 的真实时间戳渲染字幕（与画面精确对齐），拿不到才回退到按字数估算。
-/// 注意这条路径**不能**传 OpenAI 的 `response_format` 参数（会 422），认证走 `xi-api-key`。
-fn transcribe_via_elevenlabs(
-    endpoint: &str,
-    api_key: Option<&str>,
-    model_name: &str,
-    audio_path: &Path,
-    response_format: &'static str,
-) -> Result<(String, &'static str), String> {
-    let raw = run_curl_transcription_request(
-        endpoint,
-        api_key,
-        model_name,
-        audio_path,
-        "audio/wav",
-        None,
-    )?;
-    let value: Value = serde_json::from_str(raw.trim()).map_err(|error| {
-        format!(
-            "ElevenLabs 响应不是合法 JSON：{error}（原文前 200 字：{}）",
-            raw.chars().take(200).collect::<String>()
-        )
-    })?;
-    let text = value
-        .get("text")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("")
-        .to_string();
-    if text.is_empty() {
-        return Err(format!(
-            "ElevenLabs 未返回转写文本（响应前 300 字：{}）",
-            raw.chars().take(300).collect::<String>()
-        ));
-    }
-    if let Some(words) = value.get("words").and_then(Value::as_array) {
-        if let Some(subtitles) = render_subtitles_from_words(words, response_format) {
-            return Ok((subtitles, "provider"));
-        }
-    }
-    let duration = wav_duration_seconds(audio_path).unwrap_or(0.0);
-    render_estimated_subtitles(&text, duration, response_format)
-        .map(|subtitles| (subtitles, "estimated"))
 }
 
 pub(crate) fn execute_media_transcribe(

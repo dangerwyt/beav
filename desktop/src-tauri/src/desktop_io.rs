@@ -364,6 +364,18 @@ fn extract_transcription_text(value: &Value, preferred_format: &str) -> Option<S
                 return Some(text);
             }
         }
+        // ElevenLabs(scribe) 返回的是**词级时间戳** `words[]`，既不是 segments 也不是 srt/vtt，
+        // 通用分支认不出 → 这里走词级渲染（真实时间戳，与画面精确对齐）。
+        if let Some(words) = value.get("words").and_then(Value::as_array) {
+            if let Some(rendered) =
+                crate::commands::media_transcribe::subtitles::render_subtitles_from_words(
+                    words,
+                    preferred_format,
+                )
+            {
+                return Some(rendered);
+            }
+        }
         return extract_timed_segments(value, preferred_format);
     }
 
@@ -778,6 +790,40 @@ pub(crate) fn copy_image_to_clipboard(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// ElevenLabs(scribe) 返回词级时间戳 `words[]`：必须渲染成带真实时间戳的字幕，
+    /// 而不是退化成按字数估算（否则字幕与画面对不齐）。
+    #[test]
+    fn renders_srt_from_elevenlabs_words() {
+        let value = json!({
+            "text": "你好世界",
+            "words": [
+                { "text": "你好", "start": 0.0, "end": 0.5, "type": "word" },
+                { "text": "世界", "start": 0.5, "end": 1.2, "type": "word" }
+            ]
+        });
+
+        let srt = extract_transcription_text(&value, "srt").expect("应渲染出字幕");
+        assert!(
+            srt.contains("00:00:00,000 --> 00:00:01,200"),
+            "应使用 words 里的真实时间戳，实际：\n{srt}"
+        );
+        assert!(srt.contains("你好世界"), "字幕文本应完整：\n{srt}");
+    }
+
+    /// 词级渲染失败时（如 words 结构异常）不应报错，应回退到纯文本。
+    #[test]
+    fn falls_back_to_text_when_words_are_unusable() {
+        let value = json!({
+            "text": "只有纯文本",
+            "words": [{ "text": "只有纯文本" }]
+        });
+
+        assert_eq!(
+            extract_transcription_text(&value, "text").as_deref(),
+            Some("只有纯文本")
+        );
+    }
 
     #[test]
     fn extracts_plain_text_from_provider_json() {
