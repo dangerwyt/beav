@@ -1633,11 +1633,12 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
             <div className="flex items-center gap-2">
               <Lock className="w-4 h-4 text-accent-primary" strokeWidth={1.8} />
               <span className="text-sm font-semibold text-text-primary">登录管理</span>
-              {chromeStatus?.debugReady ? (
+              {/* 普通用户只看平台登录态；「已就绪/未就绪」是 Chrome 调试端口的术语，只给管理员看 */}
+              {isAdminUser && (chromeStatus?.debugReady ? (
                 <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-600">已就绪</span>
               ) : (
                 <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-secondary text-text-tertiary">未就绪</span>
-              )}
+              ))}
               {/* 登录态 ≠ Chrome 就绪：Chrome 起着但平台没登录时，抓取只能拿游客首屏几条 */}
               {platformLoginState === false && (
                 <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-600">平台未登录</span>
@@ -1651,6 +1652,27 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
 
           {chromeOpen && (
             <div className="px-3 pb-3 pt-1 space-y-3">
+              {/* 普通 web 用户只给状态 + 一句人话：扫码/cookie/诊断这些技术操作
+                  全部收进管理员视图 —— 用户端的人不需要、也不该接触这些。 */}
+              {!isAdminUser ? (
+                <div className="space-y-1.5 text-[11px] leading-relaxed">
+                  <div className="flex items-center gap-2">
+                    <span className="text-text-secondary">平台账号</span>
+                    {platformLoginState === true ? (
+                      <span className="text-emerald-600">已登录</span>
+                    ) : (
+                      <span className="text-amber-600">未登录（管理员在处理）</span>
+                    )}
+                  </div>
+                  <p className="text-text-tertiary">
+                    抓取用的平台账号由管理员在服务器上统一维护，
+                    <b className="text-text-secondary">你不需要登录任何平台账号</b>。
+                    未登录时只能抓到游客可见的少量笔记，之后会由管理员补上。
+                  </p>
+                  <p className="text-text-tertiary">当前平台：{platformLabel(chromeLoginPlatform)}</p>
+                </div>
+              ) : (
+                <>
               <div className="text-[11px] leading-relaxed text-text-tertiary">
                 {chromeStatus === null ? '正在检测本机 Chrome…' : (
                   chromeStatus.chromeInstalled ? (
@@ -1870,6 +1892,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 )}>
                   {chromeTestResult}
                 </div>
+              )}
+                </>
               )}
             </div>
           )}
