@@ -726,6 +726,16 @@ pub(crate) fn resolve_transcription_settings_with_source(
             .map(|route| route.model_name.clone())
             .filter(|value| !value.trim().is_empty())?,
     };
+    // **地址 ↔ 模型名绑定**：直连 ElevenLabs 时模型必须是 scribe_*。
+    //
+    // 库里可能存着历史错配（地址是 api.elevenlabs.io、模型却是中转站/百炼的命名
+    // 如 qwen3-asr-flash-filetrans）—— 那是旧版本「转写配置被回退的默认源覆盖」
+    // 留下的残留，用户没手动改过设置就会一直报
+    // 400 unsupported_model: 'qwen3-asr-flash-filetrans' is not a valid model_id。
+    //
+    // 纠正放在后端（最终执行者），而不是只靠设置界面自动改表单 ——
+    // 后端纠正不依赖用户「记得点保存」，改完代码就生效。
+    let model_name = resolve_transcription_model_for_endpoint(&endpoint, &model_name);
     let (api_key, key_from) = match flat_key.clone() {
         Some(value) if !value.trim().is_empty() => (Some(value), "专属配置"),
         _ if route_explicit => (
@@ -747,6 +757,39 @@ pub(crate) fn resolve_transcription_settings_with_source(
         endpoint_from_scope_config,
     };
     Some((endpoint, api_key, model_name, source))
+}
+
+/// ElevenLabs 直连可用的转写模型（官方文档 Models → STT）。
+const ELEVENLABS_TRANSCRIPTION_MODELS: &[&str] = &[
+    "scribe_v2",
+    "scribe_v1",
+    "scribe_v1_experimental",
+    "scribe_v2_realtime",
+    "scribe_v2_medical",
+];
+
+/// ElevenLabs 直连时的默认转写模型（官方推荐，`scribe_v1` 已废弃）。
+const ELEVENLABS_DEFAULT_TRANSCRIPTION_MODEL: &str = "scribe_v2";
+
+/// 按**地址**纠正转写模型名（地址 ↔ 模型名绑定）。
+///
+/// - 地址是 ElevenLabs（`api.elevenlabs.io`）→ 模型必须是 `scribe_*`。
+///   库里若存着别处的模型名（如百炼/中转站的 `qwen3-asr-flash-filetrans`），
+///   直接纠正成 `scribe_v2` —— 否则 ElevenLabs 报 400 unsupported_model。
+/// - 地址不是 ElevenLabs → 模型名里的 `scribe_*` 一定是错的（那是 ElevenLabs 专用名），
+///   保留用户填的值（可能是中转站自己的命名，如 `qwen3-asr-flash-filetrans`）。
+fn resolve_transcription_model_for_endpoint(endpoint: &str, configured_model: &str) -> String {
+    let model = configured_model.trim();
+    if !endpoint.to_ascii_lowercase().contains("elevenlabs.io") {
+        return model.to_string();
+    }
+    let is_scribe = ELEVENLABS_TRANSCRIPTION_MODELS
+        .iter()
+        .any(|item| item.eq_ignore_ascii_case(model));
+    if is_scribe {
+        return model.to_string();
+    }
+    ELEVENLABS_DEFAULT_TRANSCRIPTION_MODEL.to_string()
 }
 
 /// transcription scope 是否被**显式**路由（`ai_model_routes_json.transcription`
@@ -1041,6 +1084,57 @@ mod tests {
         assert_eq!(key.as_deref(), Some("sk-elevenlabs"));
         assert_eq!(model, "scribe_v1");
         assert_eq!(source.key_from, "专属配置");
+    }
+
+    /// 回归守卫：ElevenLabs 直连时，模型名必须被纠正成 `scribe_*`。
+    ///
+    /// 实测踩坑：库里存着历史错配（地址 api.elevenlabs.io、模型
+    /// qwen3-asr-flash-filetrans）→ ElevenLabs 报 400 unsupported_model。
+    /// 纠正放在后端，不依赖用户「记得点保存」。
+    #[test]
+    fn elevenlabs_endpoint_forces_scribe_model() {
+        assert_eq!(
+            resolve_transcription_model_for_endpoint(
+                "https://api.elevenlabs.io/v1/speech-to-text",
+                "qwen3-asr-flash-filetrans"
+            ),
+            "scribe_v2"
+        );
+        // 已经是合法的 scribe_* → 保留用户选的具体型号
+        assert_eq!(
+            resolve_transcription_model_for_endpoint(
+                "https://api.elevenlabs.io/v1/speech-to-text",
+                "scribe_v2_medical"
+            ),
+            "scribe_v2_medical"
+        );
+        // 非 ElevenLabs 地址 → 保留该服务自己的模型名（中转站的命名）
+        assert_eq!(
+            resolve_transcription_model_for_endpoint(
+                "https://relayrouter.ai/v1",
+                "qwen3-asr-flash-filetrans"
+            ),
+            "qwen3-asr-flash-filetrans"
+        );
+        // 非 ElevenLabs 地址 + 遗留的 scribe_* → 原样保留（由设置界面提示修正）
+        assert_eq!(
+            resolve_transcription_model_for_endpoint("https://relayrouter.ai/v1", "scribe_v2"),
+            "scribe_v2"
+        );
+    }
+
+    /// 转写地址 ↔ 模型名绑定后，**落到 store 的**模型名也应是纠正过的。
+    #[test]
+    fn transcription_settings_correct_model_for_elevenlabs() {
+        let settings = json!({
+            "transcription_endpoint": "https://api.elevenlabs.io/v1/speech-to-text",
+            "transcription_key": "sk-elevenlabs",
+            "transcription_model": "qwen3-asr-flash-filetrans",
+            "ai_model_routes_json": "{}",
+        });
+        let (_, _, model, _) =
+            resolve_transcription_settings_with_source(&settings).expect("settings");
+        assert_eq!(model, "scribe_v2");
     }
 
     /// 专属配置缺失时，才回退到 AI 路由 / 默认源。
