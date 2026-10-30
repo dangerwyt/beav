@@ -847,6 +847,13 @@ fn execution_failure_summary(snapshot: &CliExecutionSnapshot) -> String {
     if snapshot.execution.status == CliExecutionStatus::AwaitingEscalation {
         return "cli execution requires escalation before it can continue".to_string();
     }
+    // 验证失败时，**必须把命令自己的 stderr 一起带出来**。
+    //
+    // 只回验证摘要（如「退出码校验失败：期望 0，实际 255」）等于把真正的
+    // 原因藏起来了 —— 命令自己打印的那行（ffmpeg 的 "Invalid data found"、
+    // "No such file or directory"…）才是定位问题唯一有用的信息。
+    // 这个摘要会一路冒泡到最终的用户可见错误文案里。
+    let stderr = snapshot.stderr_tail.trim();
     if snapshot.execution.verification_status == CliVerificationStatus::Failed {
         if let Some(summary) = snapshot
             .verifications
@@ -855,10 +862,20 @@ fn execution_failure_summary(snapshot: &CliExecutionSnapshot) -> String {
             .map(|record| record.summary.trim().to_string())
             .filter(|summary| !summary.is_empty())
         {
-            return summary;
+            if stderr.is_empty() {
+                return summary;
+            }
+            // stderr 的最后几行通常是真正的错误原因（ffmpeg 把错误堆在末尾）。
+            let detail = stderr
+                .lines()
+                .rev()
+                .filter(|line| !line.trim().is_empty())
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            return format!("{summary}；命令输出：{detail}");
         }
     }
-    let stderr = snapshot.stderr_tail.trim();
     if !stderr.is_empty() {
         return stderr.to_string();
     }
@@ -921,9 +938,79 @@ pub fn run_managed_cli_command<RT: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli_runtime::{CliVerificationRecord, CliVerifierKind};
     use std::fs;
     use std::sync::Arc;
     use tauri::test::{mock_builder, mock_context, noop_assets};
+
+    /// 构造一份「验证失败 + 命令有 stderr」的快照。
+    fn snapshot_with_failed_verification(stderr: &str) -> CliExecutionSnapshot {
+        CliExecutionSnapshot {
+            execution: CliExecutionRecord {
+                id: "exec-1".to_string(),
+                session_id: "s1".to_string(),
+                task_id: None,
+                runtime_id: None,
+                environment_id: "env-1".to_string(),
+                tool_id: Some("ffmpeg".to_string()),
+                command: vec!["ffmpeg".to_string(), "-i".to_string(), "a.mp4".to_string()],
+                cwd: "/tmp".to_string(),
+                status: CliExecutionStatus::Failed,
+                exit_code: Some(255),
+                stdout_path: None,
+                stderr_path: None,
+                artifact_paths: Vec::new(),
+                verification_status: CliVerificationStatus::Failed,
+                started_at: None,
+                finished_at: None,
+                metadata: None,
+            },
+            stdout_tail: String::new(),
+            stderr_tail: stderr.to_string(),
+            verifications: vec![CliVerificationRecord {
+                id: "v1".to_string(),
+                execution_id: "exec-1".to_string(),
+                verifier: CliVerifierKind::ExitCode,
+                status: CliVerificationStatus::Failed,
+                summary: "退出码校验失败：期望 0，实际 255".to_string(),
+                detail: None,
+                created_at: 0,
+            }],
+            escalation: None,
+        }
+    }
+
+    /// 回归守卫：验证失败时，错误摘要必须带上**命令自己的 stderr**。
+    ///
+    /// 实测踩坑：ffmpeg 抽音频失败只显示「退出码校验失败：期望 0，实际 255」，
+    /// ffmpeg 真正报的那行（"Invalid data found when processing input" 等）
+    /// 被验证器吞掉了 —— 用户和排查者都无从判断是文件损坏还是参数问题。
+    #[test]
+    fn execution_failure_summary_includes_stderr_when_verification_fails() {
+        let snapshot = snapshot_with_failed_verification(
+            "Input #0, mov,mp4,m4a, from 'a.mp4':\nInvalid data found when processing input\n",
+        );
+        let summary = execution_failure_summary(&snapshot);
+        assert!(
+            summary.contains("退出码校验失败"),
+            "应保留验证摘要，实际：{summary}"
+        );
+        assert!(
+            summary.contains("Invalid data found"),
+            "应带上 ffmpeg 的 stderr，实际：{summary}"
+        );
+    }
+
+    #[test]
+    fn execution_failure_summary_falls_back_to_verification_summary_without_stderr() {
+        let snapshot = snapshot_with_failed_verification("");
+        let summary = execution_failure_summary(&snapshot);
+        assert!(summary.contains("退出码校验失败"), "实际：{summary}");
+        assert!(
+            !summary.contains("命令输出"),
+            "无 stderr 时不该加空壳，实际：{summary}"
+        );
+    }
 
     #[test]
     fn split_log_chunks_keeps_full_content() {

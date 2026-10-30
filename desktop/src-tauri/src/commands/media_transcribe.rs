@@ -121,52 +121,159 @@ fn extract_audio_for_transcription(
     output_dir: &Path,
 ) -> Result<PathBuf, String> {
     let audio_path = output_dir.join(format!("audio-{}.wav", now_ms()));
-    let args = vec![
-        "-y".to_string(),
-        "-i".to_string(),
-        source_path.display().to_string(),
-        "-vn".to_string(),
-        "-ac".to_string(),
-        "1".to_string(),
-        "-ar".to_string(),
-        "16000".to_string(),
-        "-acodec".to_string(),
-        "pcm_s16le".to_string(),
-        audio_path.display().to_string(),
+
+    // 两套参数，从严到宽。
+    //
+    // 第一套是常规参数；第二套是**兜底**：显式指定 `-f wav`、放宽到任意采样率、
+    // 并加 `-err_detect ignore_err` 让 ffmpeg 对局部损坏的帧宽容一些。
+    //
+    // 为什么需要兜底：源文件是从平台流式下载来的 mp4，网络抖动可能留下
+    // 「容器不完整 / moov 索引异常 / 某些帧解不出来」的文件。严格模式下 ffmpeg
+    // 直接退出 255，实测一批 41 条里会有个别条栽在这里 —— 而它其实仍然有可用的音频。
+    let attempts: Vec<Vec<String>> = vec![
+        vec![
+            "-y".to_string(),
+            "-i".to_string(),
+            source_path.display().to_string(),
+            "-vn".to_string(),
+            "-ac".to_string(),
+            "1".to_string(),
+            "-ar".to_string(),
+            "16000".to_string(),
+            "-acodec".to_string(),
+            "pcm_s16le".to_string(),
+            audio_path.display().to_string(),
+        ],
+        vec![
+            "-y".to_string(),
+            "-err_detect".to_string(),
+            "ignore_err".to_string(),
+            "-i".to_string(),
+            source_path.display().to_string(),
+            "-vn".to_string(),
+            "-f".to_string(),
+            "wav".to_string(),
+            "-ac".to_string(),
+            "1".to_string(),
+            "-ar".to_string(),
+            "16000".to_string(),
+            "-acodec".to_string(),
+            "pcm_s16le".to_string(),
+            audio_path.display().to_string(),
+        ],
     ];
-    let argv = std::iter::once(ffmpeg_program(Some(app))?)
-        .chain(args)
-        .collect::<Vec<_>>();
-    run_app_managed_argv(
-        app,
-        state,
-        AppManagedArgvRequest {
-            session_id: session_id.map(ToString::to_string),
-            runtime_id: Some("media-transcribe".to_string()),
-            tool_id: Some("ffmpeg".to_string()),
-            argv,
-            cwd: Some(output_dir.to_string_lossy().to_string()),
-            verification_rules: vec![
-                CliVerifyRule::ExitCode { expected: Some(0) },
-                CliVerifyRule::FileExists {
-                    path: audio_path.to_string_lossy().to_string(),
-                },
-            ],
-            ..AppManagedArgvRequest::default()
-        },
-        8_000,
-    )
-    .map_err(|error| {
-        let text = error.to_string();
-        // 常见且极难定位的失败：源视频是抖音 DASH 的**纯视频轨**，抽不出音频。
-        // 原样抛出只会得到「Invalid argument」，看不出是没有音轨，这里翻成人话。
-        if text.contains("does not contain any stream") || text.contains("does not contain") {
-            format!("该视频没有音轨，无法转写（源文件只含视频轨，抖音 DASH 需先补音轨）：{text}")
+
+    let mut last_error = String::new();
+    for (index, args) in attempts.iter().enumerate() {
+        // 每次重试都换文件名，避免上一轮的半截产物被 FileExists 规则误判为成功。
+        let attempt_path = if index == 0 {
+            audio_path.clone()
         } else {
-            format!("ffmpeg audio extraction failed: {text}")
+            output_dir.join(format!("audio-{}-retry.wav", now_ms()))
+        };
+        let mut argv_args = args.clone();
+        if index > 0 {
+            // 替换输出路径参数（最后一个）。
+            if let Some(last) = argv_args.last_mut() {
+                *last = attempt_path.display().to_string();
+            }
         }
-    })?;
-    Ok(audio_path)
+        let argv = std::iter::once(ffmpeg_program(Some(app))?)
+            .chain(argv_args)
+            .collect::<Vec<_>>();
+        let result = run_app_managed_argv(
+            app,
+            state,
+            AppManagedArgvRequest {
+                session_id: session_id.map(ToString::to_string),
+                runtime_id: Some("media-transcribe".to_string()),
+                tool_id: Some("ffmpeg".to_string()),
+                argv,
+                cwd: Some(output_dir.to_string_lossy().to_string()),
+                verification_rules: vec![
+                    CliVerifyRule::ExitCode { expected: Some(0) },
+                    CliVerifyRule::FileExists {
+                        path: attempt_path.to_string_lossy().to_string(),
+                    },
+                ],
+                ..AppManagedArgvRequest::default()
+            },
+            8_000,
+        );
+        match result {
+            Ok(_) => {
+                // FileExists 只验「文件存在」，不验「有内容」。
+                // ffmpeg 退出 0 但产出 0 字节（源文件损坏但容器仍可解析）时，
+                // 会拿到一个空 wav 送去 ASR —— 结果必然是空转写或下游报错。
+                // 这里显式检查大小，为 0 视同失败、走降级重试。
+                let size = std::fs::metadata(&attempt_path).map(|m| m.len()).unwrap_or(0);
+                if size == 0 {
+                    let _ = std::fs::remove_file(&attempt_path);
+                    last_error = format!(
+                        "ffmpeg 抽音频退出码为 0 但产出 0 字节（源文件可能损坏）：{}",
+                        source_path.display()
+                    );
+                    if index + 1 < attempts.len() {
+                        println!("[media-transcribe] {}", last_error);
+                        continue;
+                    }
+                    break;
+                }
+                return Ok(attempt_path);
+            }
+            Err(error) => {
+                let text = error.to_string();
+                // 第一套参数失败才试第二套；两次都失败才报错。
+                if index + 1 < attempts.len() {
+                    println!(
+                        "[media-transcribe] ffmpeg 抽音频第 {} 次失败，降级重试：{}",
+                        index + 1,
+                        text.lines()
+                            .rev()
+                            .filter(|line| !line.trim().is_empty())
+                            .take(2)
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    );
+                    last_error = text;
+                    continue;
+                }
+                last_error = text;
+            }
+        }
+    }
+
+    Err(describe_audio_extract_failure(&last_error, source_path))
+}
+
+/// 把 ffmpeg 抽音频的失败原因翻译成人话。
+///
+/// 历史上这里只能拿到「退出码校验失败：期望 0，实际 255」——
+/// 验证器把命令自己的 stderr 吞了，ffmpeg 真正报的那行完全看不到。
+/// 现在 stderr 会一并冒泡上来，这里据此分类。
+fn describe_audio_extract_failure(detail: &str, source_path: &Path) -> String {
+    let text = detail.to_string();
+    let lower = text.to_ascii_lowercase();
+    let file = source_path.display().to_string();
+    // 常见且极难定位的失败：源视频是抖音 DASH 的**纯视频轨**，抽不出音频。
+    if lower.contains("does not contain any stream")
+        || lower.contains("does not contain a stream")
+        || lower.contains("output file does not contain")
+    {
+        return format!("该视频没有音轨，无法转写（源文件只含视频轨，抖音 DASH 需先补音轨）：{text}");
+    }
+    // 文件本身读不出来：下载中断 / 容器损坏。
+    if lower.contains("invalid data found")
+        || lower.contains("moov atom not found")
+        || lower.contains("end of file")
+        || lower.contains("no such file or directory")
+        || lower.contains("invalid argument")
+    {
+        return format!(
+            "视频文件不完整或已损坏，无法抽取音频（多为下载中断所致，建议重新下载）：{file}；{text}"
+        );
+    }
+    format!("ffmpeg audio extraction failed: {file}；{text}")
 }
 
 fn text_preview(value: &str, max_chars: usize) -> String {
