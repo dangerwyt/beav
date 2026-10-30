@@ -210,15 +210,21 @@ pub(crate) fn run_curl_transcription_request(
             499 | 504 => {
                 "（网关超时：服务端约 60 秒未返回，通常是转写服务商上游故障，重试无效 —— 请联系服务商或更换 STT 服务）"
             }
-            401 | 403 => "（鉴权失败：检查设置里的 transcription key 是否有效）",
+            401 | 403 => {
+                "（鉴权失败：请求用的 key 无效 —— 请核对「设置 > 语音转写」里配置的 \
+                 transcription endpoint 与 key 是否属于同一个服务；官方登录态过期也会这样）"
+            }
             404 => "（接口不存在：检查 transcription endpoint 是否该带 /v1 或模型是否支持该接口）",
             413 => "（音频过大：触发服务端请求体上限）",
             429 => "（触发限流：稍后再试或降低转写并发）",
             502 | 503 => "（服务端暂时不可用）",
             _ => "",
         };
+        // 把**实际请求的地址**带上：401 时用户最需要知道的是「打到了哪个服务」——
+        // 打到官方服务却以为是自己的 STT key 失效，是最容易白折腾一轮的情况。
         return Err(format!(
-            "转写接口 HTTP {http_status}{hint}：{}",
+            "转写接口 HTTP {http_status}{hint}；请求地址：{}；响应：{}",
+            normalize_transcription_url(endpoint),
             stdout.trim()
         ));
     }
@@ -617,28 +623,98 @@ fn value_type_name(value: &Value) -> &'static str {
 pub(crate) fn resolve_transcription_settings(
     settings: &Value,
 ) -> Option<(String, Option<String>, String)> {
+    let flat_endpoint = payload_string(settings, "transcription_endpoint");
+    let flat_key = payload_string(settings, "transcription_key");
+    let flat_model = payload_string(settings, "transcription_model");
+    // 转写 scope 是否被**显式**路由（route 里指定了 sourceId 或 mode）。
+    let route_explicit = transcription_route_is_explicit(settings);
     let resolved = crate::ai_model_manager::AiModelManager::resolve(
         settings,
         crate::ai_model_manager::AiModelScope::Transcription,
         None,
     );
-    let endpoint = resolved
-        .as_ref()
-        .map(|route| route.base_url.clone())
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| payload_string(settings, "transcription_endpoint"))
-        .or_else(|| payload_string(settings, "api_endpoint"))?;
-    let model_name = resolved
-        .as_ref()
-        .map(|route| route.model_name.clone())
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| payload_string(settings, "transcription_model"))?;
-    let api_key = resolved
-        .as_ref()
-        .and_then(|route| route.api_key.clone())
-        .or_else(|| payload_string(settings, "transcription_key"))
-        .or_else(|| payload_string(settings, "api_key"));
+    // 取值优先级：**显式路由 > scope 专属配置 > 默认源回退**。
+    //
+    // 为什么专属配置要排在「默认源回退」前面：
+    // `AiModelManager::resolve` 在没有显式路由时会回退到「默认源 / 列表第一个源」
+    // （`route_source` 的兜底链），并把那个源的 base_url + api_key 一起带出来 ——
+    // 用户显式配的 transcription_endpoint / transcription_key 被**静默遮蔽**，
+    // 请求因此打到了一个用户根本没打算用的服务上。
+    //
+    // 实测症状：服务器上「官方」登录态过期时，转写报 401 "Invalid access token"，
+    // 与「STT key 无效」的提示完全一样 → 让人怀疑错方向、反复换 key。
+    let endpoint = if route_explicit {
+        resolved
+            .as_ref()
+            .map(|route| route.base_url.clone())
+            .or(flat_endpoint)
+    } else {
+        flat_endpoint.clone().or_else(|| {
+            resolved
+                .as_ref()
+                .map(|route| route.base_url.clone())
+        })
+    }
+    .filter(|value| !value.trim().is_empty())
+    .or_else(|| payload_string(settings, "api_endpoint"))?;
+    let model_name = if route_explicit {
+        resolved
+            .as_ref()
+            .map(|route| route.model_name.clone())
+            .filter(|value| !value.trim().is_empty())
+            .or(flat_model)
+    } else {
+        flat_model
+            .clone()
+            .or_else(|| {
+                resolved
+                    .as_ref()
+                    .map(|route| route.model_name.clone())
+                    .filter(|value| !value.trim().is_empty())
+            })
+    }?;
+    let api_key = if route_explicit {
+        resolved
+            .as_ref()
+            .and_then(|route| route.api_key.clone())
+            .or(flat_key)
+    } else {
+        flat_key
+            .clone()
+            .or_else(|| resolved.as_ref().and_then(|route| route.api_key.clone()))
+    }
+    .or_else(|| payload_string(settings, "api_key"));
     Some((endpoint, api_key, model_name))
+}
+
+/// transcription scope 是否被**显式**路由（`ai_model_routes_json.transcription`
+/// 里指定了 sourceId 或 mode）。
+///
+/// 「disabled」不算显式路由 —— 那表示用户主动关掉了这个 scope 的路由，
+/// 此时应该回落到 scope 专属配置（transcription_endpoint / transcription_key）。
+fn transcription_route_is_explicit(settings: &Value) -> bool {
+    let scope = crate::ai_model_manager::AiModelScope::Transcription.as_str();
+    // 注意：`ai_model_routes_json` 存的是 **JSON 字符串**，不是对象 ——
+    // 直接 .get() 永远拿不到路由，会把「有显式路由」误判成「没有」。
+    let routes = payload_string(settings, "ai_model_routes_json")
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    let Some(route) = routes.get(scope) else {
+        return false;
+    };
+    let has_source = route
+        .get("sourceId")
+        .or_else(|| route.get("source_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let has_mode = route
+        .get("mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty() && value != "disabled");
+    has_source || has_mode
 }
 
 const YTDLP_DISABLED_MESSAGE: &str = "内置 yt-dlp 服务已移除。";
@@ -873,6 +949,45 @@ mod tests {
 
         assert_eq!(body, "Bad Gateway");
         assert_eq!(status, 502);
+    }
+
+    /// 回归守卫：scope 专属配置（transcription_endpoint / transcription_key）
+    /// **不能被「默认源回退」静默遮蔽**。
+    ///
+    /// 实测踩坑：用户专门配了独立 STT 服务，但 `AiModelManager::resolve` 在没有
+    /// 显式路由时会回退到「默认源 / 列表第一个源」，并把那个源的 base_url +
+    /// api_key 一起带出来 —— 请求因此打到了用户根本没打算用的服务上，
+    /// 表现为 401 "Invalid access token"，让人以为是自己的 key 过期，反复换 key。
+    #[test]
+    fn transcription_settings_prefer_scope_config_over_default_source() {
+        let settings = json!({
+            "transcription_endpoint": "https://stt.example.com/v1/audio/transcriptions",
+            "transcription_key": "sk-user-stt",
+            "transcription_model": "whisper-1",
+            "default_ai_source_id": "src-official",
+            "ai_sources_json": "[{\"id\":\"src-official\",\"baseURL\":\"https://official.example.com\",\"apiKey\":\"official-token\",\"model\":\"gpt-x\"}]",
+            "ai_model_routes_json": "{}",
+        });
+        let (endpoint, key, model) = resolve_transcription_settings(&settings).expect("settings");
+        assert_eq!(endpoint, "https://stt.example.com/v1/audio/transcriptions");
+        assert_eq!(key.as_deref(), Some("sk-user-stt"));
+        assert_eq!(model, "whisper-1");
+    }
+
+    /// 有**显式路由**时，路由优先于 scope 专属配置（路由是用户主动指定来源的）。
+    #[test]
+    fn transcription_settings_respect_explicit_route() {
+        let settings = json!({
+            "transcription_endpoint": "https://stt.example.com/v1/audio/transcriptions",
+            "transcription_key": "sk-user-stt",
+            "transcription_model": "whisper-1",
+            "default_ai_source_id": "src-custom",
+            "ai_sources_json": "[{\"id\":\"src-custom\",\"baseURL\":\"https://custom.example.com\",\"apiKey\":\"sk-custom\",\"model\":\"m-custom\"}]",
+            "ai_model_routes_json": "{\"transcription\":{\"sourceId\":\"src-custom\"}}",
+        });
+        let (endpoint, key, _) = resolve_transcription_settings(&settings).expect("settings");
+        assert_eq!(endpoint, "https://custom.example.com");
+        assert_eq!(key.as_deref(), Some("sk-custom"));
     }
 
     #[test]
