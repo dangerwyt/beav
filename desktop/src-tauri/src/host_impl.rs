@@ -28,6 +28,7 @@ use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -169,8 +170,21 @@ pub(crate) fn now_rfc3339() -> String {
     format_timestamp_rfc3339_from_ms(now_ms() as i64).unwrap_or_else(now_iso)
 }
 
+/// 生成带前缀的唯一 id。
+///
+/// 只用毫秒时间戳是不够的：**同一毫秒内批量创建会撞号**（实测一次补历史在
+/// 几毫秒内写入 47 条帖子，只留下 5 个不同的毫秒值）。撞号的后果不是报错，而是
+/// 静默丢数据 —— 落库代码普遍写成
+/// `position(|item| item.id == record.id) ? 原地覆盖 : push`，
+/// 于是 47 条记录互相覆盖，最后只剩 5 条，而返回值里的 `created` 数组仍是 47 条，
+/// 表现为「抓到 47 → 新建 47，但库里只有 5 条」。
+///
+/// 这里补一个进程内单调递增序号（定宽补零，保住字典序即保住 `sort_by(id)` 的时间顺序）。
+/// 计数器每次进程启动归零无妨 —— 时间前缀已经不同了。
 pub(crate) fn make_id(prefix: &str) -> String {
-    format!("{prefix}-{}", now_ms())
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed) % 10_000;
+    format!("{prefix}-{}-{:04}", now_ms(), seq)
 }
 
 pub(crate) fn refresh_runtime_warm_state(
@@ -751,7 +765,7 @@ mod tests {
         interactive_model_supports_direct_attachment, interactive_skill_activation_continuation,
         interactive_skill_activations, interactive_tool_panic_message,
         is_authoring_project_link_target, json_value_to_path_list,
-        looks_like_authoring_status_summary, manuscript_save_result_path,
+        looks_like_authoring_status_summary, make_id, manuscript_save_result_path,
         message_is_successful_manuscript_write_tool_result, metadata_requires_voice_speech,
         normalized_structured_payload_arguments, now_ms, persist_subjects_workspace,
         redbox_fs_profile_read_completed, resolve_local_path, sanitize_copy_file_name,
@@ -762,9 +776,26 @@ mod tests {
         SubjectVoiceInput, COPY_TARGET_FILE_NAME_MAX_CHARS,
     };
     use serde_json::{json, Value};
+    use std::collections::HashSet;
     use std::fs;
     use std::path::Path;
     use std::time::Instant;
+
+    /// 回归守卫：一次补历史会在几毫秒内连续创建几十条记录。
+    /// 只靠毫秒时间戳做 id 会撞号，撞号的记录会被「按 id 找位置 → 覆盖」的落库代码
+    /// 互相覆盖，最终库里只剩几条，而返回值仍报「新建 N 条」。
+    #[test]
+    fn make_id_is_unique_within_a_tight_loop() {
+        let ids: Vec<String> = (0..500).map(|_| make_id("mpost")).collect();
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "紧循环内 make_id 撞号了：{} 个 id 只有 {} 个不同",
+            ids.len(),
+            unique.len()
+        );
+    }
 
     #[test]
     fn append_session_transcript_embeds_canonical_item_snapshot() {
