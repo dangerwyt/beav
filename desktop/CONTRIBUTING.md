@@ -6,7 +6,10 @@
 
 1. 先读 [README.md](/desktop/README.md) 了解工作区边界。
 2. 再读 [源码基线与历史说明](docs/source-baseline.md)。
-3. 改具体模块前，先打开该目录旁边的 `README.md` 或 `*.README.md`。
+3. **换机器 / 接手当前开发状态**：读 [交接说明 2026-10-30](docs/HANDOFF-2026-10-30.md)
+   （这几天做了什么、现在什么状态、下一步做什么、关键约定速查）。
+   改竞品监控相关代码前，再读 [监控链路踩坑记录](docs/monitor-pipeline-pitfalls.md)。
+4. 改具体模块前，先打开该目录旁边的 `README.md` 或 `*.README.md`。
 
 ## Repository Rules
 
