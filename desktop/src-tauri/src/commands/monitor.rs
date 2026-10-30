@@ -159,7 +159,9 @@ pub fn handle_monitor_channel(
             "monitor:chrome-qr-start" => chrome_qr_start(app, payload),
             "monitor:chrome-qr-status" => chrome_qr_status(app, payload),
             "monitor:chrome-login-debug" => chrome_login_debug(app, payload),
-            "monitor:chrome-shutdown" => chrome_shutdown(),
+            "monitor:chrome-export-cookies" => chrome_export_cookies(app, payload),
+            "monitor:chrome-import-cookies" => chrome_import_cookies(app, payload),
+            "monitor:chrome-shutdown" => chrome_shutdown(app, payload),
             "monitor:clear" => clear_data(state),
             "monitor:post-remove" => post_remove(state, payload),
             "monitor:clear-posts" => clear_posts(state),
@@ -382,9 +384,75 @@ fn chrome_test(_app: &AppHandle, payload: &Value) -> Result<Value, String> {
     result.map(|value| json!({ "success": true, "platform": platform, "result": value }))
 }
 
-fn chrome_shutdown() -> Result<Value, String> {
+/// 导出该平台的登录 cookie（跨机器迁移登录态用，绕开平台风控验证）。
+fn chrome_export_cookies(_app: &AppHandle, payload: &Value) -> Result<Value, String> {
+    let platform = payload
+        .get("platform")
+        .and_then(Value::as_str)
+        .unwrap_or("xiaohongshu");
+    let port = headless_browser::active_chrome_port(platform);
+    if port == 0 {
+        return Err("Chrome 未启动：请先「打开 Chrome 登录」并完成登录".to_string());
+    }
+    let ws_url = tauri::async_runtime::block_on(headless_browser::ws_url_for_port(port))?;
+    tauri::async_runtime::block_on(headless_browser::export_login_cookies(&ws_url, platform))
+}
+
+/// 导入登录 cookie（把另一台机器导出的 JSON 写进服务器 Chrome）。
+fn chrome_import_cookies(_app: &AppHandle, payload: &Value) -> Result<Value, String> {
+    let platform = payload
+        .get("platform")
+        .and_then(Value::as_str)
+        .unwrap_or("xiaohongshu");
+    let cookies = payload
+        .get("cookies")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "缺少 cookies 数组".to_string())?;
+    let port = headless_browser::active_chrome_port(platform);
+    if port == 0 {
+        return Err("Chrome 未启动：请先「打开 Chrome 登录」把 Chrome 拉起来再导入".to_string());
+    }
+    let ws_url = tauri::async_runtime::block_on(headless_browser::ws_url_for_port(port))?;
+    let count =
+        tauri::async_runtime::block_on(headless_browser::import_login_cookies(&ws_url, cookies))?;
+    Ok(json!({ "success": true, "imported": count }))
+}
+
+fn chrome_shutdown(app: &AppHandle, payload: &Value) -> Result<Value, String> {
+    let platform = payload
+        .get("platform")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     headless_browser::shutdown_chrome();
-    Ok(json!({ "success": true, "note": "已关闭登录态 Chrome 进程，下次抓取需重新登录" }))
+    // 真·退出登录：删掉该平台的 Chrome profile（cookie 就存在里面）。
+    // 只关进程不删 profile 的话，下次启动仍是登录状态 —— 按钮名不副实。
+    let mut cleared = false;
+    if let Some(platform) = platform {
+        headless_browser::invalidate_login_state(platform);
+        if let Ok(dir) = headless_browser::profile_dir_for(app, platform) {
+            // 给进程一点时间释放文件句柄（Windows 上尤其需要）
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            let mut removed = false;
+            for _ in 0..3 {
+                if std::fs::remove_dir_all(&dir).is_ok() {
+                    removed = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            cleared = removed;
+        }
+    }
+    Ok(json!({
+        "success": true,
+        "cleared": cleared,
+        "note": if cleared {
+            "已退出登录：该平台的 Chrome 登录态（profile）已清除，下次抓取需重新登录"
+        } else {
+            "已关闭 Chrome 进程；未指定平台或 profile 删除失败，登录态可能仍保留"
+        }
+    }))
 }
 
 fn str_field(payload: &Value, key: &str) -> Option<String> {

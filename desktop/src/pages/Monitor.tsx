@@ -585,6 +585,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [qrDone, setQrDone] = useState(false);
   // 服务器已登录该平台 → 需要用户确认是否强制更换账号
   const [qrNeedForce, setQrNeedForce] = useState(false);
+  /** 取码进行中标记（用 ref 防重入，state 在闭包里会读到旧值） */
+  const qrLoadingRef = useRef(false);
   // Web 普通用户不是管理员 → 隐藏扫码/退出等管理员专属操作
   const [isAdminUser, setIsAdminUser] = useState(true);
   /** 平台登录态：null = 未知/未检测，true = 已登录，false = 未登录。
@@ -743,6 +745,10 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   // force=true：服务器该平台已登录时仍然更换账号（扫码本来就是换号的行为，
   // 普通 web 用户没有「退出登录」权限，硬拦会让她无路可走）。
   const loadQrCode = useCallback(async (platform: CdpPlatform, force = false) => {
+    // 防重入：并发调用会各自取一次码，后一次会把前一次的码作废
+    // （小红书登录码按会话唯一），表现为"两个标签 + 第一个显示过期"。
+    if (qrLoadingRef.current) return;
+    qrLoadingRef.current = true;
     setQrBusy(true);
     setQrDone(false);
     setQrNote(null);
@@ -777,6 +783,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       setQrImage(null);
       setQrNote(`获取二维码失败：${String(e)}`);
     } finally {
+      qrLoadingRef.current = false;
       setQrBusy(false);
     }
   }, []);
@@ -1326,15 +1333,19 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
 
   const handleChromeLogout = useCallback(async () => {
     try {
-      await window.ipcRenderer.monitor.chromeLogout();
+      // 必须带 platform：后端要删掉该平台的 Chrome profile（cookie 在里面），
+      // 只关进程的话下次启动还是登录状态。
+      const result = await window.ipcRenderer.monitor.chromeLogout(chromeLoginPlatform);
       setChromeTestResult(null);
-      showToast('ok', '已退出登录');
+      setPlatformLoginState(false);
+      setLoginDebug(null);
+      showToast(result?.cleared === false ? 'err' : 'ok', result?.note || '已退出登录');
       await loadChromeStatus();
     } catch (e) {
       console.error('chrome logout failed:', e);
       showToast('err', e instanceof Error ? e.message : '退出失败');
     }
-  }, [loadChromeStatus, showToast]);
+  }, [chromeLoginPlatform, loadChromeStatus, showToast]);
 
   const handleInject = useCallback(async (post: MonitoredPost) => {
     try {
@@ -1672,9 +1683,9 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   <button
                     key={p}
                     onClick={() => {
+                      // 只切换平台，不弹扫码窗（扫码入口是下面那个明确的「扫码登录」按钮）。
+                      // 之前点页签就弹窗，用户反馈「点 3 个平台按钮就出现弹窗」。
                       setChromeLoginPlatform(p);
-                      // 点平台 = 选平台 + 扫码，一步到位
-                      openQrModal(p);
                     }}
                     className={clsx(
                       'flex-1 text-xs px-2 py-1.5 rounded-md border transition-colors',
@@ -1776,6 +1787,78 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 {platformLoginState === true && (
                   <div className="text-[11px] text-emerald-600">平台已登录，抓取会使用该账号的完整视角。</div>
                 )}
+
+                {/* 登录态迁移：平台对新设备扫码会风控验证，扫码走不通时用这个 */}
+                <details className="rounded-md border border-border bg-surface-secondary/40 px-2.5 py-1.5">
+                  <summary className="text-[11px] cursor-pointer text-text-secondary hover:text-text-primary">
+                    扫码过不去？用「登录态迁移」（绕开风控）
+                  </summary>
+                  <div className="mt-2 space-y-2 text-[11px] leading-relaxed text-text-tertiary">
+                    <div>
+                      1. 在<b className="text-text-secondary">已登录的机器</b>（比如你自己的电脑）点「导出」，
+                      把复制的 JSON 发到这台服务器；
+                      <br />
+                      2. 在这里粘贴 JSON 后点「导入」；
+                      <br />
+                      3. 点「检测登录状态」确认。
+                    </div>
+                    <div className="flex gap-1.5">
+                      <button
+                        onClick={() => {
+                          void (async () => {
+                            try {
+                              const result = await window.ipcRenderer.monitor.chromeExportCookies(chromeLoginPlatform);
+                              if (!result?.count) {
+                                showToast('err', '没导出到 cookie：这台机器的 Chrome 可能未启动或未登录');
+                                return;
+                              }
+                              await navigator.clipboard.writeText(JSON.stringify(result));
+                              showToast('ok', `已复制 ${result.count} 条 cookie，贴到另一台机器的导入框`);
+                            } catch (e) {
+                              showToast('err', `导出失败：${String(e)}`);
+                            }
+                          })();
+                        }}
+                        className="flex-1 px-2 py-1 rounded border border-border hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                      >
+                        导出到剪贴板
+                      </button>
+                      <button
+                        onClick={() => {
+                          void (async () => {
+                            try {
+                              const text = await navigator.clipboard.readText();
+                              const parsed = JSON.parse(text) as { cookies?: unknown[] };
+                              const cookies = Array.isArray(parsed) ? parsed : parsed?.cookies;
+                              if (!Array.isArray(cookies) || !cookies.length) {
+                                showToast('err', '剪贴板里没有有效的 cookie JSON');
+                                return;
+                              }
+                              const result = await window.ipcRenderer.monitor.chromeImportCookies(
+                                chromeLoginPlatform,
+                                cookies,
+                              );
+                              if (result?.success) {
+                                showToast('ok', `已导入 ${result.imported} 条 cookie，正在检测登录状态…`);
+                                await checkPlatformLogin(true);
+                              } else {
+                                showToast('err', '导入失败');
+                              }
+                            } catch (e) {
+                              showToast('err', `导入失败：${String(e)}`);
+                            }
+                          })();
+                        }}
+                        className="flex-1 px-2 py-1 rounded border border-border hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                      >
+                        从剪贴板导入
+                      </button>
+                    </div>
+                    <div className="text-[10px] text-amber-700/80">
+                      ⚠️ cookie 等同登录凭证，只在两台自己的机器之间传递，别发到公开地方。
+                    </div>
+                  </div>
+                </details>
               </div>
 
               {chromeTestResult && (

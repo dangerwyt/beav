@@ -179,8 +179,8 @@ export function createMonitorBridge(core: BridgeCore) {
           timeoutMs: CHROME_TIMEOUT_MS,
           fallback: () => ({ success: false, error: 'chrome test timed out' }) as unknown as T,
         }),
-      chromeLogout: <T = { success: boolean; note: string }>() =>
-        core.invokeChannelGuarded<T>('monitor:chrome-shutdown', {}, {
+      chromeLogout: <T = { success: boolean; cleared?: boolean; note: string }>(platform?: string) =>
+        core.invokeChannelGuarded<T>('monitor:chrome-shutdown', platform ? { platform } : {}, {
           timeoutMs: READ_TIMEOUT_MS,
           fallback: () => ({ success: false, note: '退出登录超时' }) as unknown as T,
         }),
@@ -189,6 +189,18 @@ export function createMonitorBridge(core: BridgeCore) {
         core.invokeChannelGuarded<T>('monitor:chrome-qr-start', payload, {
           timeoutMs: CHROME_TIMEOUT_MS,
           fallback: () => ({ success: false, error: '获取二维码超时' }) as unknown as T,
+        }),
+      /** 导出该平台登录 cookie（跨机器迁移登录态，绕开平台风控验证）。 */
+      chromeExportCookies: <T = { platform: string; count: number; cookies: unknown[] }>(platform: string) =>
+        core.invokeChannelGuarded<T>('monitor:chrome-export-cookies', { platform }, {
+          timeoutMs: CHROME_TIMEOUT_MS,
+          fallback: () => ({ platform, count: 0, cookies: [] }) as unknown as T,
+        }),
+      /** 导入登录 cookie。 */
+      chromeImportCookies: <T = { success: boolean; imported: number }>(platform: string, cookies: unknown[]) =>
+        core.invokeChannelGuarded<T>('monitor:chrome-import-cookies', { platform, cookies }, {
+          timeoutMs: CHROME_TIMEOUT_MS,
+          fallback: () => ({ success: false, imported: 0 }) as unknown as T,
         }),
       /** 登录态诊断：取服务器 Chrome 里该平台页面的真实状态（只含 cookie 名，不含值）。 */
       chromeLoginDebug: <T = Record<string, unknown>>(platform: string) =>

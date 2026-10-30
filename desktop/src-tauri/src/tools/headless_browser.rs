@@ -1100,12 +1100,19 @@ pub struct QrCapture {
 /// `background=true` 时用后台标签（不抢焦点）。注意**登录页必须前台创建**：
 /// Chrome 会节流后台标签的定时器（降到 1 分钟一次），而扫码回调靠页面自己轮询，
 /// 后台标签可能永远等不到回调 → 手机显示成功、网页端却没登录。
+/// 串行化「查-建」标签页：并发调用（React 双调用 / 连点两次）会各自建一个标签，
+/// 而小红书的登录码按会话唯一 → 后建的把先建的作废，用户就看到"两个标签、第一个过期"。
+static PLATFORM_TAB_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+
 async fn platform_tab(
     client: &CdpClient,
     platform: &str,
     initial_url: &str,
     background: bool,
 ) -> Result<String, String> {
+    // 整个"查表 → 校验存活 → 新建 → 写表"过程串行执行，避免竞态建出两个标签
+    let lock = PLATFORM_TAB_LOCK.get_or_init(|| AsyncMutex::new(()));
+    let _guard = lock.lock().await;
     let existing = {
         let tabs = platform_tabs()
             .lock()
@@ -1542,6 +1549,70 @@ pub async fn login_debug(ws_url: &str, platform: &str) -> Result<Value, String> 
         "cookieNames": cookie_names,
         "sessionCookieLength": session_len,
     }))
+}
+
+/// 导出某平台的登录 cookie（含值）——用于**跨机器迁移登录态**。
+///
+/// 使用场景：小红书对"新设备扫码登录"会触发风控验证，扫码走不通。
+/// 折中办法：在你**已经登录**的机器上导出 cookie，粘到服务器导入，
+/// 服务器直接用这份会话抓取（不需要扫码）。
+///
+/// ⚠️ 返回值含会话凭证，只在两台自己的机器之间传递。
+pub async fn export_login_cookies(ws_url: &str, platform: &str) -> Result<Value, String> {
+    let client = CdpClient::connect(ws_url).await?;
+    let domain = platform_domain(platform);
+    let cookies = client
+        .send_request("Storage.getCookies", None, None)
+        .await
+        .ok()
+        .and_then(|value| value.get("cookies").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|cookie| {
+            cookie
+                .get("domain")
+                .and_then(Value::as_str)
+                .map(|value| value.contains(domain))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    client.close().await;
+    Ok(json!({
+        "platform": platform,
+        "count": cookies.len(),
+        "cookies": cookies,
+    }))
+}
+
+/// 导入登录 cookie（`Network.setCookies`）——接收上面导出的结构。
+pub async fn import_login_cookies(ws_url: &str, cookies: &[Value]) -> Result<usize, String> {
+    if cookies.is_empty() {
+        return Err("没有可导入的 cookie".to_string());
+    }
+    let client = CdpClient::connect(ws_url).await?;
+    let result = client
+        .send_request(
+            "Network.setCookies",
+            Some(json!({ "cookies": cookies })),
+            None,
+        )
+        .await;
+    client.close().await;
+    result?;
+    // 登录态变了 → 清掉缓存，下次检查会重新判定
+    if let Some(cache) = LOGIN_STATE_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+    if let Some(baseline) = SESSION_BASELINE.get() {
+        baseline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+    Ok(cookies.len())
 }
 
 /// 检查某平台是否**真实登录**。

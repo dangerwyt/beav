@@ -221,6 +221,20 @@ need_web=0
 needs_build "$STAMP_DIR/rust.commit" "$RUST_BIN" $RUST_PATHS && need_rust=1
 needs_build "$STAMP_DIR/web.commit" "$WEB_OUT" $WEB_PATHS && need_web=1
 
+# 分支切换检测：checkout 会把所有文件时间刷成"现在"，时间戳判断会误判成"最新"
+# → 明明换了分支却不重建，产物和代码对不上（例如 main ↔ web）。
+# 这里记录上次构建时的 HEAD，HEAD 变了就强制全量重建。
+HEAD_FILE="$STAMP_DIR/head.commit"
+CURRENT_HEAD="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || true)"
+LAST_HEAD="$(cat "$HEAD_FILE" 2>/dev/null || true)"
+if [ -n "$CURRENT_HEAD" ] && [ -n "$LAST_HEAD" ] && [ "$CURRENT_HEAD" != "$LAST_HEAD" ]; then
+  warn "HEAD 变了（${LAST_HEAD:0:8} → ${CURRENT_HEAD:0:8}，可能切了分支）→ 强制重建 Rust 与前端"
+  need_rust=1
+  need_web=1
+fi
+# 注意：HEAD 基线在**构建成功后**才写（见下方），否则构建失败也会被记成"已建"，
+# 下次就不会重建了。
+
 # 自检：二进制里必须含有前端产物，否则 Tauri 会以 dev 模式启动（去连 devUrl）→ 白屏。
 # 详见 tauri/build.rs：`dev = !has_feature("custom-protocol")`，该 feature 只有
 # tauri-cli 构建时才会加；裸 `cargo build --release` 编出来的二进制**不嵌前端**。
@@ -278,6 +292,11 @@ elif [ "$need_rust" = "1" ]; then
   fi
 else
   log "Rust 产物已是最新，跳过构建"
+fi
+
+# 构建都成功了 → 记录本次构建的 HEAD（下次切分支能识别出来强制重建）
+if [ -n "$CURRENT_HEAD" ]; then
+  echo "$CURRENT_HEAD" > "$HEAD_FILE"
 fi
 
 # ---------- 4. 重启 ----------
