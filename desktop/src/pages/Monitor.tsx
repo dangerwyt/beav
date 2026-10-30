@@ -1052,9 +1052,15 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
           `没抓到任何帖子${result?.skipNote ? `：${result.skipNote}` : '（请确认该平台 Chrome 已连接）'}`,
         );
       } else {
+        const scrapedPosts = (result as { scrapedPosts?: number })?.scrapedPosts ?? 0;
+        const updatedExisting = (result as { updatedExisting?: number })?.updatedExisting ?? 0;
+        const droppedDomain = (result as { droppedDomain?: number })?.droppedDomain ?? 0;
         showToast(
           'ok',
-          `补历史完成：扫描 ${scanned} 条${profileTotal > 0 ? `（主页共 ${profileTotal} 篇）` : ''}，补进 ${added} 篇历史，补全正文 ${enriched} 篇`,
+          `补历史完成：抓到 ${scrapedPosts || scanned} 条${profileTotal > 0 ? `（主页共 ${profileTotal} 篇）` : ''}，新建 ${added} 篇`
+          + (updatedExisting > 0 ? `，已存在 ${updatedExisting} 篇` : '')
+          + (droppedDomain > 0 ? `，域名不符丢弃 ${droppedDomain} 条` : '')
+          + `，补全正文 ${enriched} 篇`,
         );
       }
       if ((result?.detailSkipped ?? 0) > 0) {

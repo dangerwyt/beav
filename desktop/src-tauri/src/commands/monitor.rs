@@ -1574,6 +1574,9 @@ fn fetch_monitor_via_cdp(
     } else {
         limit
     };
+    let scraped_posts = posts.len() as i64;
+    let mut dropped_domain = 0i64;
+    let mut updated_existing = 0i64;
     for post in posts.iter().take(effective_limit) {
         let post_url = post
             .get("url")
@@ -1586,6 +1589,7 @@ fn fetch_monitor_via_cdp(
                 .map(|host| !same_registrable_domain(&host, &base_host))
                 .unwrap_or(true)
         {
+            dropped_domain += 1;
             continue;
         }
         let title = post
@@ -1771,6 +1775,7 @@ fn fetch_monitor_via_cdp(
         if is_new {
             created.push(record);
         } else {
+            updated_existing += 1;
             updated.push(record);
         }
     }
@@ -1798,6 +1803,10 @@ fn fetch_monitor_via_cdp(
         "scanned": scanned,
         "created": created,
         "updated": updated,
+        // 落库诊断：抓到的总条数 / 域名不符丢弃 / 已存在（更新）条数
+        "scrapedPosts": scraped_posts,
+        "droppedDomain": dropped_domain,
+        "updatedExisting": updated_existing,
         "capturedVia": "chrome-cdp",
         // 是否已翻到主页底部（历史抓完的判据）
         "historyExhausted": exhausted,
@@ -4925,6 +4934,10 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
 
     let mut stats = MonitorFetchStats::default();
     let mut scanned_total = 0i64;
+    // 落库诊断累计（抓到的条数 / 已存在 / 域名不符丢弃）
+    let mut scraped_total = 0i64;
+    let mut updated_total = 0i64;
+    let mut dropped_total = 0i64;
     // 主页声明的作品总数（进度条分母）：取各博主中的最大值
     let mut profile_total_max = 0i64;
     // 每个博主的滚动诊断（真机排查「只翻到首屏」用）
@@ -5006,6 +5019,9 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
             }
         };
         let scanned = result.get("scanned").and_then(Value::as_i64).unwrap_or(0);
+        scraped_total += result.get("scrapedPosts").and_then(Value::as_i64).unwrap_or(0);
+        updated_total += result.get("updatedExisting").and_then(Value::as_i64).unwrap_or(0);
+        dropped_total += result.get("droppedDomain").and_then(Value::as_i64).unwrap_or(0);
         let exhausted = result
             .get("historyExhausted")
             .and_then(Value::as_bool)
@@ -5223,6 +5239,10 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
         "watched": stats.watched,
         // 深翻时实际滚动到的条数
         "scanned": scanned_total,
+        // 落库诊断：抓到多少条、其中多少是已存在（更新）、多少因域名不符丢弃
+        "scrapedPosts": scraped_total,
+        "updatedExisting": updated_total,
+        "droppedDomain": dropped_total,
         // 深翻上限
         "limit": BACKFILL_MAX,
         // 主页声明的作品总数（进度条分母；未知为 0）
