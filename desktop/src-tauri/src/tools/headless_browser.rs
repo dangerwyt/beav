@@ -1147,6 +1147,20 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
     // 登录页用**前台**标签：后台标签会被 Chrome 节流，扫码回调轮询会卡住
     let target_id = platform_tab(&client, spec.platform_key, spec.login_url, false).await?;
 
+    // 关掉**残留的旧登录标签**：小红书的登录二维码按会话唯一，
+    // 多开一个标签请求新码，旧标签的码立刻失效（用户实测："开第二个时第一个显示过期"）。
+    // 只保留我们跟踪的这一个，避免多标签互相作废。
+    if let Ok(targets) = client.list_targets().await {
+        for (id, url) in targets {
+            if id == target_id {
+                continue;
+            }
+            if url.contains("/login") {
+                client.close_target(&id).await;
+            }
+        }
+    }
+
     let session_id = client.attach_to_target(&target_id).await?;
 
     // 顺序很重要：**必须先导航到登录页，再清 sessionStorage**。
@@ -1403,6 +1417,43 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
     })
 }
 
+/// 只在该标签**不在登录页**时才导航到主页。
+///
+/// 登录页是扫码回调的载体：一旦把它导航走，页面就不再轮询二维码状态，
+/// 手机端显示"登录成功"但网页端永远拿不到会话（用户实测踩到）。
+async fn navigate_home_unless_login(
+    client: &CdpClient,
+    session_id: &str,
+    login_url: &str,
+    home_url: &str,
+) {
+    let href = client
+        .evaluate(session_id, "location.href", false)
+        .await
+        .ok()
+        .and_then(|value| value.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    // 判断"是否停在登录入口"：
+    // - 有独立登录页的平台（小红书 /login、B 站 account.*/login）→ 看是否还在该 URL
+    // - 登录是首页弹窗的平台（抖音）→ login_url 就是首页，此时**不导航**，就地判定
+    let stripped_login = login_url.trim_end_matches('/');
+    let on_login_entry = href.contains("/login")
+        || (!stripped_login.is_empty() && href.starts_with(stripped_login))
+        || href.is_empty();
+    if on_login_entry {
+        // 正在登录/等待扫码回调 → 绝对不要动它
+        return;
+    }
+    let _ = client
+        .send_request(
+            "Page.navigate",
+            Some(json!({ "url": home_url })),
+            Some(session_id),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+}
+
 /// 采集登录态诊断证据（**只回 cookie 名称，不回值**，避免泄露会话）。
 ///
 /// 用于定位"明明登录了却检测不通过"：把页面真实状态（URL / 标题 / 是否还有登录按钮 /
@@ -1453,14 +1504,8 @@ pub async fn login_debug(ws_url: &str, platform: &str) -> Result<Value, String> 
 
     let target_id = platform_tab(&client, spec.platform_key, spec.home_url, true).await?;
     let session_id = client.attach_to_target(&target_id).await?;
-    let _ = client
-        .send_request(
-            "Page.navigate",
-            Some(json!({ "url": spec.home_url })),
-            Some(&session_id),
-        )
-        .await;
-    tokio::time::sleep(Duration::from_millis(2200)).await;
+    navigate_home_unless_login(&client, &session_id, spec.login_url, spec.home_url).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     let evidence = client.evaluate(&session_id, DEBUG_JS, false).await.ok();
 
     // 只取 cookie 名字 + 关键会话 cookie 的长度，不泄露值
@@ -1568,13 +1613,8 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
     // 停在登录页做"页头有没有登录按钮"的判定必然误判为未登录 —— 必须换到主页再判。
     let target_id = platform_tab(&client, spec.platform_key, spec.home_url, true).await?;
     let session_id = client.attach_to_target(&target_id).await?;
-    let _ = client
-        .send_request(
-            "Page.navigate",
-            Some(json!({ "url": spec.home_url })),
-            Some(&session_id),
-        )
-        .await;
+    // 关键：正在登录页上等待扫码回调时**不要导航**，否则回调链断掉
+    navigate_home_unless_login(&client, &session_id, spec.login_url, spec.home_url).await;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
