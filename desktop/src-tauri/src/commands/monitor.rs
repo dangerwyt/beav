@@ -5211,9 +5211,18 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
         let grew = counts.len() >= 2 && captured > first;
         // 抓到的数量达到主页声明的作品数 → 已经抓全，不该报警
         let reached_total = profile_total > 0 && captured >= profile_total;
+        // 主页声明数解析不到时（小红书新版文案可能不是"47 笔记"），
+        // 用滚动位置判断是否真的到底 —— 到底且不再增长就是抓全了。
+        let reached_bottom = diag
+            .get("reachedBottom")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let all_done = reached_total || (profile_total == 0 && reached_bottom);
 
         let text = if reached_total {
             format!("{name}：已抓全 {captured} 篇（与主页声明的 {profile_total} 篇一致）")
+        } else if all_done {
+            format!("{name}：已翻到主页底部，共抓到 {captured} 篇")
         } else if !scrolled {
             format!("{name}：页面没有发生滚动（滚动容器可能选错）")
         } else if !grew {
@@ -5226,7 +5235,7 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
         } else {
             format!("{name}：滚动加载正常（{first} → {captured} 条）")
         };
-        if !reached_total {
+        if !all_done {
             hint_level = "warn";
         }
         if hint.is_none() {

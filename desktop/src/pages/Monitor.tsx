@@ -1086,16 +1086,30 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       const diagDetail = (() => {
         const diags = (result as { scrollDiags?: { name?: string; diag?: Record<string, unknown> }[] })?.scrollDiags;
         const first = diags?.[0]?.diag;
-        if (!first) return undefined;
+        // 落库计数：抓到多少 / 新建多少 / 已存在多少 —— 直接回答"47 条去哪了"
+        const scrapedPosts = (result as { scrapedPosts?: number })?.scrapedPosts ?? 0;
+        const updatedExisting = (result as { updatedExisting?: number })?.updatedExisting ?? 0;
+        const droppedDomain = (result as { droppedDomain?: number })?.droppedDomain ?? 0;
+        const added = result?.newPosts ?? 0;
+        const parts: string[] = [];
+        if (scrapedPosts > 0) {
+          parts.push(
+            `抓到 ${scrapedPosts} → 新建 ${added} / 已存在 ${updatedExisting}`
+            + (droppedDomain > 0 ? ` / 丢弃 ${droppedDomain}` : ''),
+          );
+        }
+        if (!first) return parts.length ? parts.join(' · ') : undefined;
         const scroller = typeof first.scroller === 'string' ? first.scroller : '';
         const scrolled = first.scrolled === true;
         const loggedIn = first.loggedIn !== false;
         const counts = Array.isArray(first.counts) ? (first.counts as number[]) : [];
+        const reachedBottom = first.reachedBottom === true;
         return [
           loggedIn ? '已登录' : '未登录',
-          scrolled ? '发生了滚动' : '页面没有发生滚动',
+          reachedBottom ? '已到底' : (scrolled ? '发生了滚动' : '页面没有发生滚动'),
           scroller ? `容器 ${scroller}` : '',
           counts.length ? `每轮条数 ${counts.slice(0, 6).join('→')}` : '',
+          ...parts,
         ].filter(Boolean).join(' · ');
       })();
       setBackfillDiag((prev) => ({

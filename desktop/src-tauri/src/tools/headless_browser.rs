@@ -2408,11 +2408,15 @@ pub async fn scrape_profile_posts_paged(
         (() => {
             try {
                 const text = (document.body && document.body.innerText) || '';
-                let m = text.match(/笔记\s*([\d,]+)/);
-                if (!m) m = text.match(/作品\s*([\d,]+)/);
-                // B 站：视频 tab 的「视频 84」（投稿 105 可能含图文，优先取视频数）
-                if (!m) m = text.match(/视频\s*([\d,]+)/);
-                if (!m) m = text.match(/投稿\s*([\d,]+)/);
+                // 小红书新版是「47 笔记」（数字在前），旧版/其它站是「笔记 47」——两种顺序都试。
+                let m = text.match(/([\d,]+)\s*笔记/)
+                    || text.match(/笔记\s*([\d,]+)/)
+                    || text.match(/([\d,]+)\s*作品/)
+                    || text.match(/作品\s*([\d,]+)/)
+                    // B 站：视频 tab 的「视频 84」（投稿 105 可能含图文，优先取视频数）
+                    || text.match(/视频\s*([\d,]+)/)
+                    || text.match(/([\d,]+)\s*视频/)
+                    || text.match(/投稿\s*([\d,]+)/);
                 if (m) return parseInt(String(m[1]).replace(/,/g, ''), 10) || 0;
                 // 兜底：XHS SPA 全局状态里的作品数（他人主页也可能藏在这里）
                 const st = window.__INITIAL_STATE__;
@@ -2734,6 +2738,13 @@ pub async fn scrape_profile_posts_paged(
             );
         }
     }
+    // 是否已滚到底：maxScrollTop + clientHeight ≈ scrollHeight
+    let reached_bottom = {
+        let max_top = last_scroll.get("maxScrollTop").and_then(Value::as_f64).unwrap_or(0.0);
+        let client = last_scroll.get("clientHeight").and_then(Value::as_f64).unwrap_or(0.0);
+        let height = last_scroll.get("scrollHeight").and_then(Value::as_f64).unwrap_or(0.0);
+        height > 0.0 && max_top + client >= height - 24.0
+    };
     let diag = json!({
         "rounds": rounds,
         "captured": posts.len(),
@@ -2747,6 +2758,8 @@ pub async fn scrape_profile_posts_paged(
         "maxScrollTop": last_scroll.get("maxScrollTop").cloned().unwrap_or(Value::Null),
         "scrollHeight": last_scroll.get("scrollHeight").cloned().unwrap_or(Value::Null),
         "clientHeight": last_scroll.get("clientHeight").cloned().unwrap_or(Value::Null),
+        // 已滚到底（不依赖解析"47 笔记"，滚动位置本身就能证明）
+        "reachedBottom": reached_bottom,
         "scrolled": scrolled_any
     });
     let _ = client
