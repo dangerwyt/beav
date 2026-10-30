@@ -1751,6 +1751,24 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   )}
                   {isAdminUser && (
                     <button
+                      onClick={() => {
+                        void (async () => {
+                          try {
+                            const result = await window.ipcRenderer.monitor.chromeLoginDebug(chromeLoginPlatform);
+                            setLoginDebug(JSON.stringify(result, null, 2));
+                          } catch (e) {
+                            setLoginDebug(`诊断失败：${String(e)}`);
+                          }
+                        })();
+                      }}
+                      className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                      title="取回服务器 Chrome 里该平台页面的真实登录状态"
+                    >
+                      <Eye className="w-3 h-3" />诊断
+                    </button>
+                  )}
+                  {isAdminUser && (
+                    <button
                       onClick={() => void handleChromeLogout()}
                       disabled={!chromeStatus?.debugReady}
                       className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-red-500 hover:border-red-200 transition-colors disabled:opacity-50"

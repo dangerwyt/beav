@@ -221,6 +221,13 @@ need_web=0
 needs_build "$STAMP_DIR/rust.commit" "$RUST_BIN" $RUST_PATHS && need_rust=1
 needs_build "$STAMP_DIR/web.commit" "$WEB_OUT" $WEB_PATHS && need_web=1
 
+# 前端变了就必须重编 Rust：桌面端二进制在**编译期**把 dist/ 嵌进去
+# （tauri.conf.json 的 frontendDist）。只重建 dist 不重编二进制的话，
+# 桌面端仍在用旧的嵌入资源 —— 用户会遇到"改了前端但界面没变"。
+if [ "$need_web" = "1" ]; then
+  need_rust=1
+fi
+
 # 分支切换检测：checkout 会把所有文件时间刷成"现在"，时间戳判断会误判成"最新"
 # → 明明换了分支却不重建，产物和代码对不上（例如 main ↔ web）。
 # 这里记录上次构建时的 HEAD，HEAD 变了就强制全量重建。
