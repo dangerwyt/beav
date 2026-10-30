@@ -1179,7 +1179,13 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
         success?: boolean;
         removedWatchlist?: number;
         removedPosts?: number;
+        error?: string;
       };
+      // 同上：IPC 失败会被吞成 fallback，不检查 success 会误报「已清空 0 条」。
+      if (result && result.success === false) {
+        showToast('err', result.error || '清空失败（该操作可能仅管理员可用）');
+        return;
+      }
       setSelectedWatchId(null);
       await Promise.all([loadWatches(), loadPosts()]);
       showToast(
@@ -1209,7 +1215,15 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       const result = (await window.ipcRenderer.monitor.clearPosts()) as {
         success?: boolean;
         removedPosts?: number;
+        error?: string;
       };
+      // IPC 失败会被桥接层吞成 fallback（removedPosts=0），不检查就会显示
+      // 「已清空 0 条动态」—— 让人以为清空成功，其实什么都没发生。
+      // 典型场景：web 端清空是管理员专属操作，普通用户会被拒。
+      if (result && result.success === false) {
+        showToast('err', result.error || '清空动态失败（该操作可能仅管理员可用）');
+        return;
+      }
       await loadPosts();
       showToast('ok', `已清空 ${result?.removedPosts ?? 0} 条动态`);
     } catch (e) {

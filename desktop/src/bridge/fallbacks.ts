@@ -415,6 +415,18 @@ export function buildFallbackResponse(channel: string, error: unknown, payload?:
   ) {
     return { success: false, error: `${APP_BRAND.displayName} diagnostics action failed for "${channel}": ${message}` };
   }
+  // monitor 的**写操作**失败时，错误要原样透传：后端返回的是「该操作仅管理员可用」
+  // 这类具体原因，被包成通用文案后用户就不知道到底为什么操作没生效。
+  // 只列写操作 —— 读操作（:list / :get / :status）失败时返回空值才是对的。
+  if (
+    channel === 'monitor:clear'
+    || channel === 'monitor:clear-posts'
+    || channel === 'monitor:post-remove'
+    || channel === 'monitor:watch-remove'
+    || channel === 'monitor:patch-audio-batch'
+  ) {
+    return { success: false, error: message };
+  }
   if (
     channel.endsWith(':list')
     || channel.includes('get-sessions')

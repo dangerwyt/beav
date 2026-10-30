@@ -682,7 +682,14 @@ fn clear_posts(state: &State<'_, AppState>) -> Result<Value, String> {
     with_store_mut(state, |store| {
         let removed = store.monitored_posts.len();
         store.monitored_posts.clear();
-        Ok(json!({ "success": true, "removedPosts": removed }))
+        // 带上 store 路径与「本进程看到的条数」——
+        // 服务器上是 web 网关 + 桌面版两个进程，排查「清空了 0 条」时
+        // 需要一眼看出是数据在别的进程/store 里，还是本进程本来就没有。
+        Ok(json!({
+            "success": true,
+            "removedPosts": removed,
+            "storePath": state.store_path.display().to_string(),
+        }))
     })
 }
 

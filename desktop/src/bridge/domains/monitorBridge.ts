@@ -217,20 +217,31 @@ export function createMonitorBridge(core: BridgeCore) {
           timeoutMs: CHROME_TIMEOUT_MS,
           fallback: () => ({ success: false, loggedIn: false, note: '查询超时' }) as unknown as T,
         }),
-      clear: <T = { success: boolean; removedWatchlist: number; removedPosts: number }>() =>
+      clear: <T = { success: boolean; removedWatchlist: number; removedPosts: number; error?: string }>() =>
         core.invokeChannelGuarded<T>('monitor:clear', {}, {
           timeoutMs: READ_TIMEOUT_MS,
-          fallback: () => ({ success: false, removedWatchlist: 0, removedPosts: 0 }) as unknown as T,
+          // fallback 里必须带 error：清空是管理员专属操作，web 用户调用会被拒，
+          // 不带原因前端只能显示「已清空 0 条」，让人误以为清空成功了。
+          fallback: () => ({
+            success: false,
+            removedWatchlist: 0,
+            removedPosts: 0,
+            error: '清空失败（该操作仅管理员可用）',
+          }) as unknown as T,
         }),
       postRemove: <T = { success: boolean }>(id: string) =>
         core.invokeChannelGuarded<T>('monitor:post-remove', { id }, {
           timeoutMs: READ_TIMEOUT_MS,
           fallback: () => ({ success: false }) as unknown as T,
         }),
-      clearPosts: <T = { success: boolean; removedPosts: number }>() =>
+      clearPosts: <T = { success: boolean; removedPosts: number; error?: string }>() =>
         core.invokeChannelGuarded<T>('monitor:clear-posts', {}, {
           timeoutMs: READ_TIMEOUT_MS,
-          fallback: () => ({ success: false, removedPosts: 0 }) as unknown as T,
+          fallback: () => ({
+            success: false,
+            removedPosts: 0,
+            error: '清空失败（该操作仅管理员可用）',
+          }) as unknown as T,
         }),
       // 本地详情：CDP 抓正文（首次 ~20s，之后走缓存），不跳外部平台
       postDetail: <T = MonitorPostDetailResult>(id: string, refresh?: boolean) =>
