@@ -56,18 +56,6 @@ fn platform_tabs() -> &'static Mutex<HashMap<String, String>> {
     PLATFORM_TABS.get_or_init(Default::default)
 }
 
-/// 扫码开始时的登录 cookie 基线（platform → 值）。
-///
-/// 小红书登录成功后 `web_session` 的值会变（绑定到账号），以此判断"扫码是否完成"，
-/// 避免用"页面有没有登录按钮"这种在登录页必然误判的启发式。
-static SESSION_BASELINE: OnceLock<Mutex<HashMap<String, (String, std::time::Instant)>>> =
-    OnceLock::new();
-
-/// 扫码窗口：只有在这个时间窗内才走"基线未变=未登录"的短路。
-/// 超过窗口（用户其实是在服务器上手动登录的）就必须做真实检查，
-/// 否则手动登录永远检测不到。
-const SCAN_WINDOW: Duration = Duration::from_secs(180);
-
 /// 登录态缓存（platform → (cookie 值, 结果, 检测时刻)）。
 ///
 /// cookie 没变 → 会话没变 → 直接用上次结果，**完全不碰浏览器**。
@@ -88,12 +76,6 @@ pub fn invalidate_login_state(platform: &str) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.remove(platform);
-    }
-    if let Some(baseline) = SESSION_BASELINE.get() {
-        let mut baseline = baseline
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        baseline.remove(platform);
     }
 }
 
@@ -1236,20 +1218,6 @@ pub async fn capture_login_qr(ws_url: &str, spec: &QrPlatformSpec) -> Result<QrC
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
-    // 记录扫码前的登录 cookie 基线：登录成功后该值会变（绑定到账号），
-    // 用它判断"扫码是否完成"，避免用"页面上有没有登录按钮"在登录页上必然误判。
-    {
-        let baseline = login_cookie_value(&client, spec.cookie_name, spec.platform_key).await;
-        let mut map = SESSION_BASELINE
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        map.insert(
-            spec.platform_key.to_string(),
-            (baseline, std::time::Instant::now()),
-        );
-    }
-
     // 平台特有的前置操作（抖音要点「登录」弹窗）
     if !spec.prepare_js.is_empty() {
         let _ = client.evaluate(&session_id, spec.prepare_js, false).await;
@@ -1606,12 +1574,6 @@ pub async fn import_login_cookies(ws_url: &str, cookies: &[Value]) -> Result<usi
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
     }
-    if let Some(baseline) = SESSION_BASELINE.get() {
-        baseline
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-    }
     Ok(cookies.len())
 }
 
@@ -1637,30 +1599,14 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
     //
     // 判定策略：
     //   1) 记录扫码开始时 web_session 的基线值（capture_login_qr 里写入）
-    //   2) 值没变 → 还没登录 → 直接返回 false，**完全不动浏览器**（不打断扫码回调）
-    //   3) 值变了 → 登录已完成 → 把该标签导航到主页做一次真实判定
-    //      （此时导航是安全的：回调已经完成）
+    // 小红书：游客也会拿到 web_session（所以"有没有 cookie"不能用），只能看页面状态。
+    //
+    // 曾经这里有一条"cookie 值等于扫码基线 → 直接判未登录"的短路，但它有致命误判：
+    // 如果扫码时**本来就已经登录**（值不会再变），之后 3 分钟内所有检查都返回未登录
+    // —— 用户实测"浏览器明明登录着，界面一直显示平台未登录"就是这么来的。
+    // 现在去掉：不打扰登录中页面的责任交给 navigate_home_unless_login()（它只在
+    // 标签停在登录入口时才不导航），判定一律走真实页面检查。
     let current = login_cookie_value(&client, spec.cookie_name, platform).await;
-    let baseline = SESSION_BASELINE
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(platform)
-        .cloned()
-        .unwrap_or_else(|| (String::new(), std::time::Instant::now()));
-    let (baseline_value, baseline_at) = baseline;
-
-    // 只有**扫码窗口内**才走"基线没变 = 未登录"的短路：
-    // 窗口外（比如用户是在服务器上手动登录的，根本没有扫码基线）必须做真实检查，
-    // 否则手动登录永远检测不到 —— 这正是用户遇到的情况。
-    if !baseline_value.is_empty()
-        && current == baseline_value
-        && baseline_at.elapsed() < SCAN_WINDOW
-    {
-        client.close().await;
-        return Ok(false);
-    }
-    // 会话变了 / 没有基线 / 已过扫码窗口 → 到主页做真实判定
     {
         let cache = LOGIN_STATE_CACHE
             .get_or_init(Default::default)
@@ -1683,6 +1629,19 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
     // 注意：登录页 `/login` 上本来就有个红色「登录」提交按钮，
     // 停在登录页做"页头有没有登录按钮"的判定必然误判为未登录 —— 必须换到主页再判。
     let target_id = platform_tab(&client, spec.platform_key, spec.home_url, true).await?;
+    // 关掉该平台的**残留标签**（上次运行留下的 / 手工开的）：只保留跟踪的这一个，
+    // 否则界面上会看到"两个小红书标签"，而登录码按会话唯一、多标签会互相作废。
+    if let Ok(targets) = client.list_targets().await {
+        let domain = platform_domain(spec.platform_key);
+        for (id, url) in targets {
+            if id == target_id {
+                continue;
+            }
+            if url.contains(domain) {
+                client.close_target(&id).await;
+            }
+        }
+    }
     let session_id = client.attach_to_target(&target_id).await?;
     // 关键：正在登录页上等待扫码回调时**不要导航**，否则回调链断掉
     navigate_home_unless_login(&client, &session_id, spec.login_url, spec.home_url).await;
@@ -1766,35 +1725,6 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
     Ok(logged)
 }
 
-/// 该平台 cookie 的指纹（只看该域名的 cookie 名+值）。
-///
-/// 用于判断"会话有没有变"：变了才需要重新加载页面看登录态。
-async fn cookie_signature(client: &CdpClient, platform: &str) -> String {
-    let Ok(result) = client.send_request("Storage.getCookies", None, None).await else {
-        return String::new();
-    };
-    let domain = platform_domain(platform);
-    let mut parts: Vec<String> = result
-        .get("cookies")
-        .and_then(Value::as_array)
-        .map(|cookies| {
-            cookies
-                .iter()
-                .filter_map(|cookie| {
-                    let cookie_domain = cookie.get("domain").and_then(Value::as_str)?;
-                    if !cookie_domain.contains(domain) {
-                        return None;
-                    }
-                    let name = cookie.get("name").and_then(Value::as_str)?;
-                    let value = cookie.get("value").and_then(Value::as_str)?;
-                    Some(format!("{name}={value}"))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    parts.sort();
-    parts.join("|")
-}
 
 /// 取该平台**登录态 cookie 的值**（不是全部 cookie 的指纹）。
 ///
