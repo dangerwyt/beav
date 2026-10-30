@@ -164,6 +164,24 @@ const SETTINGS_ACTIVATION_DEBOUNCE_MS = 80;
 const SETTINGS_TAB_POLL_DELAY_MS = 300;
 const FILE_INDEX_DASHBOARD_CACHE_KEY = 'redbox:file-index-dashboard:v1';
 const CHAT_FAMILY_ROUTE_SCOPES: AiModelRouteScope[] = ['chat', 'wander', 'team', 'knowledge', 'redclaw'];
+/**
+ * ElevenLabs **直连**时可用的转写模型（官方文档 ElevenLabs Models → STT）。
+ *
+ * 为什么需要内置列表：`scribe_*` 是 ElevenLabs 自己的模型，不在任何「供应商」条目
+ * （relayrouter / 百炼）的模型列表里 → 匹配不到源时模型下拉是空的，
+ * 用户只能去选一个不相干的源，结果地址与模型对不上
+ * （实测：地址是 api.elevenlabs.io、模型却是 relayrouter 的 qwen3-asr-flash-filetrans
+ * → ElevenLabs 报 400 unsupported_model）。
+ *
+ * 注意：走 relayrouter 中转时**不要**用这份列表 —— 那边用的是中转自己的模型名
+ * （如 qwen3-asr-flash-filetrans）。
+ */
+const ELEVENLABS_TRANSCRIPTION_MODELS: AiModelOption[] = [
+  { id: 'scribe_v2', label: 'scribe_v2（推荐，通用）' },
+  { id: 'scribe_v2_realtime', label: 'scribe_v2_realtime（实时场景）' },
+  { id: 'scribe_v2_medical', label: 'scribe_v2_medical（医疗音频）' },
+  { id: 'scribe_v1', label: 'scribe_v1（已废弃）' },
+];
 type RedclawProfileDraft = {
   user: string;
   creatorProfile: string;
@@ -1637,8 +1655,18 @@ export function Settings({
   }, [getAiSourceById, voiceSourceId]);
 
   const transcriptionSourceModels = useMemo(() => {
+    // ElevenLabs **直连**时，模型名不来自任何「供应商」条目（scribe_* 是
+    // ElevenLabs 自己的模型，不在 relayrouter/百炼的模型列表里）。
+    // 匹配不到源时模型下拉就是空的 → 用户只能去选一个不相干的源，
+    // 结果模型名与地址对不上（实测：地址是 ElevenLabs、模型却是
+    // relayrouter 的 qwen3-asr-flash-filetrans → 400 unsupported_model）。
+    // 这里按实际生效的地址给出内置列表。
+    const endpoint = String(formData.transcription_endpoint || '').trim().toLowerCase();
+    if (endpoint.includes('elevenlabs.io')) {
+      return ELEVENLABS_TRANSCRIPTION_MODELS.map((item) => ({ ...item }));
+    }
     return selectedTranscriptionSource ? filterAiModelsByCapability(getSourceModelList(selectedTranscriptionSource), 'transcription') : [];
-  }, [getSourceModelList, selectedTranscriptionSource]);
+  }, [getSourceModelList, selectedTranscriptionSource, formData.transcription_endpoint]);
 
   const embeddingSourceModels = useMemo(() => {
     return selectedEmbeddingSource ? filterAiModelsByCapability(getSourceModelList(selectedEmbeddingSource), 'embedding') : [];
@@ -2455,6 +2483,26 @@ export function Settings({
       [field]: value,
     }));
   }, [markAiModelSettingsDraftDirty]);
+
+  // 转写地址 ↔ 模型名**绑定**：
+  // - 地址是 ElevenLabs → 模型必须是 scribe_*（否则 400 unsupported_model），
+  //   默认给 scribe_v2（官方推荐）。这同时修掉「地址 ElevenLabs + 模型
+  //   qwen3-asr-flash-filetrans」这种历史错配（模型名是百炼/中转站的命名）。
+  // - 地址不是 ElevenLabs → scribe_* 一定是错的（那是 ElevenLabs 专用模型名），
+  //   清空让用户填该服务自己的模型名。
+  useEffect(() => {
+    const endpoint = String(formData.transcription_endpoint || '').trim().toLowerCase();
+    const currentModel = String(formData.transcription_model || '').trim();
+    const isElevenLabs = endpoint.includes('elevenlabs.io');
+    const currentIsScribe = ELEVENLABS_TRANSCRIPTION_MODELS.some(
+      (item) => item.id.toLowerCase() === currentModel.toLowerCase(),
+    );
+    if (isElevenLabs && !currentIsScribe) {
+      setAiModelFormField('transcription_model', 'scribe_v2');
+    } else if (!isElevenLabs && currentIsScribe) {
+      setAiModelFormField('transcription_model', '');
+    }
+  }, [formData.transcription_endpoint, formData.transcription_model, setAiModelFormField]);
 
   const handleRemoveSourceModel = (sourceId: string, modelId: string) => {
     const normalizedModel = String(modelId || '').trim();
@@ -7072,6 +7120,35 @@ export function Settings({
 	                          modelDisabled: !transcriptionSourceModels.length,
 	                          modelPlaceholder: '请先在该供应商中添加模型',
 	                        })}
+	                        <div className="border-t border-border/70 px-3 py-2">
+	                          <div className="text-xs font-medium text-text-secondary">
+	                            自定义转写服务（可选；与上面的供应商下拉二选一，填了这里就以这里为准）
+	                          </div>
+	                          <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
+	                            <input
+	                              value={formData.transcription_endpoint}
+	                              onChange={(event) => setAiModelFormField('transcription_endpoint', event.target.value)}
+	                              placeholder="地址：https://api.elevenlabs.io/v1/speech-to-text"
+	                              className="w-full rounded-lg border border-border bg-surface-secondary px-3 py-2 text-sm focus:border-accent-primary focus:outline-none"
+	                            />
+	                            <input
+	                              value={formData.transcription_key}
+	                              onChange={(event) => setAiModelFormField('transcription_key', event.target.value)}
+	                              placeholder="Key：你的 STT 服务密钥"
+	                              type="password"
+	                              className="w-full rounded-lg border border-border bg-surface-secondary px-3 py-2 text-sm focus:border-accent-primary focus:outline-none"
+	                            />
+	                          </div>
+	                          <div className="mt-2 text-xs text-text-tertiary">
+	                            模型名（不在上面的列表里时填这里）
+	                          </div>
+	                          <input
+	                            value={formData.transcription_model}
+	                            onChange={(event) => setAiModelFormField('transcription_model', event.target.value)}
+	                            placeholder="ElevenLabs 直连：scribe_v2；relayrouter 中转：qwen3-asr-flash-filetrans"
+	                            className="mt-1 w-full rounded-lg border border-border bg-surface-secondary px-3 py-2 text-sm focus:border-accent-primary focus:outline-none"
+	                          />
+	                        </div>
 	                        {(() => {
 	                          // 只读提示：显示**实际生效**的转写地址。
 	                          //

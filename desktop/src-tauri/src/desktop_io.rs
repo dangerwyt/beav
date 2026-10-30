@@ -214,6 +214,10 @@ pub(crate) fn run_curl_transcription_request(
                 "（鉴权失败：请求用的 key 无效 —— 请核对「设置 > 语音转写」里配置的 \
                  transcription endpoint 与 key 是否属于同一个服务；官方登录态过期也会这样）"
             }
+            400 => {
+                "（请求被拒：最常见是模型名与该服务不匹配 —— 直连 ElevenLabs 只认 \
+                 scribe_v2 / scribe_v2_realtime / scribe_v2_medical，走中转站则用中转自己的模型名）"
+            }
             404 => "（接口不存在：检查 transcription endpoint 是否该带 /v1 或模型是否支持该接口）",
             413 => "（音频过大：触发服务端请求体上限）",
             429 => "（触发限流：稍后再试或降低转写并发）",
