@@ -4938,6 +4938,8 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
     let mut scraped_total = 0i64;
     let mut updated_total = 0i64;
     let mut dropped_total = 0i64;
+    // 实际执行了几次 fetch（>1 说明被重复触发了）
+    let mut fetch_runs = 0i64;
     // 主页声明的作品总数（进度条分母）：取各博主中的最大值
     let mut profile_total_max = 0i64;
     // 每个博主的滚动诊断（真机排查「只翻到首屏」用）
@@ -5018,6 +5020,7 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
                 continue;
             }
         };
+        fetch_runs += 1;
         let scanned = result.get("scanned").and_then(Value::as_i64).unwrap_or(0);
         scraped_total += result.get("scrapedPosts").and_then(Value::as_i64).unwrap_or(0);
         updated_total += result.get("updatedExisting").and_then(Value::as_i64).unwrap_or(0);
@@ -5251,6 +5254,30 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
         }
     }
 
+    // 库内实况：直接读 store，定位"新建了 N 条却只显示几条"这类问题
+    let (store_for_watch, store_total, store_orphan) = {
+        let target_watch = watch_id.clone();
+        with_store(&state, |store| {
+            let total = store.monitored_posts.len() as i64;
+            let for_watch = target_watch
+                .as_deref()
+                .map(|id| {
+                    store
+                        .monitored_posts
+                        .iter()
+                        .filter(|post| post.watch_id.as_deref() == Some(id))
+                        .count() as i64
+                })
+                .unwrap_or(0);
+            let orphan = store
+                .monitored_posts
+                .iter()
+                .filter(|post| post.watch_id.is_none())
+                .count() as i64;
+            Ok((for_watch, total, orphan))
+        })?
+    };
+
     let summary = json!({
         "success": true,
         "watched": stats.watched,
@@ -5288,6 +5315,11 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
         // 历史视频已转后台线程自动「下载+转写」，这里报启动处理的数量
         "pendingVideos": stats.pending_videos,
         "failed": stats.failed,
+        // 库内实况：直接读 store，回答"新建了 47 为什么只显示 5 条"
+        "fetchRuns": fetch_runs,
+        "storePostsForWatch": store_for_watch,
+        "storePostsTotal": store_total,
+        "storePostsOrphan": store_orphan,
         "ranAt": now,
     });
     println!("[monitor history] backfill summary: {}", summary);

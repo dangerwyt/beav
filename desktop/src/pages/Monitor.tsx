@@ -1098,6 +1098,16 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
             + (droppedDomain > 0 ? ` / 丢弃 ${droppedDomain}` : ''),
           );
         }
+        // 库内实况：直接回答"新建了 N 条为什么只显示 M 条"
+        const storeForWatch = (result as { storePostsForWatch?: number })?.storePostsForWatch;
+        const storeTotal = (result as { storePostsTotal?: number })?.storePostsTotal;
+        const fetchRuns = (result as { fetchRuns?: number })?.fetchRuns;
+        if (typeof storeForWatch === 'number') {
+          parts.push(`库内该博主 ${storeForWatch} 条 / 全库 ${storeTotal ?? 0} 条`);
+        }
+        if ((fetchRuns ?? 0) > 1) {
+          parts.push(`抓取执行了 ${fetchRuns} 次`);
+        }
         if (!first) return parts.length ? parts.join(' · ') : undefined;
         const scroller = typeof first.scroller === 'string' ? first.scroller : '';
         const scrolled = first.scrolled === true;
