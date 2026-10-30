@@ -497,14 +497,49 @@ fn watch_add(state: &State<'_, AppState>, payload: &Value) -> Result<Value, Stri
     let name = str_field(payload, "name").ok_or_else(|| "缺少博主名称 name".to_string())?;
     let now = now_i64();
     let owner = crate::identity::owner_or_admin();
+    let platform = str_field(payload, "platform").unwrap_or_default();
+    let profile_url = str_field(payload, "profileUrl")
+        .or_else(|| str_field(payload, "profile_url"))
+        .map(|url| crate::tools::headless_browser::normalize_profile_url(&url));
+    // 判重键：同一用户 + 同一平台 + 同一主页（归一化后的裸 URL）。
+    //
+    // 为什么必须判重：同一博主建两个监控项时，两个 watch 会轮流抓同一批帖子，
+    // 而落库按 (owner, 裸URL) 去重 → 帖子只会归属其中**一个** watch，
+    // 另一个 watch 的卡片永远显示「已收录 0 篇」，用户会以为抓取坏了。
+    // 重复添加同一个博主属于误操作，直接提示而不是默默建第二条。
+    let dedupe_key = watch_dedupe_key(&owner, &platform, profile_url.as_deref());
+    if let Some(key) = dedupe_key.as_ref() {
+        let duplicate = with_store(state, |store| {
+            Ok(store
+                .competitor_watchlist
+                .iter()
+                .find(|item| {
+                    watch_dedupe_key(&item.owner, &item.platform, item.profile_url.as_deref())
+                        .as_ref()
+                        == Some(key)
+                })
+                .cloned())
+        })?;
+        if let Some(existing) = duplicate {
+            // 返回 Ok({success:false}) 而不是 Err：IPC 通道会把 Err 包成
+            // 「host request failed for "monitor:watch-add"」的通用文案，
+            // 把这里的具体原因盖掉，用户就看不到「已存在」这个关键信息了。
+            return Ok(json!({
+                "success": false,
+                "duplicate": true,
+                "error": format!(
+                    "「{}」已在监控列表中（ID {}），请勿重复添加同一博主",
+                    existing.name, existing.id
+                ),
+            }));
+        }
+    }
     let record = crate::CompetitorWatchRecord {
         id: make_id("watch"),
         owner,
         name,
-        platform: str_field(payload, "platform").unwrap_or_default(),
-        profile_url: str_field(payload, "profileUrl")
-            .or_else(|| str_field(payload, "profile_url"))
-            .map(|url| crate::tools::headless_browser::normalize_profile_url(&url)),
+        platform,
+        profile_url,
         handle: str_field(payload, "handle"),
         note: str_field(payload, "note"),
         enabled: payload
@@ -525,6 +560,28 @@ fn watch_add(state: &State<'_, AppState>, payload: &Value) -> Result<Value, Stri
         store.competitor_watchlist.push(record.clone());
         Ok(json!({ "success": true, "item": record }))
     })
+}
+
+/// 监控项判重键：`owner + 平台 + 归一化主页 URL`。
+///
+/// 主页 URL 要去掉 query：小红书的 `xsec_token` / `xsec_source` 每次会话都变，
+/// 带 token 比较会把同一个博主判成两个。
+/// 主页 URL 缺失时返回 `None` —— 没有 URL 就无从判重。
+fn watch_dedupe_key(owner: &str, platform: &str, profile_url: Option<&str>) -> Option<String> {
+    let url = profile_url?.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let bare = url.split('?').next().unwrap_or(url).trim_end_matches('/');
+    if bare.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}|{}|{}",
+        owner.trim(),
+        platform.trim().to_ascii_lowercase(),
+        bare.to_ascii_lowercase()
+    ))
 }
 
 fn watch_list(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
@@ -961,6 +1018,31 @@ fn platform_of(url: &str) -> String {
         .to_string()
 }
 
+/// 决定一条帖子记录归属哪个监控项（`watch_id`）。
+///
+/// 返回 `Some(watch_id)` 表示这条帖子归该监控项所有，`None` 表示保持原样（不覆盖）。
+///
+/// 背景：落库时如果无条件写 `watch_id = 当前 watch`，那么「同一个博主被建了
+/// 两个监控项」（或两个用户监控同一博主）时，后抓的一方会把先抓的记录整个抢走 ——
+/// 先抓的那个用户的卡片上「已收录 N 篇」会凭空归零，看起来就像「抓到了却没存进去」。
+///
+/// 规则：
+/// - 记录已有归属，且那个监控项**还在** → **保留原归属**，不抢（不同监控项各管各的）。
+/// - 记录已有归属，但那个监控项**已被删除** → 归给当前监控项。
+///   否则这些帖子会永远挂在不存在的 watch 上，卡片数恒为 0、也永远不会被接管。
+/// - 记录还没有归属（临时粘贴单帖抓的孤儿记录）→ 归给当前监控项（顺手收编）。
+/// - 新记录 → 归给当前监控项。
+fn resolve_watch_id(
+    existing_watch_id: Option<&str>,
+    current_watch_id: Option<&str>,
+    original_watch_exists: bool,
+) -> Option<String> {
+    match existing_watch_id {
+        Some(owner) if original_watch_exists => Some(owner.to_string()),
+        _ => current_watch_id.map(str::to_string),
+    }
+}
+
 /// 单次抓取条数：**固定值，不再对用户开放配置**。
 ///
 /// 之前由前端输入框 + `store.monitor_scan_limit` 配置，但实际只有一个合理量级（每天增量窗口），
@@ -1192,13 +1274,34 @@ fn fetch_monitor(
         };
 
         // 与已抓取的同 post_url 对比，判断是否新动态。
-        let existing: Option<crate::MonitoredPostRecord> =
+        // 同样按「归属用户 + URL」限定：否则两个用户监控同一博主时，
+        // 后抓的会把先抓的记录抢走（watch_id 被覆盖），先抓的用户卡片上的条数归零。
+        let scope_owner = watch
+            .as_ref()
+            .map(|item| item.owner.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(crate::identity::owner_or_admin);
+        let (existing, original_watch_exists): (Option<crate::MonitoredPostRecord>, bool) =
             with_store_mut(state, |store| {
-                Ok(store
+                let found = store
                     .monitored_posts
                     .iter()
-                    .find(|item| &item.post_url == candidate)
-                    .cloned())
+                    .find(|item| {
+                        &item.post_url == candidate
+                            && crate::identity::owner_equals(&item.owner, &scope_owner)
+                    })
+                    .cloned();
+                let alive = found
+                    .as_ref()
+                    .and_then(|item| item.watch_id.as_deref())
+                    .map(|watch_id| {
+                        store
+                            .competitor_watchlist
+                            .iter()
+                            .any(|entry| entry.id == watch_id)
+                    })
+                    .unwrap_or(false);
+                Ok((found, alive))
             })?;
 
         let (is_new, prev_likes, prev_comments) = match &existing {
@@ -1225,7 +1328,11 @@ fn fetch_monitor(
                 .filter(|value| !value.is_empty())
                 .or_else(|| watch.as_ref().map(|item| item.owner.clone()).filter(|value| !value.is_empty()))
                 .unwrap_or_else(crate::identity::owner_or_admin),
-            watch_id: watch_id.clone(),
+            watch_id: resolve_watch_id(
+                existing.as_ref().and_then(|previous| previous.watch_id.as_deref()),
+                watch_id.as_deref(),
+                original_watch_exists,
+            ),
             platform: platform.clone(),
             author: author_name.clone(),
             author_url: watch.as_ref().and_then(|item| item.profile_url.clone()),
@@ -1602,13 +1709,42 @@ fn fetch_monitor_via_cdp(
         // 完整 URL（含 token）留在 post_url 里供「原文」打开。
         let post_key = post_url.split('?').next().unwrap_or(&post_url).to_string();
 
-        let existing: Option<crate::MonitoredPostRecord> = with_store_mut(state, |store| {
-            Ok(store
-                .monitored_posts
-                .iter()
-                .find(|item| item.post_url.split('?').next().unwrap_or(&item.post_url) == post_key)
-                .cloned())
-        })?;
+        // 找已有记录：**按 (归属用户, 裸 URL) 匹配**，同一用户下的同一条帖子只留一份。
+        //
+        // 原来只有全局匹配（连 owner 都不看）。两个用户监控同一个博主时，
+        // 后抓的那个会把先抓的记录整个抢走 —— watch_id 被覆盖后，先抓的用户
+        // 卡片上的「已收录 N 篇」凭空归零（跨用户串数据）。
+        //
+        // 归属用户必须取**监控项的 owner**，不能取当前请求的 owner：
+        // 定时任务线程里没有请求身份（= admin），但它抓的是各用户自己的监控项，
+        // 用 admin 去比会把所有用户的帖子混成一堆。
+        let scope_owner = watch
+            .map(|item| item.owner.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(crate::identity::owner_or_admin);
+        // 同时查出「原归属的监控项是否还存在」——已被删除的 watch 其帖子要能被接管。
+        let (existing, original_watch_exists): (Option<crate::MonitoredPostRecord>, bool) =
+            with_store_mut(state, |store| {
+                let found = store
+                    .monitored_posts
+                    .iter()
+                    .find(|item| {
+                        item.post_url.split('?').next().unwrap_or(&item.post_url) == post_key
+                            && crate::identity::owner_equals(&item.owner, &scope_owner)
+                    })
+                    .cloned();
+                let alive = found
+                    .as_ref()
+                    .and_then(|item| item.watch_id.as_deref())
+                    .map(|watch_id| {
+                        store
+                            .competitor_watchlist
+                            .iter()
+                            .any(|entry| entry.id == watch_id)
+                    })
+                    .unwrap_or(false);
+                Ok((found, alive))
+            })?;
         // 已存在：点赞数变化视为「动态信号」；新链接：视为新动态。
         let (is_new, prev_likes, prev_comments) = match &existing {
             Some(previous) => (false, previous.likes, previous.comments),
@@ -1633,6 +1769,7 @@ fn fetch_monitor_via_cdp(
         // （实测踩坑：补历史一次，73 条视频全变 image、正文 36→7、赞藏评归零）。
         // 抖音的 URL 就能判定媒体类型：/video/ 是视频，/note/ 是图文。
         let looks_like_video = post_url.contains("/video/");
+        let current_watch_id = watch.map(|item| item.id.as_str());
         let record = crate::MonitoredPostRecord {
             id: existing
                 .as_ref()
@@ -1644,7 +1781,12 @@ fn fetch_monitor_via_cdp(
                 .filter(|value| !value.is_empty())
                 .or_else(|| watch.map(|item| item.owner.clone()).filter(|value| !value.is_empty()))
                 .unwrap_or_else(crate::identity::owner_or_admin),
-            watch_id: watch.map(|item| item.id.clone()),
+            // 归属不被抢：已有归属就保留（见 resolve_watch_id 的注释）。
+            watch_id: resolve_watch_id(
+                existing.as_ref().and_then(|previous| previous.watch_id.as_deref()),
+                current_watch_id,
+                original_watch_exists,
+            ),
             platform: platform.to_string(),
             author: author_name.clone(),
             author_url: watch.and_then(|item| item.profile_url.clone()),
@@ -5503,5 +5645,94 @@ pub fn start_monitor_scheduler(app: AppHandle) {
                 // 跑完后循环回到顶部，重新计算下一个 00:00（= 次日），天然每天只触发一次。
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_watch_id, watch_dedupe_key};
+
+    /// 回归守卫：已有归属的帖子不能被另一个监控项抢走。
+    ///
+    /// 实测踩坑：同一博主建两个监控项 / 两个用户监控同一博主时，
+    /// 落库若无条件覆盖 watch_id，先抓的一方卡片上的「已收录 N 篇」会凭空归零，
+    /// 看起来就像「抓到了却没存进去」。
+    #[test]
+    fn resolve_watch_id_keeps_existing_owner() {
+        // 已有归属且原监控项还在 → 保留原归属，不被抢
+        assert_eq!(
+            resolve_watch_id(Some("watch-a"), Some("watch-b"), true),
+            Some("watch-a".to_string())
+        );
+        // 孤儿记录（无归属）→ 归给当前监控项
+        assert_eq!(
+            resolve_watch_id(None, Some("watch-b"), false),
+            Some("watch-b".to_string())
+        );
+        // 新记录 → 归给当前监控项
+        assert_eq!(resolve_watch_id(None, None, false), None);
+        // 已有归属 + 无当前监控项（临时粘贴单帖）→ 仍保留原归属
+        assert_eq!(
+            resolve_watch_id(Some("watch-a"), None, true),
+            Some("watch-a".to_string())
+        );
+    }
+
+    /// 回归守卫：原监控项已被删除时，帖子要能被新监控项接管。
+    ///
+    /// `watch_remove` 不删帖子，所以这些记录会永远挂在不存在的 watch 上 ——
+    /// 卡片数恒为 0，再抓也永远接不回来。
+    #[test]
+    fn resolve_watch_id_reclaims_orphaned_watch() {
+        // 原监控项已删 → 归给当前监控项
+        assert_eq!(
+            resolve_watch_id(Some("deleted-watch"), Some("watch-b"), false),
+            Some("watch-b".to_string())
+        );
+        // 原监控项已删 + 没有当前监控项 → 无归属（不凭空造一个）
+        assert_eq!(resolve_watch_id(Some("deleted-watch"), None, false), None);
+    }
+
+    /// 回归守卫：同一博主的判重必须忽略会变的 xsec_token。
+    ///
+    /// 小红书主页链接每次会话都带不同的 `xsec_token` / `xsec_source`，
+    /// 带 token 比较会把同一个博主判成两个 → 重复建监控项 → 帖子互相抢归属。
+    #[test]
+    fn watch_dedupe_key_ignores_volatile_token() {
+        let with_token = watch_dedupe_key(
+            "alice",
+            "xiaohongshu",
+            Some("https://www.xiaohongshu.com/user/profile/abc?xsec_token=TOKEN1&xsec_source=pc_feed"),
+        );
+        let other_token = watch_dedupe_key(
+            "alice",
+            "xiaohongshu",
+            Some("https://www.xiaohongshu.com/user/profile/abc?xsec_token=TOKEN2&xsec_source=pc_search"),
+        );
+        assert_eq!(with_token, other_token);
+        assert!(with_token.is_some());
+    }
+
+    #[test]
+    fn watch_dedupe_key_separates_users_and_platforms() {
+        let base = watch_dedupe_key("alice", "xiaohongshu", Some("https://x.com/u/abc"));
+        // 不同用户 → 不同 key（各人可以监控同一个博主）
+        assert_ne!(
+            base,
+            watch_dedupe_key("bob", "xiaohongshu", Some("https://x.com/u/abc"))
+        );
+        // 不同平台 → 不同 key
+        assert_ne!(
+            base,
+            watch_dedupe_key("alice", "douyin", Some("https://x.com/u/abc"))
+        );
+        // 不同博主 → 不同 key
+        assert_ne!(
+            base,
+            watch_dedupe_key("alice", "xiaohongshu", Some("https://x.com/u/xyz"))
+        );
+        // 无主页 URL → 不判重（返回 None）
+        assert!(watch_dedupe_key("alice", "xiaohongshu", None).is_none());
+        assert!(watch_dedupe_key("alice", "xiaohongshu", Some("   ")).is_none());
     }
 }

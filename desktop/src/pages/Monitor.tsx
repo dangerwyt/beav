@@ -1322,13 +1322,19 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       return;
     }
     try {
-      await window.ipcRenderer.monitor.watchAdd({
+      const result = (await window.ipcRenderer.monitor.watchAdd({
         name,
         platform: addForm.platform,
         profileUrl,
         note: addForm.note.trim() || undefined,
         // 监控统一由凌晨增量任务跑：enabled / interval_hours 取后端默认值（true / 24）
-      });
+      })) as { success?: boolean; error?: string } | undefined;
+      // 后端失败（比如同一博主重复添加）会带上具体原因，必须展示出来 ——
+      // 否则用户点了「添加」却什么都没发生，也不知道原因。
+      if (result && result.success === false) {
+        setAddError(result.error || '添加失败');
+        return;
+      }
       setAddOpen(false);
       setAddForm({ name: '', platform: '', profileUrl: '', note: '' });
       setAddError('');

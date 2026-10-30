@@ -22,6 +22,7 @@
 
 - [maintenance/clean-douyin-titles.mjs](/desktop/scripts/maintenance/clean-douyin-titles.mjs): 回洗存量抖音标题（去前导「置顶」/点赞数、去重复文案）。`--dry-run` 只报告；`--self-test` 跑 10 条回归用例；`--store <path>` 指定文件
 - [maintenance/fix-video-audio-flag.mjs](/desktop/scripts/maintenance/fix-video-audio-flag.mjs): 用 ffprobe 探测本地视频是否含音轨，回填 `videoHasAudio` 并把无音轨的分析记录标为 `no-audio`。`--dry-run` / `--store` / `--ffprobe` 可用
+- [maintenance/dedupe-watch-list.mjs](/desktop/scripts/maintenance/dedupe-watch-list.mjs): 检测 / 合并「同一用户下重复的监控项」（同一主页被建了多条）。重复项会让两个 watch 轮流抓同一批帖子，而落库按 (owner, 裸URL) 去重 → 只有一个 watch 能拿到帖子，另一个卡片恒显示「已收录 0 篇」。默认 `--dry-run` 只报告，`--merge` 才实际合并（帖子迁移到保留的主项，同一条帖子不重复入库）
 
 ## Artifact Paths
 

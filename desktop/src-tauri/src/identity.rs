@@ -51,3 +51,12 @@ pub(crate) fn owner_matches(owner: &str) -> bool {
         Some(current) => current == effective(owner),
     }
 }
+
+/// 两个归属是否指向同一个用户（空 owner 归 admin）。
+///
+/// 与 `owner_matches` 的区别：那个问「**当前请求身份**能不能访问这条数据」，
+/// 这个问「这两条数据是不是同一个用户的」。做去重/归属判定时必须用后者 ——
+/// 定时任务线程没有请求身份（= admin），拿它去比会把各用户的帖子混成一堆。
+pub(crate) fn owner_equals(left: &str, right: &str) -> bool {
+    effective(left) == effective(right)
+}
