@@ -1108,6 +1108,18 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
         if ((fetchRuns ?? 0) > 1) {
           parts.push(`抓取执行了 ${fetchRuns} 次`);
         }
+        // 视频诊断：直接回答"补齐了 N 篇为什么一个视频都没下载"
+        const videoDiags = (result as {
+          videoDiags?: { name?: string; posts?: number; typedVideo?: number; missingType?: number; pending?: number }[];
+        })?.videoDiags;
+        for (const item of videoDiags ?? []) {
+          if (!item?.posts) continue;
+          parts.push(
+            `视频 ${item.typedVideo ?? 0}/${item.posts} 篇识别为视频`
+            + (item.pending ? `，已启动 ${item.pending} 个下载` : '，未启动下载')
+            + ((item.missingType ?? 0) > 0 ? `（${item.missingType} 篇缺媒体类型）` : ''),
+          );
+        }
         if (!first) return parts.length ? parts.join(' · ') : undefined;
         const scroller = typeof first.scroller === 'string' ? first.scroller : '';
         const scrolled = first.scrolled === true;

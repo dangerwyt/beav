@@ -5086,6 +5086,8 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
     let mut profile_total_max = 0i64;
     // 每个博主的滚动诊断（真机排查「只翻到首屏」用）
     let mut scroll_diags: Vec<(String, Value)> = Vec::new();
+    // 每个博主的视频诊断：(名称, 帖总数, mediaType=video 的数, mediaType 缺失的数, 本次待下载数)
+    let mut video_diag: Vec<(String, i64, i64, i64, i64)> = Vec::new();
 
     for watch in &watches {
         // 该平台本次的登录态（写进滚动诊断，便于一次判断「未登录」还是「页面不给更多」）
@@ -5260,27 +5262,21 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
             })?;
         }
 
-        // —— 历史视频：与「补正文」并行 ——
-        // 原实现要等 detail 全补完才串行下载视频，总耗时 = detail + video；
-        // 现在提前启动视频任务（重叠），总耗时 ≈ max(detail, video)。
-        // 取流与 detail 各开独立 CDP target（navigate_and_eval_settle 内部 create_target），互不干扰。
-        // 幂等：只处理 video_status=="none" 的帖。
-        let video_ids: Vec<String> = with_store(&state, |store| {
-            Ok(store
-                .monitored_posts
-                .iter()
-                .filter(|p| p.watch_id.as_deref() == Some(watch.id.as_str()))
-                .filter(|p| p.media_type == "video" || p.post_url.contains("/video/"))
-                .filter(|p| Platform::parse(&p.platform).map(|x| x.is_cdp()).unwrap_or(false))
-                .filter(|p| p.video_status == "none")
-                .map(|p| p.id.clone())
-                .collect())
-        })?;
-        stats.pending_videos += video_ids.len() as i64;
-        if !video_ids.is_empty() {
-            spawn_video_workers(app.clone(), watch.id.clone(), video_ids);
-        }
-
+        // —— 历史视频：必须在「补正文」之后启动 ——
+        //
+        // 视频与否由 `media_type` 决定，而 `media_type` 只有**抓详情页**时才会被修正
+        // （post_detail 里 detail.mediaType 落库）。列表抓取拿不到媒体类型，
+        // 新帖的默认值是 "image"。
+        //
+        // 原实现把视频筛选放在补正文**之前**（想靠并行省时间），于是筛选时
+        // media_type 全是 "image" → 一个视频帖都选不出来 → 「补齐了 47 篇但
+        // 一个视频都没下载」。小红书 URL 是 /explore/xxx，兜底条件
+        // `post_url.contains("/video/")` 也匹配不上。
+        //
+        // 每日增量路径（run_daily_prefetch）本来就是「先 enrich_detail 再判视频」，
+        // 补历史这里改成同样的顺序：先补正文（顺带把 media_type 修正准），
+        // 再挑出视频帖丢给 worker。
+        //
         // 补全正文：本次滚出的帖【全部】补正文（不再受固定 200 截断），
         // 再用「存量里还没抓过正文」的旧帖补满到 BACKFILL_MAX（近期窗口 500）。
         let mut detail_targets: Vec<String> = created
@@ -5312,6 +5308,46 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
 
         for id in &detail_targets {
             stats.enrich_detail(&state, id);
+        }
+
+        // 补完正文后，media_type 已被详情页修正为真实的 "video" / "image"，
+        // 这时才能准确挑出视频帖（顺序要求见上面的说明）。
+        // 幂等：只处理 video_status=="none" 的帖；取流与详情各开独立 CDP target，互不干扰。
+        //
+        // 同时统计该博主的媒体类型分布 —— 「补齐了 47 篇但一个视频都没下载」时，
+        // 看这行就能立刻分辨是「压根没识别出视频帖」还是「识别出来了但下载失败」。
+        let (video_ids, video_total, video_type_video, video_type_missing) = with_store(
+            &state,
+            |store| {
+                let mut ids: Vec<String> = Vec::new();
+                let mut total = 0i64;
+                let mut typed_video = 0i64;
+                let mut missing_type = 0i64;
+                for post in store
+                    .monitored_posts
+                    .iter()
+                    .filter(|p| p.watch_id.as_deref() == Some(watch.id.as_str()))
+                    .filter(|p| Platform::parse(&p.platform).map(|x| x.is_cdp()).unwrap_or(false))
+                {
+                    total += 1;
+                    if post.media_type.trim().is_empty() {
+                        missing_type += 1;
+                    } else if post.media_type == "video" {
+                        typed_video += 1;
+                    }
+                    if (post.media_type == "video" || post.post_url.contains("/video/"))
+                        && post.video_status == "none"
+                    {
+                        ids.push(post.id.clone());
+                    }
+                }
+                Ok((ids, total, typed_video, missing_type))
+            },
+        )?;
+        stats.pending_videos += video_ids.len() as i64;
+        video_diag.push((watch.name.clone(), video_total, video_type_video, video_type_missing, video_ids.len() as i64));
+        if !video_ids.is_empty() {
+            spawn_video_workers(app.clone(), watch.id.clone(), video_ids);
         }
 
         // 打上「已补历史」标记，后续不再每晚重复深翻。
@@ -5456,6 +5492,20 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
         "hintLevel": hint_level,
         // 历史视频已转后台线程自动「下载+转写」，这里报启动处理的数量
         "pendingVideos": stats.pending_videos,
+        // 视频诊断明细（每个博主：帖子总数 / mediaType=video 的数 / mediaType 缺失的数 / 本次待下载数）
+        // 用来分辨「压根没识别出视频帖」还是「识别出来了但下载失败」。
+        "videoDiags": video_diag
+            .iter()
+            .map(|(name, total, typed_video, missing_type, pending)| {
+                json!({
+                    "name": name,
+                    "posts": total,
+                    "typedVideo": typed_video,
+                    "missingType": missing_type,
+                    "pending": pending,
+                })
+            })
+            .collect::<Vec<_>>(),
         "failed": stats.failed,
         // 库内实况：直接读 store，回答"新建了 47 为什么只显示 5 条"
         "fetchRuns": fetch_runs,
