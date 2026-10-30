@@ -222,8 +222,10 @@ pub(crate) fn run_curl_transcription_request(
         };
         // 把**实际请求的地址**带上：401 时用户最需要知道的是「打到了哪个服务」——
         // 打到官方服务却以为是自己的 STT key 失效，是最容易白折腾一轮的情况。
+        // 模型名一并带上：ElevenLabs 的 400 unsupported_model 只说"这个名字不认识"，
+        // 不说"我们发的是哪个名字"。
         return Err(format!(
-            "转写接口 HTTP {http_status}{hint}；请求地址：{}；响应：{}",
+            "转写接口 HTTP {http_status}{hint}；请求地址：{}；模型：{model_name}；响应：{}",
             normalize_transcription_url(endpoint),
             stdout.trim()
         ));
@@ -629,6 +631,9 @@ pub(crate) struct TranscriptionSettingsSource {
     pub endpoint_from: String,
     /// api_key 来自哪里
     pub key_from: String,
+    /// endpoint 是否来自用户的**专属配置**（而非 AI 路由/默认源回退）。
+    /// 决定「是不是官方服务」该看 endpoint 还是看路由指针。
+    pub endpoint_from_scope_config: bool,
     /// 人类可读的一句话
     pub summary: String,
 }
@@ -667,14 +672,30 @@ pub(crate) fn resolve_transcription_settings_with_source(
     // 官方 token 一过期就是 401 "Invalid access token"，而用户明明填的是 ElevenLabs。
     //
     // 所以以「专属配置」为准（它是最终值），路由只在它缺失时兜底。
-    let (endpoint, endpoint_from) = match flat_endpoint.clone() {
-        Some(value) if !value.trim().is_empty() => (value, "专属配置"),
+    //
+    // 另外：**「默认源回退」不采用官方源**。
+    // 转写是唯一会自己上传音频的服务，回退到官方源意味着「用户没配转写」
+    // 会被悄悄变成「用官方 access token 调官方 ASR」——官方 token 一过期就是
+    // 401，而错误提示只说「检查 transcription key」，用户完全看不出来。
+    // 与其静默走官方，不如明确报错，让他去配自己的 STT（如 ElevenLabs）。
+    let resolved_is_official = resolved
+        .as_ref()
+        .map(|route| route.is_official)
+        .unwrap_or(false);
+    let (endpoint, endpoint_from, endpoint_from_scope_config) = match flat_endpoint.clone() {
+        Some(value) if !value.trim().is_empty() => (value, "专属配置", true),
         _ if route_explicit => (
             resolved
                 .as_ref()
                 .map(|route| route.base_url.clone())
                 .unwrap_or_default(),
             "AI 路由",
+            false,
+        ),
+        _ if resolved_is_official => (
+            String::new(),
+            "未配置（官方源不用于转写）",
+            false,
         ),
         _ => (
             resolved
@@ -682,6 +703,7 @@ pub(crate) fn resolve_transcription_settings_with_source(
                 .map(|route| route.base_url.clone())
                 .unwrap_or_default(),
             "AI 源（默认回退）",
+            false,
         ),
     };
     let endpoint = endpoint.trim().to_string();
@@ -718,6 +740,7 @@ pub(crate) fn resolve_transcription_settings_with_source(
         summary: format!("endpoint 来自{endpoint_from}，key 来自{key_from}"),
         endpoint_from,
         key_from,
+        endpoint_from_scope_config,
     };
     Some((endpoint, api_key, model_name, source))
 }
@@ -744,12 +767,17 @@ fn transcription_route_is_explicit(settings: &Value) -> bool {
         .and_then(Value::as_str)
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
-    let has_mode = route
+    let mode = route
         .get("mode")
         .and_then(Value::as_str)
         .map(str::trim)
-        .is_some_and(|value| !value.is_empty() && value != "disabled");
-    has_source || has_mode
+        .unwrap_or_default();
+    // 只有**真的指向某个源**才算显式路由：
+    // - 有 sourceId → 明确指向
+    // - mode==='official' → 明确要用官方
+    // mode==='custom' 但 sourceId 为空 = 什么都没指向（前端在用户没为该 scope
+    // 选源、又不允许回退时写的就是这个），不算显式。
+    has_source || mode == "official"
 }
 
 const YTDLP_DISABLED_MESSAGE: &str = "内置 yt-dlp 服务已移除。";
@@ -1025,6 +1053,44 @@ mod tests {
         assert_eq!(endpoint, "https://custom.example.com");
         assert_eq!(key.as_deref(), Some("sk-custom"));
         assert_eq!(source.endpoint_from, "AI 路由");
+    }
+
+    /// 回归守卫：转写路由是 `custom` 但**没有 sourceId** 时，不算显式路由 ——
+    /// 什么都没指向，应落回用户的专属配置（ElevenLabs）。
+    #[test]
+    fn transcription_route_without_source_is_not_explicit() {
+        let settings = json!({
+            "transcription_endpoint": "https://api.elevenlabs.io/v1/speech-to-text",
+            "transcription_key": "sk-elevenlabs",
+            "transcription_model": "scribe_v2",
+            "default_ai_source_id": "src-official",
+            "ai_sources_json": "[{\"id\":\"src-official\",\"baseURL\":\"https://api.ziz.hk/beav/v1\",\"apiKey\":\"official-token\",\"model\":\"fun-asr\"}]",
+            "ai_model_routes_json": "{\"transcription\":{\"mode\":\"custom\",\"sourceId\":\"\"}}",
+        });
+        let (endpoint, key, model, source) =
+            resolve_transcription_settings_with_source(&settings).expect("settings");
+        assert_eq!(endpoint, "https://api.elevenlabs.io/v1/speech-to-text");
+        assert_eq!(key.as_deref(), Some("sk-elevenlabs"));
+        assert_eq!(model, "scribe_v2");
+        assert!(source.endpoint_from_scope_config);
+    }
+
+    /// 回归守卫：转写**不采用官方源兜底**。
+    ///
+    /// 转写是唯一会上传音频的服务；「用户没配转写」被悄悄变成「用官方
+    /// access token 调官方 ASR」后，官方 token 一过期就是 401，而错误提示只说
+    /// 「检查 transcription key」，用户完全看不出来。
+    #[test]
+    fn transcription_settings_never_fall_back_to_official_source() {
+        let settings = json!({
+            "default_ai_source_id": "src-official",
+            "ai_sources_json": "[{\"id\":\"src-official\",\"baseURL\":\"https://api.ziz.hk/beav/v1\",\"apiKey\":\"official-token\",\"model\":\"fun-asr\",\"isOfficial\":true}]",
+            "ai_model_routes_json": "{}",
+        });
+        assert!(
+            resolve_transcription_settings_with_source(&settings).is_none(),
+            "转写不应回退到官方源"
+        );
     }
 
     #[test]

@@ -3715,6 +3715,8 @@ export function Settings({
           apiKey?: string;
           model?: string;
           fallbackId?: string;
+          /** 是否允许回退到默认源。转写传 false —— 官方源不做转写兜底。 */
+          allowFallback?: boolean;
         }): string => {
           const normalizedEndpoint = String(params.endpoint || '').trim();
           const normalizedApiKey = String(params.apiKey || '').trim();
@@ -3741,6 +3743,10 @@ export function Settings({
           }
 
           if (bestScore > 0 && bestSourceId) return bestSourceId;
+          // 回退到默认源：会把「用户手填的独立服务地址」在保存时整个覆盖成
+          // 默认源的值（实测：ElevenLabs 被官方源覆盖 → 401/400）。
+          // 转写不允许这个回退 —— 官方源不做转写兜底。
+          if (params.allowFallback === false) return '';
           const fallbackId = String(params.fallbackId || '').trim();
           if (fallbackId && sourceList.some((source) => source.id === fallbackId)) return fallbackId;
           return normalizedDefaultId;
@@ -3776,6 +3782,9 @@ export function Settings({
           apiKey: String(settings.transcription_key || settings.api_key || '').trim(),
           model: String(settings.transcription_model || '').trim(),
           fallbackId: normalizedDefaultId,
+          // 转写不走官方源兜底：用户配了 ElevenLabs 这类独立 STT 时，
+          // 回退到默认源会在保存时把地址/key 整个覆盖掉。
+          allowFallback: false,
         });
         const resolvedEmbeddingSourceId = resolveLinkedSourceIdFromList({
           endpoint: String(settings.embedding_endpoint || settings.api_endpoint || '').trim(),
@@ -5682,7 +5691,11 @@ export function Settings({
       const aiSourceSaveGeneration = aiSourceEditGenerationRef.current;
       const aiModelSettingsSaveGeneration = aiModelSettingsEditGenerationRef.current;
       const fallbackRouteSource = officialAiSource || null;
-      const resolvedTranscriptionSource = getAiSourceById(transcriptionSourceId) || fallbackRouteSource;
+      // 转写**不回退**到官方源：转写是唯一会上传音频的服务，
+      // 官方源只做「用户没配转写」时的静默兜底 → 官方 token 一过期就 401，
+      // 而提示只说「检查 transcription key」，用户完全看不出来。
+      // 转写配置缺失时保留用户手填的值，由后端明确报「未配置音频转写服务」。
+      const resolvedTranscriptionSource = getAiSourceById(transcriptionSourceId) || null;
       const resolvedEmbeddingSource = getAiSourceById(embeddingSourceId) || fallbackRouteSource;
       const resolvedVisualIndexSource = getAiSourceById(visualIndexSourceId) || fallbackRouteSource;
       const resolvedVideoAnalysisSource = getAiSourceById(videoAnalysisSourceId) || fallbackRouteSource;
@@ -5816,12 +5829,37 @@ export function Settings({
         }
         return { ...route, sourceId: normalizedSourceId };
       };
-      const routeTranscriptionModel = routeModel(
-        'transcription',
-        resolvedTranscriptionModel,
-        resolvedTranscriptionSource,
-        (source) => pickBestModelForSource(source, '', 'transcription'),
-      );
+      // 转写路由的 mode：**不沿用旧的 official**。
+      //
+      // 转写的 route.mode 会被自动回退污染（用户没为该 scope 选源时，
+      // `routeSourceMode` 会给出 official），而 `normalizeRouteForSource` 见到
+      // mode==='official' 就会强制写回 official —— 于是后端又按官方源解析，
+      // 官方 token 一过期就是 401，而用户配的是 ElevenLabs。
+      //
+      // 所以转写这一路：禁用的保持 disabled，其余按「实际选中的源」推导 ——
+      // 没选源就是 custom + 空 sourceId（后端会明确报「未配置音频转写服务」）。
+      const transcriptionRouteMode: AiModelRouteConfig['mode'] =
+        aiModelRoutes.transcription.mode === 'disabled'
+          ? 'disabled'
+          : (resolvedTranscriptionSource?.id
+              ? (isOfficialAutoSourceId(resolvedTranscriptionSource.id) ? 'official' : 'custom')
+              : 'custom');
+      // 转写模型名：**用户填的优先**，不走 routeModel 的 official 兜底。
+      //
+      // routeModel 在 mode==='official' 时会用 `pickBestModelForSource(source, explicit)`
+      // 覆盖显式模型名 —— 而转写的路由 mode 会被自动回退成 official（用户没为
+      // 该 scope 选源时），于是用户手填的模型名被换成官方源的模型
+      // （实测：ElevenLabs 的 scribe_v2 被换成 fun-asr → 400 unsupported_model）。
+      //
+      // 用户为转写选了源时，formData.transcription_model 已在选源处同步成源的值，
+      // 所以 formData 优先的语义与「源优先」一致。
+      const routeTranscriptionModel = String(formData.transcription_model || '').trim()
+        || routeModel(
+          'transcription',
+          resolvedTranscriptionModel,
+          resolvedTranscriptionSource,
+          (source) => pickBestModelForSource(source, '', 'transcription'),
+        );
       const routeEmbeddingModel = routeModel(
         'embedding',
         resolvedEmbeddingModel,
@@ -5872,7 +5910,7 @@ export function Settings({
           aiModelRoutes.redclaw.sourceId || OFFICIAL_AUTO_SOURCE_ID,
         ),
         transcription: normalizeRouteForSource(
-          { ...aiModelRoutes.transcription, sourceId: resolvedTranscriptionSource?.id || '', model: routeTranscriptionModel },
+          { ...aiModelRoutes.transcription, mode: transcriptionRouteMode, sourceId: resolvedTranscriptionSource?.id || '', model: routeTranscriptionModel },
           resolvedTranscriptionSource?.id || '',
         ),
         embedding: normalizeRouteForSource(

@@ -68,11 +68,22 @@ fn resolve_agent_srt_transcription_model(
     endpoint: &str,
     configured_model: &str,
     response_format: &str,
+    endpoint_from_scope_config: bool,
 ) -> String {
-    if response_format == "srt"
-        && (crate::media_generation::is_redbox_official_endpoint(endpoint)
-            || transcription_route_uses_official_source(settings))
-    {
+    // 「是不是官方服务」的判断依据：
+    // - endpoint 来自**用户的专属配置** → 只认 endpoint。
+    //   路由指针（ai_model_routes_json.transcription.sourceId）不能用：前端在用户
+    //   没为该 scope 选源时会**自动回退填上默认源**，于是指针指向官方源，
+    //   即便用户明明配的是 ElevenLabs，也会被判成「官方」→ 模型被强制成 fun-asr
+    //   → ElevenLabs 直接 400 unsupported_model（实测）。
+    // - endpoint 来自 AI 路由 → 保持原判断（endpoint 或路由指针任一命中官方即算官方）。
+    let official = if endpoint_from_scope_config {
+        crate::media_generation::is_redbox_official_endpoint(endpoint)
+    } else {
+        crate::media_generation::is_redbox_official_endpoint(endpoint)
+            || transcription_route_uses_official_source(settings)
+    };
+    if response_format == "srt" && official {
         // Temporary official-source compatibility shim: agent-generated SRT must use fun-asr
         // until the official ASR routing/model matrix is updated.
         OFFICIAL_AGENT_SRT_TRANSCRIPTION_MODEL.to_string()
@@ -437,6 +448,7 @@ pub(crate) fn execute_media_transcribe(
         &endpoint,
         &model_name,
         response_format,
+        source.endpoint_from_scope_config,
     );
 
     let job_id = make_id("media-transcribe-job");
@@ -527,6 +539,47 @@ fn strip_subtitle_markup(subtitles: &str) -> String {
 mod tests {
     use super::*;
 
+    /// 回归守卫：endpoint 来自**用户专属配置**时，模型名必须用用户配的那个。
+    ///
+    /// 实测踩坑：用户配的是 ElevenLabs（`scribe_v2`），但转写路由指针被前端
+    /// 自动回退填成了官方源 → `transcription_route_uses_official_source` 判为真
+    /// → 模型被强制成 `fun-asr` → ElevenLabs 直接 400 unsupported_model
+    /// （"'fun-asr' is not a valid model_id"）。
+    #[test]
+    fn scope_config_endpoint_keeps_configured_model() {
+        // 路由指针指向官方源（前端自动回退造成），但 endpoint 是用户配的 ElevenLabs。
+        let settings = json!({
+            "transcription_endpoint": "https://api.elevenlabs.io/v1/speech-to-text",
+            "transcription_key": "sk-elevenlabs",
+            "transcription_model": "scribe_v2",
+            "default_ai_source_id": "src-official",
+            "ai_sources_json": "[{\"id\":\"src-official\",\"baseURL\":\"https://api.ziz.hk/beav/v1\",\"apiKey\":\"official-token\",\"model\":\"fun-asr\"}]",
+            "ai_model_routes_json": "{\"transcription\":{\"sourceId\":\"src-official\"}}",
+        });
+        let model = resolve_agent_srt_transcription_model(
+            &settings,
+            "https://api.elevenlabs.io/v1/speech-to-text",
+            "scribe_v2",
+            "srt",
+            true,
+        );
+        assert_eq!(model, "scribe_v2");
+    }
+
+    /// 官方 endpoint 仍要用 fun-asr（官方 ASR 路由矩阵的临时兼容 shim）。
+    #[test]
+    fn official_endpoint_still_forces_fun_asr() {
+        let settings = json!({});
+        let model = resolve_agent_srt_transcription_model(
+            &settings,
+            "https://api.ziz.hk/beav/v1",
+            "scribe_v2",
+            "srt",
+            true,
+        );
+        assert_eq!(model, "fun-asr");
+    }
+
     #[test]
     fn transcript_format_defaults_to_srt() {
         assert_eq!(normalize_transcript_format(None), ("srt", "srt"));
@@ -583,6 +636,7 @@ mod tests {
             "https://example.com/v1",
             "user-selected-asr",
             "srt",
+            false,
         );
 
         assert_eq!(model, "fun-asr");
@@ -601,6 +655,7 @@ mod tests {
             "https://example.com/v1",
             "user-selected-asr",
             "text",
+            false,
         );
 
         assert_eq!(model, "user-selected-asr");
@@ -622,6 +677,7 @@ mod tests {
             "https://example.com/v1",
             "user-selected-asr",
             "srt",
+            false,
         );
 
         assert_eq!(model, "user-selected-asr");
