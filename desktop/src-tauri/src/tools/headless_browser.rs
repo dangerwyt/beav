@@ -1630,15 +1630,22 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
     // 注意：登录页 `/login` 上本来就有个红色「登录」提交按钮，
     // 停在登录页做"页头有没有登录按钮"的判定必然误判为未登录 —— 必须换到主页再判。
     let target_id = platform_tab(&client, spec.platform_key, spec.home_url, true).await?;
-    // 关掉该平台的**残留标签**（上次运行留下的 / 手工开的）：只保留跟踪的这一个，
+    // 关掉**残留的登录页标签**（上次运行留下的）：只保留跟踪的这一个，
     // 否则界面上会看到"两个小红书标签"，而登录码按会话唯一、多标签会互相作废。
+    //
+    // 只清 /login 这类登录入口页 —— **不要按域名清**：用户可能自己在服务器上
+    // 开了小红书标签看内容，按域名清会把他的标签一起关掉。
     if let Ok(targets) = client.list_targets().await {
-        let domain = platform_domain(spec.platform_key);
+        let login_marker = if spec.login_url.contains("/login") {
+            "/login"
+        } else {
+            ""
+        };
         for (id, url) in targets {
-            if id == target_id {
+            if id == target_id || login_marker.is_empty() {
                 continue;
             }
-            if url.contains(domain) {
+            if url.contains(login_marker) {
                 client.close_target(&id).await;
             }
         }
