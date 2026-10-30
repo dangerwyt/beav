@@ -6,6 +6,7 @@ import { clsx } from 'clsx';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { MonitorChromeStatus, MonitorChromeLaunchResult, MonitorChromeTestResult } from '../bridge/domains/monitorBridge';
 import { resolveAssetUrl } from '../utils/pathManager';
+import { appConfirm } from '../utils/appDialogs';
 import { CDP_PLATFORMS, PLATFORM_HOME, PLATFORMS, type CdpPlatform } from '../constants/platforms';
 
 /** 是否是内容平台链接（小红书/抖音/B站/微博）—— 这些链接含会话凭证。 */
@@ -1170,9 +1171,14 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   }, [loadWatches, loadPosts, showToast]);
 
   const handleClear = useCallback(async () => {
-    const ok = window.confirm(
-      '确定清空全部「对标博主」和「全部动态」数据吗？\n此操作不可恢复。',
-    );
+    // 用应用内对话框而不是 window.confirm：Tauri 的 macOS WKWebView 不实现
+    // 原生 confirm 面板，window.confirm 静默返回 false → 点了完全没反应。
+    const ok = await appConfirm('确定清空全部「对标博主」和「全部动态」数据吗？此操作不可恢复。', {
+      title: '清空全部数据',
+      confirmLabel: '确认清空',
+      cancelLabel: '取消',
+      tone: 'danger',
+    });
     if (!ok) return;
     try {
       const result = (await window.ipcRenderer.monitor.clear()) as {
@@ -1209,23 +1215,31 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   }, [loadPosts, showToast]);
 
   const handleClearPosts = useCallback(async () => {
-    const ok = window.confirm('确定清空全部「动态」数据吗？\n此操作不可恢复（对标博主列表不受影响）。');
+    // 同 handleClear：不能用 window.confirm（Tauri macOS WebView 里不弹窗）。
+    const ok = await appConfirm('确定清空全部「动态」数据吗？此操作不可恢复（对标博主列表不受影响）。', {
+      title: '清空全部动态',
+      confirmLabel: '确认清空',
+      cancelLabel: '取消',
+      tone: 'danger',
+    });
     if (!ok) return;
     try {
       const result = (await window.ipcRenderer.monitor.clearPosts()) as {
         success?: boolean;
         removedPosts?: number;
+        scope?: 'all' | 'own';
         error?: string;
       };
       // IPC 失败会被桥接层吞成 fallback（removedPosts=0），不检查就会显示
       // 「已清空 0 条动态」—— 让人以为清空成功，其实什么都没发生。
-      // 典型场景：web 端清空是管理员专属操作，普通用户会被拒。
       if (result && result.success === false) {
-        showToast('err', result.error || '清空动态失败（该操作可能仅管理员可用）');
+        showToast('err', result.error || '清空动态失败');
         return;
       }
       await loadPosts();
-      showToast('ok', `已清空 ${result?.removedPosts ?? 0} 条动态`);
+      // web 用户只清自己的，管理员清全库 —— 说清楚实际清了什么。
+      const scope = result?.scope === 'own' ? '（仅自己的）' : '';
+      showToast('ok', `已清空 ${result?.removedPosts ?? 0} 条动态${scope}`);
     } catch (e) {
       console.error('clear posts failed:', e);
       showToast('err', e instanceof Error ? e.message : '清空动态失败');

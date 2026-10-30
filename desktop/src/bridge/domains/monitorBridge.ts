@@ -234,13 +234,13 @@ export function createMonitorBridge(core: BridgeCore) {
           timeoutMs: READ_TIMEOUT_MS,
           fallback: () => ({ success: false }) as unknown as T,
         }),
-      clearPosts: <T = { success: boolean; removedPosts: number; error?: string }>() =>
+      clearPosts: <T = { success: boolean; removedPosts: number; scope?: 'all' | 'own'; error?: string }>() =>
         core.invokeChannelGuarded<T>('monitor:clear-posts', {}, {
           timeoutMs: READ_TIMEOUT_MS,
           fallback: () => ({
             success: false,
             removedPosts: 0,
-            error: '清空失败（该操作仅管理员可用）',
+            error: '清空动态失败',
           }) as unknown as T,
         }),
       // 本地详情：CDP 抓正文（首次 ~20s，之后走缓存），不跳外部平台

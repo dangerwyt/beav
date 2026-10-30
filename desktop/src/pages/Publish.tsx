@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import type { PublishRecord, PublishPlatform } from '../bridge/domains/publishBridge';
+import { appConfirm } from '../utils/appDialogs';
 
 const EMPTY_FORM = {
   platform: 'xiaohongshu',
@@ -192,7 +193,15 @@ export function Publish({ isActive = true }: { isActive?: boolean }) {
 
   const handleRemove = useCallback(
     async (id: string) => {
-      if (!window.confirm('确定删除这条发布记录？')) return;
+      // 用应用内对话框而不是 window.confirm：Tauri 的 macOS WKWebView 不实现
+      // 原生 confirm 面板，window.confirm 静默返回 false → 点了完全没反应。
+      const confirmed = await appConfirm('确定删除这条发布记录？', {
+        title: '删除发布记录',
+        confirmLabel: '删除',
+        cancelLabel: '取消',
+        tone: 'danger',
+      });
+      if (!confirmed) return;
       try {
         const result = (await window.ipcRenderer.publish.remove(id)) as {
           success: boolean;

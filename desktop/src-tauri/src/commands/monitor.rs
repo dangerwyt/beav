@@ -124,7 +124,8 @@ pub fn handle_monitor_channel(
     // 前者会断掉所有人共用的会话，后者会在服务器上弹窗口。
     const ADMIN_ONLY: &[&str] = &[
         "monitor:clear",
-        "monitor:clear-posts",
+        // 注：monitor:clear-posts **不**在列表里 —— 它按身份区分作用域
+        // （管理员清全库 / web 用户只清自己的），web 用户有清理自己数据的合理需求。
         "monitor:retro",
         "monitor:set-export-root",
         "monitor:pick-export-root",
@@ -665,11 +666,20 @@ fn clear_data(state: &State<'_, AppState>) -> Result<Value, String> {
 }
 
 /// 删除单条动态（帖子）。按 id 从 `monitored_posts` 中移除并落盘。
+///
+/// 归属校验：web 用户只能删自己的帖子（`guard_owned_target` 已按 id 校验过归属，
+/// 这里再兜一层，防止越权删到别人的数据）。
 fn post_remove(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
     let id = str_field(payload, "id").ok_or_else(|| "缺少 id".to_string())?;
     with_store_mut(state, |store| {
         let before = store.monitored_posts.len();
-        store.monitored_posts.retain(|item| item.id != id);
+        store.monitored_posts.retain(|item| {
+            if item.id != id {
+                return true;
+            }
+            // 保留「这条不属于当前身份」的记录，不让 web 用户删掉别人的帖子。
+            crate::identity::owner_matches(&item.owner)
+        });
         if store.monitored_posts.len() == before {
             return Err("动态不存在".to_string());
         }
@@ -678,16 +688,32 @@ fn post_remove(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
 }
 
 /// 清空全部动态（仅 `monitored_posts`，不动对标博主列表）。
+///
+/// 权限分两种：
+/// - 管理员（桌面端）→ 清空**全库**（服务器上所有用户的数据都在同一个 store 里）。
+/// - web 用户 → 只清**自己**的帖子。整库清空是危险操作，web 用户没有权限；
+///   但「清空我的动态」是合理需求，不该被整个挡掉（原先一律 ADMIN_ONLY，
+///   结果 web 端点「清空动态」只会弹「仅管理员可用」，用户完全没法清理自己的数据）。
+///
+/// 带上 store 路径与「本进程看到的条数」——服务器上是 web 网关 + 桌面版两个进程，
+/// 排查「清空了 0 条」时需要一眼看出是数据在别的 store 里，还是本进程本来就没有。
 fn clear_posts(state: &State<'_, AppState>) -> Result<Value, String> {
+    let is_admin = crate::identity::is_admin();
     with_store_mut(state, |store| {
-        let removed = store.monitored_posts.len();
-        store.monitored_posts.clear();
-        // 带上 store 路径与「本进程看到的条数」——
-        // 服务器上是 web 网关 + 桌面版两个进程，排查「清空了 0 条」时
-        // 需要一眼看出是数据在别的进程/store 里，还是本进程本来就没有。
+        let before = store.monitored_posts.len();
+        if is_admin {
+            store.monitored_posts.clear();
+        } else {
+            // 只清当前用户自己的（空 owner 的旧数据归 admin，普通用户清不到）。
+            store
+                .monitored_posts
+                .retain(|item| !crate::identity::owner_matches(&item.owner));
+        }
+        let removed = before - store.monitored_posts.len();
         Ok(json!({
             "success": true,
             "removedPosts": removed,
+            "scope": if is_admin { "all" } else { "own" },
             "storePath": state.store_path.display().to_string(),
         }))
     })
