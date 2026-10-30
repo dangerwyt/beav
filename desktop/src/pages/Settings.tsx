@@ -5926,8 +5926,22 @@ export function Settings({
         proxy_url: String(formData.proxy_url || '').trim(),
         proxy_bypass: String(formData.proxy_bypass || '').trim(),
         transcription_model: routeTranscriptionModel,
-        transcription_endpoint: String(resolvedTranscriptionSource?.baseURL || formData.transcription_endpoint || resolvedApiEndpoint).trim(),
-        transcription_key: String(resolvedTranscriptionSource?.apiKey || formData.transcription_key || '').trim(),
+        // 转写的 endpoint/key 以 **formData 为准**（它已是最终生效值）。
+        //
+        // 之前写的是 `resolvedTranscriptionSource?.baseURL || formData.transcription_endpoint || …`，
+        // 而 `resolvedTranscriptionSource` 在用户**没为转写选源**时会回退到默认源
+        // （实测是官方源）→ 用户在「语音转写」里手填的地址/key 被整个覆盖成官方源的。
+        // 结果请求打到官方网关（api.ziz.hk/beav/v1）、用官方 access token ——
+        // 官方 token 一过期就 401 "Invalid access token"，而用户填的其实是 ElevenLabs。
+        //
+        // 用户为该 scope 选了源时，formData 会在选源处同步成源的值（见上面的
+        // transcription_endpoint/transcription_key 赋值），所以这里用 formData 语义一致。
+        transcription_endpoint: String(
+          formData.transcription_endpoint || resolvedTranscriptionSource?.baseURL || resolvedApiEndpoint,
+        ).trim(),
+        transcription_key: String(
+          formData.transcription_key || resolvedTranscriptionSource?.apiKey || '',
+        ).trim(),
         embedding_model: routeEmbeddingModel,
         embedding_endpoint: String(resolvedEmbeddingSource?.baseURL || formData.embedding_endpoint || resolvedApiEndpoint).trim(),
         embedding_key: String(resolvedEmbeddingSource?.apiKey || formData.embedding_key || '').trim(),
@@ -7020,6 +7034,29 @@ export function Settings({
 	                          modelDisabled: !transcriptionSourceModels.length,
 	                          modelPlaceholder: '请先在该供应商中添加模型',
 	                        })}
+	                        {(() => {
+	                          // 只读提示：显示**实际生效**的转写地址。
+	                          //
+	                          // 为什么需要：转写地址可以手填（ElevenLabs 之类），不一定对应
+	                          // 任何「供应商」条目；而下拉框在匹配不上时会回退显示默认源，
+	                          // 于是「下拉框选中的源」与「真正发请求的地址」可能对不上 ——
+	                          // 用户以为在用自己的 STT，实际请求打到了别处（401 Invalid access token）。
+	                          const effectiveTranscriptionEndpoint = String(
+	                            formData.transcription_endpoint || '',
+	                          ).trim();
+	                          const linkedTranscriptionSource = getAiSourceById(transcriptionSourceId);
+	                          const mismatch =
+	                            effectiveTranscriptionEndpoint &&
+	                            linkedTranscriptionSource &&
+	                            String(linkedTranscriptionSource.baseURL || '').trim() !== effectiveTranscriptionEndpoint;
+	                          if (!effectiveTranscriptionEndpoint || !mismatch) return null;
+	                          return (
+	                            <div className="border-t border-border/70 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+	                              实际生效的转写地址为「{effectiveTranscriptionEndpoint}」，与所选供应商不一致；
+	                              保存时将以该地址为准。
+	                            </div>
+	                          );
+	                        })()}
 	                        {renderModelSettingsTableRow({
 	                          label: 'Embedding',
 	                          sourceValue: embeddingSourceId,

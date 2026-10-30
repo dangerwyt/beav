@@ -620,9 +620,30 @@ fn value_type_name(value: &Value) -> &'static str {
     }
 }
 
+/// 转写配置的来源标记 —— 用来说明「这次转写到底用了谁的 key」。
+///
+/// 401 时用户最需要知道的就是这个：请求打到了哪个服务、用的谁的凭据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TranscriptionSettingsSource {
+    /// endpoint 来自哪里
+    pub endpoint_from: String,
+    /// api_key 来自哪里
+    pub key_from: String,
+    /// 人类可读的一句话
+    pub summary: String,
+}
+
 pub(crate) fn resolve_transcription_settings(
     settings: &Value,
 ) -> Option<(String, Option<String>, String)> {
+    resolve_transcription_settings_with_source(settings)
+        .map(|(endpoint, api_key, model, _)| (endpoint, api_key, model))
+}
+
+/// 同 `resolve_transcription_settings`，但额外返回「配置来源」。
+pub(crate) fn resolve_transcription_settings_with_source(
+    settings: &Value,
+) -> Option<(String, Option<String>, String, TranscriptionSettingsSource)> {
     let flat_endpoint = payload_string(settings, "transcription_endpoint");
     let flat_key = payload_string(settings, "transcription_key");
     let flat_model = payload_string(settings, "transcription_model");
@@ -633,58 +654,72 @@ pub(crate) fn resolve_transcription_settings(
         crate::ai_model_manager::AiModelScope::Transcription,
         None,
     );
-    // 取值优先级：**显式路由 > scope 专属配置 > 默认源回退**。
+    // 取值优先级：**专属配置 > 显式路由 > 默认源回退**。
     //
-    // 为什么专属配置要排在「默认源回退」前面：
-    // `AiModelManager::resolve` 在没有显式路由时会回退到「默认源 / 列表第一个源」
-    // （`route_source` 的兜底链），并把那个源的 base_url + api_key 一起带出来 ——
-    // 用户显式配的 transcription_endpoint / transcription_key 被**静默遮蔽**，
-    // 请求因此打到了一个用户根本没打算用的服务上。
+    // 关键认知：`transcription_endpoint` / `transcription_key` 存的是**前端算出的
+    // 最终生效值**（保存设置时由「用户为该 scope 选中的源」或「用户手填的值」决定），
+    // 而 `ai_model_routes_json.transcription.sourceId` 只是**来源指针**。
     //
-    // 实测症状：服务器上「官方」登录态过期时，转写报 401 "Invalid access token"，
-    // 与「STT key 无效」的提示完全一样 → 让人怀疑错方向、反复换 key。
-    let endpoint = if route_explicit {
-        resolved
-            .as_ref()
-            .map(|route| route.base_url.clone())
-            .or(flat_endpoint)
-    } else {
-        flat_endpoint.clone().or_else(|| {
+    // 指针有个陷阱：用户在「语音转写」里**手填**了地址（没为该 scope 选源）时，
+    // 前端 `resolveLinkedSourceIdFromList` 匹配不上任何 AI 源 → 回退填上**默认源**
+    // （实测是官方源）→ 保存时把用户手填的地址/key 整个覆盖成官方源的值。
+    // 于是请求打到官方网关（api.ziz.hk/beav/v1），用官方 access token ——
+    // 官方 token 一过期就是 401 "Invalid access token"，而用户明明填的是 ElevenLabs。
+    //
+    // 所以以「专属配置」为准（它是最终值），路由只在它缺失时兜底。
+    let (endpoint, endpoint_from) = match flat_endpoint.clone() {
+        Some(value) if !value.trim().is_empty() => (value, "专属配置"),
+        _ if route_explicit => (
             resolved
                 .as_ref()
                 .map(|route| route.base_url.clone())
-        })
+                .unwrap_or_default(),
+            "AI 路由",
+        ),
+        _ => (
+            resolved
+                .as_ref()
+                .map(|route| route.base_url.clone())
+                .unwrap_or_default(),
+            "AI 源（默认回退）",
+        ),
+    };
+    let endpoint = endpoint.trim().to_string();
+    let endpoint = if endpoint.is_empty() {
+        payload_string(settings, "api_endpoint").unwrap_or_default()
+    } else {
+        endpoint
+    };
+    if endpoint.trim().is_empty() {
+        return None;
     }
-    .filter(|value| !value.trim().is_empty())
-    .or_else(|| payload_string(settings, "api_endpoint"))?;
-    let model_name = if route_explicit {
-        resolved
+    let model_name = match flat_model.clone() {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => resolved
             .as_ref()
             .map(|route| route.model_name.clone())
-            .filter(|value| !value.trim().is_empty())
-            .or(flat_model)
-    } else {
-        flat_model
-            .clone()
-            .or_else(|| {
-                resolved
-                    .as_ref()
-                    .map(|route| route.model_name.clone())
-                    .filter(|value| !value.trim().is_empty())
-            })
-    }?;
-    let api_key = if route_explicit {
-        resolved
-            .as_ref()
-            .and_then(|route| route.api_key.clone())
-            .or(flat_key)
-    } else {
-        flat_key
-            .clone()
-            .or_else(|| resolved.as_ref().and_then(|route| route.api_key.clone()))
-    }
-    .or_else(|| payload_string(settings, "api_key"));
-    Some((endpoint, api_key, model_name))
+            .filter(|value| !value.trim().is_empty())?,
+    };
+    let (api_key, key_from) = match flat_key.clone() {
+        Some(value) if !value.trim().is_empty() => (Some(value), "专属配置"),
+        _ if route_explicit => (
+            resolved.as_ref().and_then(|route| route.api_key.clone()),
+            "AI 路由",
+        ),
+        _ => (
+            resolved.as_ref().and_then(|route| route.api_key.clone()),
+            "AI 源（默认回退）",
+        ),
+    };
+    let api_key = api_key.or_else(|| payload_string(settings, "api_key"));
+    let endpoint_from = endpoint_from.to_string();
+    let key_from = key_from.to_string();
+    let source = TranscriptionSettingsSource {
+        summary: format!("endpoint 来自{endpoint_from}，key 来自{key_from}"),
+        endpoint_from,
+        key_from,
+    };
+    Some((endpoint, api_key, model_name, source))
 }
 
 /// transcription scope 是否被**显式**路由（`ai_model_routes_json.transcription`
@@ -954,40 +989,42 @@ mod tests {
     /// 回归守卫：scope 专属配置（transcription_endpoint / transcription_key）
     /// **不能被「默认源回退」静默遮蔽**。
     ///
-    /// 实测踩坑：用户专门配了独立 STT 服务，但 `AiModelManager::resolve` 在没有
-    /// 显式路由时会回退到「默认源 / 列表第一个源」，并把那个源的 base_url +
-    /// api_key 一起带出来 —— 请求因此打到了用户根本没打算用的服务上，
-    /// 表现为 401 "Invalid access token"，让人以为是自己的 key 过期，反复换 key。
+    /// 实测踩坑：用户在「语音转写」里手填了 ElevenLabs 的地址与 key，但前端保存时
+    /// 把「回退到默认源（官方源）」的值写了进去 —— 请求因此打到官方网关
+    /// api.ziz.hk/beav/v1、用官方 access token，官方 token 一过期就是
+    /// 401 "Invalid access token"，与「STT key 无效」的提示完全对不上号。
     #[test]
     fn transcription_settings_prefer_scope_config_over_default_source() {
         let settings = json!({
-            "transcription_endpoint": "https://stt.example.com/v1/audio/transcriptions",
-            "transcription_key": "sk-user-stt",
-            "transcription_model": "whisper-1",
+            "transcription_endpoint": "https://api.elevenlabs.io/v1/speech-to-text",
+            "transcription_key": "sk-elevenlabs",
+            "transcription_model": "scribe_v1",
             "default_ai_source_id": "src-official",
-            "ai_sources_json": "[{\"id\":\"src-official\",\"baseURL\":\"https://official.example.com\",\"apiKey\":\"official-token\",\"model\":\"gpt-x\"}]",
+            "ai_sources_json": "[{\"id\":\"src-official\",\"baseURL\":\"https://api.ziz.hk/beav/v1\",\"apiKey\":\"official-token\",\"model\":\"gpt-x\"}]",
             "ai_model_routes_json": "{}",
         });
-        let (endpoint, key, model) = resolve_transcription_settings(&settings).expect("settings");
-        assert_eq!(endpoint, "https://stt.example.com/v1/audio/transcriptions");
-        assert_eq!(key.as_deref(), Some("sk-user-stt"));
-        assert_eq!(model, "whisper-1");
+        let (endpoint, key, model, source) =
+            resolve_transcription_settings_with_source(&settings).expect("settings");
+        assert_eq!(endpoint, "https://api.elevenlabs.io/v1/speech-to-text");
+        assert_eq!(key.as_deref(), Some("sk-elevenlabs"));
+        assert_eq!(model, "scribe_v1");
+        assert_eq!(source.key_from, "专属配置");
     }
 
-    /// 有**显式路由**时，路由优先于 scope 专属配置（路由是用户主动指定来源的）。
+    /// 专属配置缺失时，才回退到 AI 路由 / 默认源。
     #[test]
-    fn transcription_settings_respect_explicit_route() {
+    fn transcription_settings_fall_back_to_route_source() {
         let settings = json!({
-            "transcription_endpoint": "https://stt.example.com/v1/audio/transcriptions",
-            "transcription_key": "sk-user-stt",
             "transcription_model": "whisper-1",
             "default_ai_source_id": "src-custom",
             "ai_sources_json": "[{\"id\":\"src-custom\",\"baseURL\":\"https://custom.example.com\",\"apiKey\":\"sk-custom\",\"model\":\"m-custom\"}]",
             "ai_model_routes_json": "{\"transcription\":{\"sourceId\":\"src-custom\"}}",
         });
-        let (endpoint, key, _) = resolve_transcription_settings(&settings).expect("settings");
+        let (endpoint, key, _, source) =
+            resolve_transcription_settings_with_source(&settings).expect("settings");
         assert_eq!(endpoint, "https://custom.example.com");
         assert_eq!(key.as_deref(), Some("sk-custom"));
+        assert_eq!(source.endpoint_from, "AI 路由");
     }
 
     #[test]

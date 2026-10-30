@@ -1,7 +1,7 @@
 use crate::cli_runtime::CliVerifyRule;
 use crate::command_execution::{run_app_managed_argv, AppManagedArgvRequest};
 use crate::desktop_io::{
-    is_service_unavailable_error, resolve_transcription_settings,
+    is_service_unavailable_error, resolve_transcription_settings_with_source,
     run_curl_transcription_with_parse_format,
 };
 use crate::store::settings as settings_store;
@@ -425,7 +425,8 @@ pub(crate) fn execute_media_transcribe(
     let settings_snapshot = crate::persistence::with_store(state, |store| {
         Ok(settings_store::settings_snapshot(&store))
     })?;
-    let Some((endpoint, api_key, model_name)) = resolve_transcription_settings(&settings_snapshot)
+    let Some((endpoint, api_key, model_name, source)) =
+        resolve_transcription_settings_with_source(&settings_snapshot)
     else {
         return Err(
             "未配置音频转写服务，请先在设置中填写 transcription endpoint/model。".to_string(),
@@ -442,16 +443,18 @@ pub(crate) fn execute_media_transcribe(
     let output_dir = output_dir_for_request(state, request, &job_id)?;
     let audio_path =
         extract_audio_for_transcription(app, state, session_id, &source_path, &output_dir)?;
-    let (transcript, timing_mode) = if matches!(response_format, "srt" | "vtt") {
-        transcribe_with_subtitle_fallback(
-            &endpoint,
-            api_key.as_deref(),
-            &effective_model_name,
-            &audio_path,
-            response_format,
-        )?
-    } else {
-        (
+    // 转写失败时把「配置来源」一并带出来：401/403 最容易白折腾的就是
+    // 「以为用自己的 STT key，实际打到了默认 AI 源」—— 不说清楚来源就无从判断。
+    let transcript_result: Result<(String, &'static str), String> =
+        if matches!(response_format, "srt" | "vtt") {
+            transcribe_with_subtitle_fallback(
+                &endpoint,
+                api_key.as_deref(),
+                &effective_model_name,
+                &audio_path,
+                response_format,
+            )
+        } else {
             run_curl_transcription_with_parse_format(
                 &endpoint,
                 api_key.as_deref(),
@@ -460,10 +463,11 @@ pub(crate) fn execute_media_transcribe(
                 "audio/wav",
                 Some(response_format),
                 Some(response_format),
-            )?,
-            "provider",
-        )
-    };
+            )
+            .map(|value| (value, "provider"))
+        };
+    let (transcript, timing_mode) = transcript_result
+        .map_err(|error| format!("{error}；转写配置：{}", source.summary))?;
 
     let output_path = output_dir.join(format!("transcript.{extension}"));
     fs::write(&output_path, &transcript).map_err(|error| error.to_string())?;
