@@ -1472,6 +1472,7 @@ pub async fn login_debug(ws_url: &str, platform: &str) -> Result<Value, String> 
             cookieHasSession: (document.cookie || '').includes('web_session='),
             hasVerifyModal: /请通过验证|扫码验证身份|为保护账号安全/.test(text),
             hasPhoneLogin: /手机号登录|获取验证码/.test(text),
+            textLen: text.trim().length,
             textSnippet: text.replace(/\s+/g, ' ').slice(0, 160),
             userState,
         };
@@ -1666,13 +1667,33 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
     // 给弹窗渲染留时间
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let logged = client
+    // 先等页面**真正渲染出内容**：刚导航完 innerText 还是空的，
+    // 此时"没有登录按钮"不代表已登录（只是还没画出来）。
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let len = client
+            .evaluate(
+                &session_id,
+                "(() => { try { return ((document.body && document.body.innerText) || '').trim().length; } catch (e) { return 0; } })()",
+                false,
+            )
+            .await
+            .ok()
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0);
+        if len >= 50 || std::time::Instant::now() >= ready_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    // 页面侧只收集**事实**，是否登录由 Rust 结合服务器侧 cookie 判定
+    // （web_session 是 HttpOnly，页面 `document.cookie` 读不到 —— 之前
+    //  "页面读不到 session 就判未登录"导致明明登录着却一直报未登录）。
+    let facts = client
         .evaluate(
             &session_id,
             r#"(() => {
-                // 判据要稳：不能"页面上出现扫码登录字样"就判未登录 ——
-                // 小红书登录后页面上仍可能残留登录弹窗相关文案，导致误判。
-                // 主判据：页头是否还有「登录」按钮（未登录才显示）。
                 const visible = (el) => {
                     const r = el.getBoundingClientRect();
                     return r.width > 0 && r.height > 0 && r.width < 160;
@@ -1688,25 +1709,52 @@ pub async fn login_logged_in(ws_url: &str, platform: &str) -> Result<bool, Strin
                             return ct === '登录' || ct === '登录/注册';
                         });
                     });
-                // INITIAL_STATE 有明确布尔值时以它为准
+                const text = (document.body && document.body.innerText) || '';
+                let stateLoggedIn = null;
                 try {
                     const s = window.__INITIAL_STATE__;
                     const u = s && s.user;
-                    if (u && typeof u.loggedIn === 'boolean') return u.loggedIn;
-                    if (u && u.userInfo && (u.userInfo.nickname || u.userInfo.userId)) return true;
+                    if (u && typeof u.loggedIn === 'boolean') stateLoggedIn = u.loggedIn;
+                    else if (u && u.userInfo && (u.userInfo.nickname || u.userInfo.userId)) stateLoggedIn = true;
                 } catch (e) {}
-                const hasSession = (document.cookie || '').includes('web_session=');
-                // 页头还有「登录」按钮 → 未登录
-                if (loginButtons.length > 0) return false;
-                return hasSession;
+                return {
+                    loginButtonCount: loginButtons.length,
+                    textLen: text.trim().length,
+                    hasVerifyModal: /请通过验证|扫码验证身份|为保护账号安全/.test(text),
+                    stateLoggedIn,
+                };
             })()"#,
             false,
         )
         .await
         .ok()
-        .and_then(|value| value.as_bool())
+        .unwrap_or(Value::Null);
+    let has_server_session = !current.is_empty();
+    let state_logged_in = facts.get("stateLoggedIn").and_then(Value::as_bool);
+    let login_button_count = facts
+        .get("loginButtonCount")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let page_text_len = facts.get("textLen").and_then(Value::as_i64).unwrap_or(0);
+    let has_verify_modal = facts
+        .get("hasVerifyModal")
+        .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    // 判定优先级：
+    // 1) 页面自报明确布尔值 → 以它为准
+    // 2) 有风控验证弹窗 → 未登录（验证没走完）
+    // 3) 页面已渲染 且 页头无「登录」按钮 且 服务器侧有 web_session → 已登录
+    // 4) 其余 → 未登录
+    let logged = match state_logged_in {
+        Some(value) => value,
+        None => {
+            !has_verify_modal
+                && page_text_len >= 50
+                && login_button_count == 0
+                && has_server_session
+        }
+    };
     {
         let mut cache = LOGIN_STATE_CACHE
             .get_or_init(Default::default)
