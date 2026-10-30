@@ -305,6 +305,25 @@ pub fn build_cli_sandbox_spec(
             lower.starts_with("http://") || lower.starts_with("https://")
         });
     let mut allow_read_paths = vec![environment.root_path.clone()];
+    // **必须允许读工作区根**。
+    //
+    // 沙箱原本只放行「哈希后的运行时目录」（environments/workspace/<hash>），
+    // 却**没有放行这个环境对应的工作区本身**（environment.workspace_root）。
+    // 结果：应用自己放在工作区里的数据（如 `~/.beav/monitor-videos/*.mp4`）
+    // 对沙箱内的进程是不可见的 —— macOS 的 sandbox-exec 拒绝时返回的是
+    // **EPERM（"Operation not permitted"）**，不是 EACCES，看起来像"文件损坏"，
+    // 极难定位（实测 41 条视频转写里偶发失败，ffmpeg 报的是
+    // "Error opening input: Operation not permitted"）。
+    if let Some(workspace_root) = environment
+        .workspace_root
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        if !allow_read_paths.iter().any(|item| item == workspace_root) {
+            allow_read_paths.push(workspace_root.to_string());
+        }
+    }
     let cwd_text = cwd.to_string_lossy().to_string();
     if !allow_read_paths.iter().any(|item| item == &cwd_text) {
         allow_read_paths.push(cwd_text.clone());
@@ -419,6 +438,43 @@ mod tests {
             .allow_write_paths
             .iter()
             .any(|item| item.contains("project")));
+    }
+
+    /// 回归守卫：沙箱必须放行**工作区根**。
+    ///
+    /// 实测踩坑：沙箱只放行了哈希后的运行时目录（environments/workspace/<hash>），
+    /// 没放行工作区本身 → 应用自己放在工作区里的文件（如 monitor-videos/*.mp4）
+    /// 对沙箱内进程不可见 → macOS sandbox-exec 返回 **EPERM**
+    /// （"Operation not permitted"），ffmpeg 报的是 "Error opening input"，
+    /// 看起来像文件损坏，极难定位。
+    #[test]
+    fn build_cli_sandbox_spec_allows_reading_workspace_root() {
+        let environment = CliEnvironmentRecord {
+            id: "env-1".to_string(),
+            scope: CliEnvironmentScope::WorkspaceLocal,
+            root_path: "/tmp/redbox-env/environments/workspace/abc123".to_string(),
+            workspace_root: Some("/tmp/workspace".to_string()),
+            path_entries: Vec::new(),
+            runtimes: CliRuntimeInventory::default(),
+            installed_tool_ids: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+            metadata: None,
+        };
+        let spec = build_cli_sandbox_spec(
+            &CliExecuteRequest::default(),
+            &environment,
+            Path::new("/tmp/workspace/.redbox/media-transcripts/job"),
+            &BTreeMap::new(),
+            &CliPermissionGrantSet::default(),
+        );
+        assert!(
+            spec.allow_read_paths
+                .iter()
+                .any(|item| item == "/tmp/workspace"),
+            "工作区根必须在允许读列表里，实际：{:?}",
+            spec.allow_read_paths
+        );
     }
 
     #[test]

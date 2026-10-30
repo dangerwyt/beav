@@ -122,6 +122,11 @@ fn extract_audio_for_transcription(
 ) -> Result<PathBuf, String> {
     let audio_path = output_dir.join(format!("audio-{}.wav", now_ms()));
 
+    // 源文件在应用工作区内 → 走直连（见下面 run_ffmpeg_directly 的注释）。
+    let inside_app_workspace = workspace_root(state)
+        .map(|root| source_path.starts_with(&root))
+        .unwrap_or(false);
+
     // 两套参数，从严到宽。
     //
     // 第一套是常规参数；第二套是**兜底**：显式指定 `-f wav`、放宽到任意采样率、
@@ -181,25 +186,41 @@ fn extract_audio_for_transcription(
         let argv = std::iter::once(ffmpeg_program(Some(app))?)
             .chain(argv_args)
             .collect::<Vec<_>>();
-        let result = run_app_managed_argv(
-            app,
-            state,
-            AppManagedArgvRequest {
-                session_id: session_id.map(ToString::to_string),
-                runtime_id: Some("media-transcribe".to_string()),
-                tool_id: Some("ffmpeg".to_string()),
-                argv,
-                cwd: Some(output_dir.to_string_lossy().to_string()),
-                verification_rules: vec![
-                    CliVerifyRule::ExitCode { expected: Some(0) },
-                    CliVerifyRule::FileExists {
-                        path: attempt_path.to_string_lossy().to_string(),
-                    },
-                ],
-                ..AppManagedArgvRequest::default()
-            },
-            8_000,
-        );
+        let result = if inside_app_workspace {
+            // 应用自己产出的文件（工作区内的媒体，如 monitor-videos/*.mp4）→ 直接调 ffmpeg。
+            //
+            // 为什么不用 CLI 沙箱：沙箱的白名单是按 **CLI environment** 推导的
+            // （哈希运行时目录 + cwd + 工具自身），**不包含应用的工作区目录**。
+            // macOS 的 sandbox-exec 拒绝时返回的是 **EPERM**（"Operation not permitted"），
+            // 不是 EACCES，ffmpeg 报出来的是 "Error opening input" —— 看着像文件损坏，
+            // 实测 41 条视频转写里就有一条这样挂了（`~/.beav/monitor-videos/xxx.mp4`）。
+            //
+            // 应用内部的其它 5 处 ffmpeg 调用（下载 / 抽帧 / 转码 / 合并音轨 / 探测）
+            // 也都是直接 Command::new，这里保持一致。
+            // 工作区**之外**的路径（LLM 工具调用传入的任意路径）仍走沙箱，边界不变。
+            run_ffmpeg_directly(&argv, &attempt_path)
+        } else {
+            run_app_managed_argv(
+                app,
+                state,
+                AppManagedArgvRequest {
+                    session_id: session_id.map(ToString::to_string),
+                    runtime_id: Some("media-transcribe".to_string()),
+                    tool_id: Some("ffmpeg".to_string()),
+                    argv,
+                    cwd: Some(output_dir.to_string_lossy().to_string()),
+                    verification_rules: vec![
+                        CliVerifyRule::ExitCode { expected: Some(0) },
+                        CliVerifyRule::FileExists {
+                            path: attempt_path.to_string_lossy().to_string(),
+                        },
+                    ],
+                    ..AppManagedArgvRequest::default()
+                },
+                8_000,
+            )
+            .map(|_| ())
+        };
         match result {
             Ok(_) => {
                 // FileExists 只验「文件存在」，不验「有内容」。
@@ -246,6 +267,38 @@ fn extract_audio_for_transcription(
     Err(describe_audio_extract_failure(&last_error, source_path))
 }
 
+/// 直接执行 ffmpeg（不经过 CLI 沙箱），返回 (退出码, stderr)。
+///
+/// 只用于**应用自己工作区内**的媒体文件：CLI 沙箱的白名单是按 CLI environment
+/// 推导的，不包含应用的工作区目录，macOS sandbox-exec 拒绝时返回 EPERM
+/// （"Operation not permitted"），ffmpeg 表现为 "Error opening input"，
+/// 看着像文件损坏、实则是权限问题。
+///
+/// 保留 stderr 是关键：错误分类（无音轨 / 文件损坏 / 权限）都靠它。
+fn run_ffmpeg_directly(argv: &[String], output_path: &Path) -> Result<(), String> {
+    let Some(program) = argv.first() else {
+        return Err("ffmpeg 命令为空".to_string());
+    };
+    let mut command = std::process::Command::new(program);
+    command.args(argv.iter().skip(1));
+    let output = command
+        .output()
+        .map_err(|error| format!("启动 ffmpeg 失败：{error}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        return Err(format!("退出码校验失败：期望 0，实际 {code}；命令输出：{stderr}"));
+    }
+    // 退出码 0 但没有产物 —— 视同失败（否则会拿空文件去转写）。
+    if std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0) == 0 {
+        let _ = std::fs::remove_file(output_path);
+        return Err(format!(
+            "ffmpeg 退出码为 0 但未产出音频文件；命令输出：{stderr}"
+        ));
+    }
+    Ok(())
+}
+
 /// 把 ffmpeg 抽音频的失败原因翻译成人话。
 ///
 /// 历史上这里只能拿到「退出码校验失败：期望 0，实际 255」——
@@ -271,6 +324,13 @@ fn describe_audio_extract_failure(detail: &str, source_path: &Path) -> String {
     {
         return format!(
             "视频文件不完整或已损坏，无法抽取音频（多为下载中断所致，建议重新下载）：{file}；{text}"
+        );
+    }
+    // macOS 的 sandbox-exec 拒绝访问时返回的是 EPERM（"Operation not permitted"），
+    // 不是 EACCES（"Permission denied"）—— 看起来像"文件有问题"，其实是权限问题。
+    if lower.contains("operation not permitted") || lower.contains("permission denied") {
+        return format!(
+            "系统拒绝访问该视频文件（权限/沙箱限制），无法抽取音频：{file}；{text}"
         );
     }
     format!("ffmpeg audio extraction failed: {file}；{text}")
