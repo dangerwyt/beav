@@ -5217,9 +5217,17 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
             .get("reachedBottom")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let eval_errors = diag
+            .get("evalErrors")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         let all_done = reached_total || (profile_total == 0 && reached_bottom);
 
-        let text = if reached_total {
+        let text = if eval_errors > 0 && !reached_total {
+            // 求值失败 = 页面连接断过（标签被关/CDP 断开），结果可能不完整，
+            // 绝不能说成"已抓全"。
+            format!("{name}：抓取过程中页面连接中断 {eval_errors} 次（标签可能被关闭），本次结果可能不完整")
+        } else if reached_total {
             format!("{name}：已抓全 {captured} 篇（与主页声明的 {profile_total} 篇一致）")
         } else if all_done {
             format!("{name}：已翻到主页底部，共抓到 {captured} 篇")
@@ -5235,7 +5243,7 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
         } else {
             format!("{name}：滚动加载正常（{first} → {captured} 条）")
         };
-        if !all_done {
+        if !all_done || eval_errors > 0 {
             hint_level = "warn";
         }
         if hint.is_none() {

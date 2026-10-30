@@ -2656,20 +2656,27 @@ pub async fn scrape_profile_posts_paged(
     // 整个会话期间是否真的滚动过。不能只看最后一轮：滚到底后自然滚不动，
     // 只看最后一轮会误报「页面没有发生滚动（滚动容器可能选错）」。
     let mut scrolled_any = false;
+    // 抽取/滚动求值失败次数：标签被关掉 / CDP 断开时每轮都会失败。
+    // 原代码用 `if let Ok` 静默吞掉 → 表现为"条数不增长" → 被误判成已翻到底。
+    // （真实事故：登录态轮询按域名清标签，把正在翻页的抓取标签关掉了，只落 4 条。）
+    let mut eval_errors = 0i64;
     let rounds = std::cmp::max(
         18usize,
         std::cmp::min(70usize, ((limit.max(1) + 3) / 3) as usize),
     );
     for _ in 0..rounds {
         // 1) 抽取当前 DOM 窗口，按 id 并入累计集合（跨轮累计，避免 30→16 回退）
-        if let Ok(val) = client.evaluate(&session_id, &extract_js, false).await {
-            if let Some(arr) = val.as_array() {
-                for item in arr {
-                    if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                        seen.insert(id.to_string(), item.clone());
+        match client.evaluate(&session_id, &extract_js, false).await {
+            Ok(val) => {
+                if let Some(arr) = val.as_array() {
+                    for item in arr {
+                        if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                            seen.insert(id.to_string(), item.clone());
+                        }
                     }
                 }
             }
+            Err(_) => eval_errors += 1,
         }
         let captured = seen.len() as i64;
         round_counts.push(captured);
@@ -2710,13 +2717,15 @@ pub async fn scrape_profile_posts_paged(
             last_captured = captured;
         }
         // 5) 渐进式滚动一屏
-        if let Ok(info) = client.evaluate(&session_id, scroll_js, true).await {
-            if !info.is_null() {
+        match client.evaluate(&session_id, scroll_js, true).await {
+            Ok(info) if !info.is_null() => {
                 if info.get("v").and_then(Value::as_bool).unwrap_or(false) {
                     scrolled_any = true;
                 }
                 last_scroll = info;
             }
+            Ok(_) => {}
+            Err(_) => eval_errors += 1,
         }
         tokio::time::sleep(Duration::from_millis(1300)).await;
     }
@@ -2766,6 +2775,8 @@ pub async fn scrape_profile_posts_paged(
         "scrollHeight": last_scroll.get("scrollHeight").cloned().unwrap_or(Value::Null),
         "clientHeight": last_scroll.get("clientHeight").cloned().unwrap_or(Value::Null),
         // 已滚到底（不依赖解析"47 笔记"，滚动位置本身就能证明）
+        // 抽取/滚动求值失败次数（>0 说明页面连接断过，结果可能不完整）
+        "evalErrors": eval_errors,
         "reachedBottom": reached_bottom,
         "scrolled": scrolled_any
     });
