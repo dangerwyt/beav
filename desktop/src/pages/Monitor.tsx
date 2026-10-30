@@ -485,12 +485,17 @@ function VideoPlayerWithFallback({
   const [src, setSrc] = useState<string | null>(derivedPreview);
   const [triedFallback, setTriedFallback] = useState(false);
   const [playbackFailed, setPlaybackFailed] = useState(false);
+  // 播放诊断：记录实际请求的地址与媒体信息。
+  // 「只能播几秒」这类问题分不清是「地址不对 / 服务端没按 Range 分段 / 文件损坏 /
+  // 编码不支持」—— 把真实地址与时长显示出来，下次报错就能一眼定位。
+  const [playbackInfo, setPlaybackInfo] = useState<{ url: string; duration?: number } | null>(null);
 
   // 详情弹窗内是同一个组件实例，切换帖子时必须重置播放状态
   useEffect(() => {
     setSrc(derivedPreview);
     setTriedFallback(false);
     setPlaybackFailed(false);
+    setPlaybackInfo(null);
   }, [derivedPreview, localPath]);
 
   const onError = () => {
@@ -502,19 +507,34 @@ function VideoPlayerWithFallback({
     setPlaybackFailed(true);
   };
   if (!src) return null;
+  const resolvedSrc = resolveAssetUrl(src);
   return (
     <>
       <video
         key={src}
-        src={resolveAssetUrl(src)}
+        src={resolvedSrc}
         controls
         preload="metadata"
         onError={onError}
+        onLoadedMetadata={(event) => {
+          const duration = event.currentTarget?.duration;
+          setPlaybackInfo({
+            url: resolvedSrc,
+            duration: typeof duration === 'number' && Number.isFinite(duration) ? duration : undefined,
+          });
+        }}
         className="w-full max-h-80 rounded-lg border border-border bg-black"
       />
       {playbackFailed && (
         <p className="text-[11px] text-amber-600 dark:text-amber-400">
-          内置播放器无法播放该视频（多为 4K / HEVC 等 WebView 不支持的编码）。可点「重新下载」生成 720p 可播放版，或用系统播放器打开原片。
+          内置播放器无法播放该视频（多为 4K / HEVC 等 WebView 不支持的编码，或文件下载不完整）。
+          可点「重新下载」生成 720p 可播放版，或用系统播放器打开原片。
+        </p>
+      )}
+      {playbackInfo && !playbackFailed && (
+        <p className="text-[11px] text-text-tertiary break-all">
+          播放源：{playbackInfo.url}
+          {playbackInfo.duration !== undefined ? ` · 时长 ${playbackInfo.duration.toFixed(1)}s` : ''}
         </p>
       )}
     </>
