@@ -1886,6 +1886,15 @@ pub async fn scrape_profile_posts(
 ) -> Result<Value, String> {
     let client = CdpClient::connect(ws_url).await?;
     let target_id = client.create_target("about:blank").await?;
+    // 置为前台：Chrome 会节流后台标签的定时器/IO 回调，懒加载滚动会"滚了不加载"
+    // （实测补历史停在 9 条就是这个原因之一）。
+    let _ = client
+        .send_request(
+            "Target.activateTarget",
+            Some(json!({ "targetId": target_id })),
+            None,
+        )
+        .await;
     let session_id = client.attach_to_target(&target_id).await?;
     let profile_url = strip_modal_id_param(profile_url);
     let nav_params = json!({ "url": profile_url });
@@ -1976,23 +1985,44 @@ pub async fn scrape_profile_posts(
                     return true;
                 }).slice(0, 12);
             };
-            const scrollAll = () => {
+            const scrollAll = async () => {
                 let moved = false;
-                for (const el of scrollTargets()) {
-                    try {
-                        const before = el.scrollTop;
-                        el.scrollTop = el.scrollHeight;
-                        diag.maxScrollTop = Math.max(diag.maxScrollTop, el.scrollTop);
-                        diag.scrollHeight = Math.max(diag.scrollHeight, el.scrollHeight);
-                        diag.clientHeight = Math.max(diag.clientHeight, el.clientHeight);
-                        if (el.scrollTop > before + 10) {
-                            moved = true;
-                            if (!diag.scroller) {
-                                const cls = (typeof el.className === 'string' && el.className) ? el.className.split(' ')[0] : '';
-                                diag.scroller = el.id ? '#' + el.id : (cls ? '.' + cls : el.tagName);
+                // 分段滚动而不是一步跳到底：小红书的懒加载靠 IntersectionObserver，
+                // 一次跳到 scrollHeight 只给"哨兵元素"一次进入视口的机会，
+                // 很容易判定"翻不动了"（实测停在 9 条）。这里每次滚约 0.9 屏，
+                // 最多 6 段，同时派发 wheel 事件（有些站点只监听 wheel）。
+                for (let step = 0; step < 6; step++) {
+                    let stepMoved = false;
+                    for (const el of scrollTargets()) {
+                        try {
+                            const before = el.scrollTop;
+                            const next = Math.min(
+                                before + Math.max(200, Math.round(el.clientHeight * 0.9)),
+                                el.scrollHeight,
+                            );
+                            el.scrollTop = next;
+                            try {
+                                el.dispatchEvent(new WheelEvent('wheel', {
+                                    deltaY: Math.max(200, Math.round(el.clientHeight * 0.9)),
+                                    bubbles: true,
+                                    cancelable: true,
+                                }));
+                            } catch (e) {}
+                            diag.maxScrollTop = Math.max(diag.maxScrollTop, el.scrollTop);
+                            diag.scrollHeight = Math.max(diag.scrollHeight, el.scrollHeight);
+                            diag.clientHeight = Math.max(diag.clientHeight, el.clientHeight);
+                            if (el.scrollTop > before + 10) {
+                                stepMoved = true;
+                                if (!diag.scroller) {
+                                    const cls = (typeof el.className === 'string' && el.className) ? el.className.split(' ')[0] : '';
+                                    diag.scroller = el.id ? '#' + el.id : (cls ? '.' + cls : el.tagName);
+                                }
                             }
-                        }
-                    } catch (e) {}
+                        } catch (e) {}
+                    }
+                    if (!stepMoved) break;
+                    moved = true;
+                    await sleep(220);
                 }
                 // 兜底：真实 window 滚动（触发 scroll 事件 + IntersectionObserver 懒加载）
                 try {
@@ -2019,12 +2049,12 @@ pub async fn scrape_profile_posts(
                 if (n >= LIMIT) break;
                 if (n === lastCount) {
                     stagnant += 1;
-                    if (stagnant >= 4) { exhausted = true; break; }
+                    if (stagnant >= 5) { exhausted = true; break; }
                 } else {
                     stagnant = 0;
                     lastCount = n;
                 }
-                scrollAll();
+                await scrollAll();
                 // 小红书懒加载要时间去请求下一页，700ms 太短容易误判成"翻不动了"
                 await sleep(1200);
             }
@@ -2610,6 +2640,8 @@ pub async fn scrape_profile_posts_paged(
     let mut exhausted = false;
     let mut hit_limit = false; // 是否因触到 limit 兜底上限而停（而非真的翻到底）
     let mut max_window = 0i64; // 单轮窗口峰值（诊断用）
+    let mut round_counts: Vec<i64> = Vec::new(); // 每轮累计条数（看是否根本不再增长）
+    let mut last_scroll: Value = Value::Null; // 最后一次滚动返回的容器/高度信息
     let rounds = std::cmp::max(
         18usize,
         std::cmp::min(70usize, ((limit.max(1) + 3) / 3) as usize),
@@ -2626,6 +2658,7 @@ pub async fn scrape_profile_posts_paged(
             }
         }
         let captured = seen.len() as i64;
+        round_counts.push(captured);
         max_window = max_window.max(captured);
         // 2) 实时进度：用累计去重数量（逼近真实总量），前端据此刷新「已抓 X / 共 Y」
         if emit_progress {
@@ -2663,7 +2696,9 @@ pub async fn scrape_profile_posts_paged(
             last_captured = captured;
         }
         // 5) 渐进式滚动一屏
-        let _ = client.evaluate(&session_id, scroll_js, true).await;
+        if let Ok(info) = client.evaluate(&session_id, scroll_js, true).await {
+            if !info.is_null() { last_scroll = info; }
+        }
         tokio::time::sleep(Duration::from_millis(1300)).await;
     }
 
@@ -2695,8 +2730,16 @@ pub async fn scrape_profile_posts_paged(
         "rounds": rounds,
         "captured": posts.len(),
         "maxWindow": max_window,
+        // 每轮累计条数：看它是否从第 1 轮就再没增长（= 页面根本不给更多）
+        "counts": round_counts,
         "profileTotal": profile_total,
-        "scrolled": max_window > (limit.min(30) as i64)
+        "limit": limit,
+        // 滚动容器与实际高度：scrollHeight == clientHeight 说明容器没有变长（没加载新内容）
+        "scroller": last_scroll.get("scroller").cloned().unwrap_or(Value::Null),
+        "maxScrollTop": last_scroll.get("maxScrollTop").cloned().unwrap_or(Value::Null),
+        "scrollHeight": last_scroll.get("scrollHeight").cloned().unwrap_or(Value::Null),
+        "clientHeight": last_scroll.get("clientHeight").cloned().unwrap_or(Value::Null),
+        "scrolled": last_scroll.get("v").and_then(Value::as_bool).unwrap_or(false)
     });
     let _ = client
         .send_request(
