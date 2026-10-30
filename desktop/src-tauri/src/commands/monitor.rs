@@ -5174,6 +5174,8 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
 
     // 汇总滚动诊断 → 一句话提示（让用户不用翻日志就知道「为什么只翻到首屏」）
     let mut hint: Option<String> = None;
+    // 提示等级：ok = 正常（含"已抓全"），warn = 需要关注
+    let mut hint_level: &str = "ok";
     for (name, diag) in &scroll_diags {
         let scrolled = diag
             .get("scrolled")
@@ -5184,22 +5186,33 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
             .and_then(Value::as_array)
             .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<i64>>())
             .unwrap_or_default();
-        let grew = counts.len() >= 2 && counts[counts.len() - 1] > counts[0];
-        let text = if !scrolled {
+        let profile_total = diag
+            .get("profileTotal")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let captured = counts.last().copied().unwrap_or(0);
+        let first = counts.first().copied().unwrap_or(0);
+        let grew = counts.len() >= 2 && captured > first;
+        // 抓到的数量达到主页声明的作品数 → 已经抓全，不该报警
+        let reached_total = profile_total > 0 && captured >= profile_total;
+
+        let text = if reached_total {
+            format!("{name}：已抓全 {captured} 篇（与主页声明的 {profile_total} 篇一致）")
+        } else if !scrolled {
             format!("{name}：页面没有发生滚动（滚动容器可能选错）")
         } else if !grew {
             format!(
-                "{name}：滚动后没有加载出更多内容（停在 {} 条，共 {} 轮）",
-                counts.first().copied().unwrap_or(0),
+                "{name}：滚动后没有加载出更多内容（停在 {captured} 条，共 {} 轮）",
                 counts.len()
             )
+        } else if profile_total > 0 {
+            format!("{name}：抓到 {captured} 篇，主页声明 {profile_total} 篇（可能还有未加载的）")
         } else {
-            format!(
-                "{name}：滚动加载正常（{} → {} 条）",
-                counts.first().copied().unwrap_or(0),
-                counts.last().copied().unwrap_or(0)
-            )
+            format!("{name}：滚动加载正常（{first} → {captured} 条）")
         };
+        if !reached_total {
+            hint_level = "warn";
+        }
         if hint.is_none() {
             hint = Some(text);
         }
@@ -5233,6 +5246,8 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
             .collect::<Vec<_>>(),
         // 一句话诊断提示
         "hint": hint,
+        // "ok" = 正常（含已抓全）/ "warn" = 需要关注
+        "hintLevel": hint_level,
         // 历史视频已转后台线程自动「下载+转写」，这里报启动处理的数量
         "pendingVideos": stats.pending_videos,
         "failed": stats.failed,

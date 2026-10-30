@@ -2642,6 +2642,9 @@ pub async fn scrape_profile_posts_paged(
     let mut max_window = 0i64; // 单轮窗口峰值（诊断用）
     let mut round_counts: Vec<i64> = Vec::new(); // 每轮累计条数（看是否根本不再增长）
     let mut last_scroll: Value = Value::Null; // 最后一次滚动返回的容器/高度信息
+    // 整个会话期间是否真的滚动过。不能只看最后一轮：滚到底后自然滚不动，
+    // 只看最后一轮会误报「页面没有发生滚动（滚动容器可能选错）」。
+    let mut scrolled_any = false;
     let rounds = std::cmp::max(
         18usize,
         std::cmp::min(70usize, ((limit.max(1) + 3) / 3) as usize),
@@ -2697,7 +2700,12 @@ pub async fn scrape_profile_posts_paged(
         }
         // 5) 渐进式滚动一屏
         if let Ok(info) = client.evaluate(&session_id, scroll_js, true).await {
-            if !info.is_null() { last_scroll = info; }
+            if !info.is_null() {
+                if info.get("v").and_then(Value::as_bool).unwrap_or(false) {
+                    scrolled_any = true;
+                }
+                last_scroll = info;
+            }
         }
         tokio::time::sleep(Duration::from_millis(1300)).await;
     }
@@ -2739,7 +2747,7 @@ pub async fn scrape_profile_posts_paged(
         "maxScrollTop": last_scroll.get("maxScrollTop").cloned().unwrap_or(Value::Null),
         "scrollHeight": last_scroll.get("scrollHeight").cloned().unwrap_or(Value::Null),
         "clientHeight": last_scroll.get("clientHeight").cloned().unwrap_or(Value::Null),
-        "scrolled": last_scroll.get("v").and_then(Value::as_bool).unwrap_or(false)
+        "scrolled": scrolled_any
     });
     let _ = client
         .send_request(
