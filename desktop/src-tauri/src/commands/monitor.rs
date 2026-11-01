@@ -4734,6 +4734,52 @@ fn history_backfill_valid(flag: Option<&str>) -> bool {
 /// （每条详情要开一个 CDP tab，耗时线性增加）。
 const BACKFILL_MAX: usize = 500;
 
+/// 补历史的年份下限：只收录 `BACKFILL_YEAR_MIN` 年（含）以后发布的动态，
+/// 更早的历史帖在补完正文、拿到发布日期后直接删掉（连同互动快照）。
+const BACKFILL_YEAR_MIN: i32 = 2026;
+
+/// 判断 `published_at` 是否早于补历史年份下限。
+///
+/// 日期文案随平台而异：`2024-03-15`（小红书 ISO 截断）/ `2024年3月15日` / `03-15`（无年份）
+/// / `3天前`（相对日期）。规则取保守侧：
+/// - 能解析出**四位年份**且 < 下限 → 早于下限（要删）；
+/// - 解析不出年份（无年份短格式、相对日期通常都表示近期）→ 视为不早于下限，
+///   宁可多留，也不能因为解析失败把 2026 年的帖子误删。
+fn published_before_cutoff(published_at: Option<&str>) -> bool {
+    let Some(text) = published_at.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    extract_four_digit_year(text).is_some_and(|year| year < BACKFILL_YEAR_MIN)
+}
+
+/// 从文本里取出第一段**独立**的四位年份数字（前后都不是数字才算边界）。
+///
+/// 只取独立四位段是为了避开两种误配：五位以上数字（时间戳 `1793952000000`）
+/// 和被夹在更长数字里的子串。2026 年以后平台若改文案，这里只会退化为
+/// 「解析不出年份 → 保留」，不会反向误删。
+fn extract_four_digit_year(text: &str) -> Option<i32> {
+    let chars: Vec<char> = text.chars().collect();
+    // 短于 4 个字符不可能含四位年份。必须先行返回：`len - 4` 在 len < 4 时会下溢，
+    // 写成 `0..=len.saturating_sub(4)` 则退化成 `0..=0`，随后 `chars[0..4]` 直接 panic
+    // （"3天前" 这种相对日期正好 3 个字符，是最常见的踩点）。
+    if chars.len() < 4 {
+        return None;
+    }
+    for i in 0..=(chars.len() - 4) {
+        let window = &chars[i..i + 4];
+        if !window.iter().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let left_ok = i == 0 || !chars[i - 1].is_ascii_digit();
+        let right_ok = i + 4 >= chars.len() || !chars[i + 4].is_ascii_digit();
+        if left_ok && right_ok {
+            let year: String = window.iter().collect();
+            return year.parse().ok();
+        }
+    }
+    None
+}
+
 /// 补历史时并行处理视频的 worker 数。
 ///
 /// 取流、下载、转写都是长任务，串行处理上百条视频耗时很久。多 worker 并行按倍数省时间，
@@ -4759,6 +4805,8 @@ struct MonitorFetchStats {
     recovered_downloading: i64,
     /// 本轮回填的存量帖数
     backfilled: i64,
+    /// 本次因发布年份早于 `BACKFILL_YEAR_MIN` 被丢弃的历史帖数
+    dropped_old_posts: i64,
     /// 待处理的历史视频帖数（历史视频不自动下载，交给用户手动）
     pending_videos: i64,
     /// 因已有「已补历史」标记而被跳过的博主数
@@ -5518,7 +5566,8 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
             .iter()
             .filter_map(|post| post.get("id").and_then(Value::as_str).map(String::from))
             .collect();
-        // 新帖不够填满窗口时，用「存量里还没抓过正文」的补上（同样是最近的优先）
+        // 新帖不够填满窗口时，用「存量里还没抓过正文」的补上（同样是最近的优先）。
+        // 年份下限同样生效：已知发布日期早于下限的存量帖不再花详情抓取的额度。
         if detail_targets.len() < BACKFILL_MAX {
             let backlog: Vec<String> = with_store(&state, |store| {
                 let mut pending: Vec<(i64, String)> = store
@@ -5527,6 +5576,7 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
                     .filter(|p| p.watch_id.as_deref() == Some(watch.id.as_str()))
                     .filter(|p| Platform::parse(&p.platform).map(|x| x.is_cdp()).unwrap_or(false))
                     .filter(|p| !p.detail_fetched && p.content.trim().is_empty())
+                    .filter(|p| !published_before_cutoff(p.published_at.as_deref()))
                     .map(|p| (p.created_at.parse::<i64>().unwrap_or(0), p.id.clone()))
                     .collect();
                 pending.sort_by(|a, b| b.0.cmp(&a.0));
@@ -5543,6 +5593,56 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
 
         for id in &detail_targets {
             stats.enrich_detail(&state, id);
+        }
+
+        // —— 年份下限：BACKFILL_YEAR_MIN 年以前发布的历史动态直接丢弃 ——
+        //
+        // 日期只有补完正文才拿得到（主页列表不带发布时间），所以删除动作放在这里。
+        // 两个位置约束：
+        // 1. 必须先于「视频挑选」执行，否则下架前的老视频会照常排进下载队列，
+        //    用户看到的就是「补完历史，开始下载 2019 年的视频」；
+        // 2. 快照随帖一起删（与 post_remove 的级联语义一致），不留给复盘当孤儿。
+        let dropped_ids: Vec<String> = with_store_mut(&state, |store| {
+            let stale: Vec<String> = store
+                .monitored_posts
+                .iter()
+                .filter(|p| detail_targets.contains(&p.id))
+                .filter(|p| published_before_cutoff(p.published_at.as_deref()))
+                .map(|p| p.id.clone())
+                .collect();
+            if !stale.is_empty() {
+                store.monitored_posts.retain(|p| !stale.contains(&p.id));
+                store.post_snapshots.retain(|s| !stale.contains(&s.post_id));
+            }
+            Ok(stale)
+        })?;
+        if !dropped_ids.is_empty() {
+            // 计数修正：new_posts 在上文按 created 全量计过，被年份砍掉的要扣回去。
+            // （backlog 回填的计数 stats.backfilled 同理不再修正 —— 该数字表示「补了
+            // 多少条正文」，正文确实补了，只是落库前被删，统计口径不变。）
+            let dropped_created = created
+                .iter()
+                .filter(|post| {
+                    post.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| dropped_ids.iter().any(|x| x == id))
+                })
+                .count() as i64;
+            stats.new_posts -= dropped_created;
+            stats.dropped_old_posts = dropped_ids.len() as i64;
+            crate::logging::emit_legacy_line(
+                crate::logging::event::LogSource::Host,
+                crate::logging::event::LogLevel::Info,
+                "monitor",
+                "monitor.history.dropped_old",
+                format!(
+                    "[monitor history] {}: dropped {} posts published before {BACKFILL_YEAR_MIN}",
+                    watch.name,
+                    dropped_ids.len()
+                ),
+                json!({ "watchId": watch.id, "dropped": dropped_ids.len(), "minYear": BACKFILL_YEAR_MIN }),
+                None,
+            );
         }
 
         // 补完正文后，media_type 已被详情页修正为真实的 "video" / "image"，
@@ -5706,6 +5806,8 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
         "profileTotal": profile_total_max,
         // 其中 URL 未见过的 = 真正补进来的历史帖
         "newPosts": stats.new_posts,
+        // 因发布年份早于下限（BACKFILL_YEAR_MIN）被丢弃的历史帖数
+        "droppedBefore2026": stats.dropped_old_posts,
         "detailEnriched": stats.detail_ok,
         "detailSkipped": stats.detail_skipped,
         "skipNote": stats.skip_note,
@@ -5935,7 +6037,41 @@ pub fn start_monitor_scheduler(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_watch_id, watch_dedupe_key};
+    use super::{
+        extract_four_digit_year, published_before_cutoff, resolve_watch_id, watch_dedupe_key,
+    };
+
+    /// 回归守卫：年份下限判定宁可漏删不可误删。
+    ///
+    /// 各平台 `published_at` 的实际文案差异很大（ISO 截断 / 中文日期 / 无年份短格式 /
+    /// 相对日期）。解析不出年份的一律视为「不早于下限」——2026 年的帖子绝不能被删。
+    #[test]
+    fn published_before_cutoff_judges_conservatively() {
+        // 早于 2026 → 删
+        assert!(published_before_cutoff(Some("2024-03-15")));
+        assert!(published_before_cutoff(Some("2024年3月15日")));
+        assert!(published_before_cutoff(Some("2019-12-31 23:59")));
+        // 2026 及以后 → 留
+        assert!(!published_before_cutoff(Some("2026-01-01")));
+        assert!(!published_before_cutoff(Some("2026-11-01")));
+        // 解析不出年份 → 留（相对日期 / 无年份短格式 / 空 / 缺字段）
+        assert!(!published_before_cutoff(Some("3天前")));
+        assert!(!published_before_cutoff(Some("03-15")));
+        assert!(!published_before_cutoff(Some("")));
+        assert!(!published_before_cutoff(None));
+        // 五位以上数字不是年份（时间戳被误塞进来也不能按前四位判）
+        assert!(!published_before_cutoff(Some("1793952000000")));
+    }
+
+    /// 独立四位段才算年份：避开长数字子串和粘连数字。
+    #[test]
+    fn extract_four_digit_year_needs_digit_boundaries() {
+        assert_eq!(extract_four_digit_year("2024-03-15"), Some(2024));
+        assert_eq!(extract_four_digit_year("发布于 2019年12月"), Some(2019));
+        assert_eq!(extract_four_digit_year("03-15"), None);
+        assert_eq!(extract_four_digit_year("3天前"), None);
+        assert_eq!(extract_four_digit_year("1793952000000"), None);
+    }
 
     /// 回归守卫：已有归属的帖子不能被另一个监控项抢走。
     ///
