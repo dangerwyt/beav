@@ -1,9 +1,8 @@
 import { startTransition, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { isTauriRuntime } from '../bridge/browserHost';
-import { Radar, Plus, RefreshCw, Trash2, ExternalLink, Zap, Sparkles, Check, X, Eye, Loader2, Link2, Lock, LogOut, ChevronDown, ChevronLeft, ChevronRight, FlaskConical, BookOpen, Copy, Download, Video, Film, History, AudioLines } from 'lucide-react';
+import { Radar, Plus, RefreshCw, Trash2, ExternalLink, Zap, Sparkles, Check, X, Eye, Loader2, Link2, Lock, LogOut, ChevronDown, ChevronLeft, ChevronRight, FlaskConical, BookOpen, Copy, Download, Video, Film, History, AudioLines, Users } from 'lucide-react';
 import { createPortal } from 'react-dom';
 import { clsx } from 'clsx';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { MonitorChromeStatus, MonitorChromeLaunchResult, MonitorChromeTestResult } from '../bridge/domains/monitorBridge';
 import { resolveAssetUrl } from '../utils/pathManager';
 import { appConfirm } from '../utils/appDialogs';
@@ -13,6 +12,13 @@ import { CDP_PLATFORMS, PLATFORM_HOME, PLATFORMS, type CdpPlatform } from '../co
 function isPlatformUrl(url: string): boolean {
   return /xiaohongshu\.com|douyin\.com|bilibili\.com|weibo\.com/i.test(String(url || ''));
 }
+
+/**
+ * 普通用户视图里单平台的登录态。
+ * - logged-in / not-logged-in 看的是登录 cookie
+ * - chrome-down 表示该平台的 Chrome 根本没在跑（服务器上被人关了，或从没启动过）
+ */
+type PlatformLoginTag = 'logged-in' | 'not-logged-in' | 'chrome-down';
 
 interface CompetitorWatch {
   id: string;
@@ -28,6 +34,8 @@ interface CompetitorWatch {
   historyBackfilledAt?: string | null;
   /** 该监控已收录的帖子数（后端 watch-list 从 monitored_posts 派生，不依赖前端选中的 posts 数组）。 */
   postCount?: number;
+  /** 被分配给了哪些 web 用户（桌面端添加的博主可分给指定用户，让他们在 web 端也能看到）。 */
+  sharedTo?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -580,6 +588,13 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   });
   const [addError, setAddError] = useState('');
 
+  // —— 分配博主给 web 用户（仅桌面端管理员可见）——
+  const [assignTarget, setAssignTarget] = useState<CompetitorWatch | null>(null);
+  const [assignCandidates, setAssignCandidates] = useState<Array<{ username: string; role: string }>>([]);
+  const [assignSelected, setAssignSelected] = useState<string[]>([]);
+  const [assignLoading, setAssignLoading] = useState(false);
+  const [assignError, setAssignError] = useState('');
+
   // —— 本地详情弹窗（点标题在 Beav 内看正文，不跳平台）——
   const [detailPost, setDetailPost] = useState<MonitoredPost | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -595,6 +610,10 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [chromeBusy, setChromeBusy] = useState(false);
   const [chromeLoginPlatform, setChromeLoginPlatform] = useState<CdpPlatform>(CDP_PLATFORMS[0]);
   const [chromeTestResult, setChromeTestResult] = useState<string | null>(null);
+  /** 三个平台**各自**的登录态（普通用户视图用）。
+   *  普通用户看不到平台 tab，只显示一个"当前平台"等于什么都没说：
+   *  他既不知道抖音/B 站有没有登录，也不知道服务器上某个平台的 Chrome 被关掉了。 */
+  const [platformStates, setPlatformStates] = useState<Partial<Record<CdpPlatform, PlatformLoginTag>>>({});
 
   // —— 扫码登录弹窗 ——
   const [qrOpen, setQrOpen] = useState(false);
@@ -633,11 +652,13 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   }, [chromeLoginPlatform]);
 
   useEffect(() => {
-    if (!isActive) return;
+    // 普通用户不查「当前选中平台」：他没有 tab 可切，看的是下面按平台列出的 tag。
+    // 这里多查一次只会和管理员视图的状态打架，还白跑一次 IPC。
+    if (!isActive || !isAdminUser) return;
     void checkPlatformLogin(false);
     const timer = window.setInterval(() => void checkPlatformLogin(false), 10_000);
     return () => window.clearInterval(timer);
-  }, [isActive, checkPlatformLogin]);
+  }, [isActive, isAdminUser, checkPlatformLogin]);
 
   useEffect(() => {
     if (isTauriRuntime()) return;
@@ -654,6 +675,47 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       cancelled = true;
     };
   }, []);
+
+  // 普通 web 用户：把三个平台的登录态一次查全。
+  //
+  // 管理员有 tab，可以自己切着看；普通用户没有 tab，面板里如果只写「当前平台：小红书」，
+  // 等于告诉他一件跟他无关的事，而真正要紧的两件事他看不到：
+  //   1) 抖音 / B 站到底有没有登录（能不能抓）
+  //   2) 服务器上某个平台的 Chrome 被关掉了（抓取会静默失败）
+  // chromeQrStatus 在端口为 0 时返回 loggedIn=false + note="Chrome 未启动"，
+  // 正好可以把「没运行」和「没登录」区分开。
+  useEffect(() => {
+    if (isAdminUser || !isActive) return;
+    let cancelled = false;
+    const probe = async () => {
+      const entries = await Promise.all(
+        CDP_PLATFORMS.map(async (platform) => {
+          try {
+            const status = await window.ipcRenderer.monitor.chromeQrStatus(platform, false);
+            const tag: PlatformLoginTag =
+              status?.loggedIn === true
+                ? 'logged-in'
+                : String(status?.note || '').includes('未启动')
+                  ? 'chrome-down'
+                  : 'not-logged-in';
+            return [platform, tag] as const;
+          } catch {
+            return [platform, 'chrome-down'] as const;
+          }
+        }),
+      );
+      if (!cancelled) {
+        setPlatformStates(Object.fromEntries(entries) as Partial<Record<CdpPlatform, PlatformLoginTag>>);
+      }
+    };
+    void probe();
+    // 20s 一轮：比单个平台的 10s 轮询稍慢，避免三个平台同时打后端。
+    const timer = window.setInterval(() => void probe(), 20_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [isAdminUser, isActive]);
 
   // —— 爆文拆解（详情弹窗内）——
   const [deconResult, setDeconResult] = useState<PostDeconstruction | null>(null);
@@ -889,19 +951,22 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   // 没有这一层，即使后端已补全，用户次日打开仍要走异步 fetch（不「秒见正文」）。
   useEffect(() => {
     if (!isActive) return;
-    let unlisten: UnlistenFn | undefined;
-    listen<{
-      newPosts?: number;
-      videosDownloaded?: number;
-      videosTranscribed?: number;
-      detailEnriched?: number;
-      detailSkipped?: number;
-      skipNote?: string | null;
-      backfilled?: number;
-      recoveredDownloading?: number;
-    }>('monitor:prefetch-done', (event) => {
+    // 走桥接层 on/off，而**不是** `@tauri-apps/api/event` 的 listen：
+    // web 端没有 Tauri 运行时，listen() 取不到 __TAURI_INTERNALS__ 会直接失败，
+    // 事件永远收不到 —— 「桌面端有提示、web 端没有」的根因就是这个。
+    // window.ipcRenderer.on 两端通用：桌面端走原生事件，浏览器走 /api/events 的 SSE。
+    const handler = (_event: unknown, raw: unknown) => {
       void loadPosts();
-      const p = event.payload ?? {};
+      const p = (raw ?? {}) as {
+        newPosts?: number;
+        videosDownloaded?: number;
+        videosTranscribed?: number;
+        detailEnriched?: number;
+        detailSkipped?: number;
+        skipNote?: string | null;
+        backfilled?: number;
+        recoveredDownloading?: number;
+      };
       const parts: string[] = [];
       if ((p.newPosts ?? 0) > 0) parts.push(`新增 ${p.newPosts} 篇`);
       if ((p.detailEnriched ?? 0) > 0) parts.push(`补全正文 ${p.detailEnriched} 篇`);
@@ -915,57 +980,45 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
           `有 ${p.detailSkipped} 篇未抓到正文${p.skipNote ? `：${p.skipNote}` : ''}`,
         );
       }
-    })
-      .then((u) => {
-        unlisten = u;
-      })
-      .catch(() => {});
-    return () => {
-      unlisten?.();
     };
+    window.ipcRenderer.on('monitor:prefetch-done', handler);
+    return () => window.ipcRenderer.off('monitor:prefetch-done', handler);
   }, [isActive, loadPosts, showToast]);
 
   // 监听后端「补历史」实时进度：深翻是 Rust 侧逐轮滚动，每轮上报一次
   // { watchId, scanned, total }，前端据此刷新「已抓 X / 共 Y」进度条。
   useEffect(() => {
     if (!isActive) return;
-    let unlisten: UnlistenFn | undefined;
-    listen<{ watchId?: string; scanned?: number; total?: number; phase?: string }>(
-      'monitor:backfill-progress',
-      (event) => {
-        const p = event.payload ?? {};
-        if (!p.watchId) return;
-        const wid = p.watchId as string;
-        // phase=videos-done：本批视频处理结束。多批并行时，先完成的小批
-        // 不能把还在跑的大批进度条删掉 → 只有完成批次 >= 当前记录的批次才清。
-        if (p.phase === 'videos-done') {
-          const incomingTotal = p.total ?? 0;
-          setBackfillProgress((prev) => {
-            const current = prev[wid];
-            if (current && current.total > incomingTotal) return prev;
-            const next = { ...prev };
-            delete next[wid];
-            return next;
-          });
-          return;
-        }
-        setBackfillProgress((prev) => ({
-          ...prev,
-          [wid]: {
-            scanned: p.scanned ?? 0,
-            total: p.total ?? 0,
-            phase: p.phase,
-          },
-        }));
-      },
-    )
-      .then((u) => {
-        unlisten = u;
-      })
-      .catch(() => {});
-    return () => {
-      unlisten?.();
+    // 同上：必须走桥接层。用 listen() 的话 web 端这条事件永远到不了，
+    // 表现就是「桌面端显示『历史视频处理中 14 / 共 16 个』，web 端什么都没有」。
+    const handler = (_event: unknown, raw: unknown) => {
+      const p = (raw ?? {}) as { watchId?: string; scanned?: number; total?: number; phase?: string };
+      if (!p.watchId) return;
+      const wid = p.watchId;
+      // phase=videos-done：本批视频处理结束。多批并行时，先完成的小批
+      // 不能把还在跑的大批进度条删掉 → 只有完成批次 >= 当前记录的批次才清。
+      if (p.phase === 'videos-done') {
+        const incomingTotal = p.total ?? 0;
+        setBackfillProgress((prev) => {
+          const current = prev[wid];
+          if (current && current.total > incomingTotal) return prev;
+          const next = { ...prev };
+          delete next[wid];
+          return next;
+        });
+        return;
+      }
+      setBackfillProgress((prev) => ({
+        ...prev,
+        [wid]: {
+          scanned: p.scanned ?? 0,
+          total: p.total ?? 0,
+          phase: p.phase,
+        },
+      }));
     };
+    window.ipcRenderer.on('monitor:backfill-progress', handler);
+    return () => window.ipcRenderer.off('monitor:backfill-progress', handler);
   }, [isActive]);
 
   const openExternal = useCallback(async (url?: string | null) => {
@@ -1189,6 +1242,58 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       showToast('err', e instanceof Error ? e.message : '删除失败');
     }
   }, [loadWatches, loadPosts, showToast]);
+
+  /** 打开「分配」弹窗：先拉一次 web 用户表，把当前已分配的勾上。 */
+  const openAssign = useCallback(async (watch: CompetitorWatch) => {
+    setAssignTarget(watch);
+    setAssignSelected(watch.sharedTo ?? []);
+    setAssignError('');
+    setAssignLoading(true);
+    try {
+      const result = (await window.ipcRenderer.monitor.webUsers()) as {
+        users?: Array<{ username: string; role: string }>;
+        found?: boolean;
+      };
+      setAssignCandidates(result?.users ?? []);
+      if (result && result.found === false) {
+        // 桌面端单独运行（没起过 web 网关）时没有 users.json，明确说清楚而不是显示空列表。
+        setAssignError('没找到 web 用户表（users.json）—— 先启动一次 web 端并建好账号，再回来分配');
+      }
+    } catch (e) {
+      setAssignError(e instanceof Error ? e.message : '读取用户列表失败');
+    } finally {
+      setAssignLoading(false);
+    }
+  }, []);
+
+  /** 保存分配：整表覆盖（传空数组=收回该博主的全部分配）。 */
+  const handleAssignSave = useCallback(async () => {
+    if (!assignTarget) return;
+    setAssignLoading(true);
+    setAssignError('');
+    try {
+      const result = (await window.ipcRenderer.monitor.watchAssign(
+        assignTarget.id,
+        assignSelected,
+      )) as { success?: boolean; error?: string };
+      if (result && result.success === false) {
+        setAssignError(result.error || '分配失败');
+        return;
+      }
+      setAssignTarget(null);
+      await loadWatches();
+      showToast(
+        'ok',
+        assignSelected.length
+          ? `已分配给 ${assignSelected.join('、')}`
+          : '已收回全部分配（只有你自己能看到）',
+      );
+    } catch (e) {
+      setAssignError(e instanceof Error ? e.message : '分配失败');
+    } finally {
+      setAssignLoading(false);
+    }
+  }, [assignTarget, assignSelected, loadWatches, showToast]);
 
   const handleClear = useCallback(async () => {
     // 用应用内对话框而不是 window.confirm：Tauri 的 macOS WKWebView 不实现
@@ -1738,11 +1843,13 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               ) : (
                 <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-secondary text-text-tertiary">未就绪</span>
               ))}
-              {/* 登录态 ≠ Chrome 就绪：Chrome 起着但平台没登录时，抓取只能拿游客首屏几条 */}
-              {platformLoginState === false && (
+              {/* 登录态 ≠ Chrome 就绪：Chrome 起着但平台没登录时，抓取只能拿游客首屏几条。
+                  「当前选中平台」这个概念只对管理员有意义（他有 tab 可切）；
+                  普通用户看的是下面三个平台各自的 tag，这里不再重复一个单平台状态。 */}
+              {isAdminUser && platformLoginState === false && (
                 <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-600">平台未登录</span>
               )}
-              {platformLoginState === true && (
+              {isAdminUser && platformLoginState === true && (
                 <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-600">已登录</span>
               )}
             </div>
@@ -1755,20 +1862,49 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   全部收进管理员视图 —— 用户端的人不需要、也不该接触这些。 */}
               {!isAdminUser ? (
                 <div className="space-y-1.5 text-[11px] leading-relaxed">
-                  <div className="flex items-center gap-2">
-                    <span className="text-text-secondary">平台账号</span>
-                    {platformLoginState === true ? (
-                      <span className="text-emerald-600">已登录</span>
-                    ) : (
-                      <span className="text-amber-600">未登录（管理员在处理）</span>
-                    )}
-                  </div>
+                  {/* 平台账号的「已登录/未登录」那行已按需求去掉：下面的三平台 tag
+                      已经逐平台列了状态，单拎一个「平台账号」反而看不出是哪个平台。 */}
                   <p className="text-text-tertiary">
                     抓取用的平台账号由管理员在服务器上统一维护，
                     <b className="text-text-secondary">你不需要登录任何平台账号</b>。
                     未登录时只能抓到游客可见的少量笔记，之后会由管理员补上。
                   </p>
-                  <p className="text-text-tertiary">当前平台：{platformLabel(chromeLoginPlatform)}</p>
+                  {/* 三个平台各自的登录态。普通用户没有 tab 可切，这里必须一次列清楚：
+                      哪个平台能用、哪个平台没登录、哪个平台 Chrome 被关了。
+                      单写「当前平台：小红书」等于什么都没说，还会让人以为要"切"才能抓抖音。 */}
+                  <div className="flex items-start gap-1.5">
+                    <span className="text-text-secondary shrink-0">当前已登录平台：</span>
+                    <div className="flex flex-wrap items-center gap-1">
+                      {CDP_PLATFORMS.map((p) => {
+                        const tag = platformStates[p];
+                        return (
+                          <span
+                            key={p}
+                            className={clsx(
+                              'px-1.5 py-0.5 rounded-full border text-[10px] leading-none',
+                              tag === 'logged-in'
+                                ? 'bg-emerald-50 text-emerald-600 border-emerald-200'
+                                : tag === 'not-logged-in'
+                                  ? 'bg-amber-50 text-amber-600 border-amber-200'
+                                  : 'bg-surface-secondary text-text-tertiary border-border',
+                            )}
+                          >
+                            {platformLabel(p)}
+                            {' · '}
+                            {tag === 'logged-in'
+                              ? '已登录'
+                              : tag === 'not-logged-in'
+                                ? '未登录'
+                                : tag === 'chrome-down'
+                                  ? '未运行'
+                                  : '检测中'}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  {/* 「未运行/未登录」的解释段与「按博主平台自动选登录态」的说明已按需求去掉：
+                      tag 本身已经用颜色区分了三种状态（绿=已登录、琥珀=未登录、灰=未运行）。 */}
                 </div>
               ) : (
                 <>
@@ -2075,6 +2211,14 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                       watch.enabled ? 'bg-emerald-500' : 'bg-text-tertiary/40',
                     )} />
                     <span className="text-sm font-medium text-text-primary truncate flex-1">{watch.name}</span>
+                    {isAdminUser && (watch.sharedTo?.length ?? 0) > 0 && (
+                      <span
+                        className="text-[10px] px-1.5 py-0.5 rounded-full bg-accent-primary/10 text-accent-primary shrink-0"
+                        title={`已分配给：${watch.sharedTo?.join('、')}`}
+                      >
+                        已分配 {watch.sharedTo?.length}
+                      </span>
+                    )}
                     {watch.platform && (
                       <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-primary text-text-tertiary shrink-0">
                         {platformLabel(watch.platform)}
@@ -2200,6 +2344,24 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
+                  {isAdminUser && (
+                    <button
+                      onClick={() => void openAssign(watch)}
+                      className={clsx(
+                        'inline-flex items-center justify-center w-7 h-7 rounded-md transition-colors',
+                        (watch.sharedTo?.length ?? 0) > 0
+                          ? 'text-accent-primary bg-accent-primary/10 hover:bg-accent-primary/20'
+                          : 'text-text-tertiary hover:text-accent-primary hover:bg-surface-primary',
+                      )}
+                      title={
+                        (watch.sharedTo?.length ?? 0) > 0
+                          ? `已分配给：${watch.sharedTo?.join('、')}（点击调整）`
+                          : '分配给 web 用户，让他登录后在 web 端也能看到这个博主'
+                      }
+                    >
+                      <Users className="w-3.5 h-3.5" />
+                    </button>
+                  )}
                 </div>
               </div>
             ))
@@ -3074,6 +3236,83 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 className="px-4 py-2 text-sm text-white bg-accent-primary hover:bg-accent-primary/90 rounded-lg transition-colors"
               >
                 添加
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 分配博主给 web 用户（桌面端管理员专用）。
+          只改可见性，不改归属：抓取产物仍记在你自己名下，web 用户能看能用，但删不掉。 */}
+      {assignTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+          <div className="w-full max-w-md mx-4 bg-surface-primary rounded-xl border border-border shadow-2xl overflow-hidden">
+            <div className="px-6 py-4 border-b border-border flex items-center justify-between">
+              <h3 className="text-base font-semibold text-text-primary">分配给 web 用户</h3>
+              <button onClick={() => setAssignTarget(null)} className="text-text-tertiary hover:text-text-primary">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="px-6 py-4 space-y-3">
+              <p className="text-xs leading-relaxed text-text-secondary">
+                「{assignTarget.name}」以及已抓取的动态，勾选的用户登录 web 端就能看到。
+                他们也能抓取、补历史、下载；但删除这个博主仍然只有你能做。
+              </p>
+              {assignLoading && (
+                <div className="flex items-center gap-2 text-xs text-text-tertiary">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> 处理中…
+                </div>
+              )}
+              {!assignLoading && assignCandidates.length === 0 && !assignError && (
+                <p className="text-xs text-text-tertiary">还没有其他 web 用户账号。</p>
+              )}
+              {assignCandidates.length > 0 && (
+                <div className="space-y-1.5 max-h-56 overflow-y-auto">
+                  {assignCandidates.map((user) => {
+                    const checked = assignSelected.includes(user.username);
+                    return (
+                      <label
+                        key={user.username}
+                        className="flex items-center gap-2.5 px-3 py-2 rounded-lg border border-border hover:bg-surface-secondary cursor-pointer"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() =>
+                            setAssignSelected((prev) =>
+                              checked
+                                ? prev.filter((name) => name !== user.username)
+                                : [...prev, user.username],
+                            )
+                          }
+                          className="accent-accent-primary"
+                        />
+                        <span className="text-sm text-text-primary">{user.username}</span>
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-secondary text-text-tertiary ml-auto">
+                          {user.role === 'admin' ? '管理员' : '普通用户'}
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+              {assignError && <p className="text-xs text-red-500 leading-relaxed">{assignError}</p>}
+            </div>
+
+            <div className="px-6 py-4 bg-surface-secondary border-t border-border flex items-center justify-end gap-3">
+              <button
+                onClick={() => setAssignTarget(null)}
+                className="px-4 py-2 text-sm text-text-secondary hover:text-text-primary border border-border rounded-lg transition-colors"
+              >
+                取消
+              </button>
+              <button
+                onClick={() => void handleAssignSave()}
+                disabled={assignLoading}
+                className="px-4 py-2 text-sm text-white bg-accent-primary hover:bg-accent-primary/90 rounded-lg transition-colors disabled:opacity-50"
+              >
+                保存分配
               </button>
             </div>
           </div>

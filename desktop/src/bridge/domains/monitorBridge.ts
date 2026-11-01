@@ -148,6 +148,18 @@ export function createMonitorBridge(core: BridgeCore) {
           timeoutMs: READ_TIMEOUT_MS,
           fallback: () => ({ success: false, error: 'remove timed out' }) as unknown as T,
         }),
+      /** 把博主分配（或取消分配）给 web 用户。传空数组=收回全部分配。 */
+      watchAssign: <T = unknown>(id: string, users: string[]) =>
+        core.invokeChannelGuarded<T>('monitor:watch-assign', { id, users }, {
+          timeoutMs: READ_TIMEOUT_MS,
+          fallback: () => ({ success: false, error: 'assign timed out' }) as unknown as T,
+        }),
+      /** 可分配的 web 用户（读网关的 users.json；找不到时 found=false）。 */
+      webUsers: <T = unknown>() =>
+        core.invokeChannelGuarded<T>('monitor:web-users', {}, {
+          timeoutMs: READ_TIMEOUT_MS,
+          fallback: () => ({ users: [], found: false }) as unknown as T,
+        }),
       fetch: <T = unknown>(payload: MonitorFetchPayload) =>
         core.invokeChannelGuarded<T>('monitor:fetch', payload, {
           timeoutMs: FETCH_TIMEOUT_MS,

@@ -778,6 +778,13 @@ pub(crate) struct CompetitorWatchRecord {
     /// 归属用户（web 多租户）。空 = 旧数据，归 admin。
     #[serde(default)]
     pub(crate) owner: String,
+    /// 被**分配**给哪些 web 用户查看/使用。
+    ///
+    /// 归属仍是 `owner`（抓取产物、去重键都按 owner 算），这里只是可见性白名单：
+    /// 桌面端（admin）添加的博主可以分配给自己之外的用户，让 web 端能看到该博主及其动态。
+    /// 空数组 = 未分配，只有 owner 本人（以及 admin）可见。
+    #[serde(default)]
+    pub(crate) shared_to: Vec<String>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
 }

@@ -60,3 +60,19 @@ pub(crate) fn owner_matches(owner: &str) -> bool {
 pub(crate) fn owner_equals(left: &str, right: &str) -> bool {
     effective(left) == effective(right)
 }
+
+/// 当前身份能否访问「归属 `owner`、且被分配给 `shared_to` 这些人」的数据。
+///
+/// 在 `owner_matches` 之上多放行一条：**被分配**的博主。
+/// 用途限于「看」和「对已有数据做增量处理」（抓取、补历史、下载）；
+/// 删除类操作必须继续用 `owner_matches`，否则被分配者能反过来删掉别人的东西。
+pub(crate) fn can_access(owner: &str, shared_to: &[String]) -> bool {
+    if owner_matches(owner) {
+        return true;
+    }
+    let Some(current) = current_owner() else {
+        return true;
+    };
+    let me = current.trim();
+    shared_to.iter().any(|user| user.trim() == me)
+}

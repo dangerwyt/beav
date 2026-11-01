@@ -61,23 +61,40 @@ fn guard_owned_target(
         return Ok(());
     }
 
+    // 删除类操作只认归属者本人：被分配（sharedTo）的用户可以查看、抓取、下载，
+    // 但不能反过来删掉别人的帖子/博主。
+    const OWNER_STRICT_CHANNELS: &[&str] = &["monitor:watch-remove", "monitor:post-remove"];
+    let strict = OWNER_STRICT_CHANNELS.contains(&channel);
+
     if let Some(id) = payload
         .get("id")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let owner = with_store(state, |store| {
+        // 返回 (归属人, 被分配给谁)，由下面的判定决定用严格还是放宽规则。
+        let target = with_store(state, |store| {
             if let Some(post) = store.monitored_posts.iter().find(|item| item.id == id) {
-                return Ok(Some(post.owner.clone()));
+                let shared = post
+                    .watch_id
+                    .as_ref()
+                    .and_then(|watch_id| store.competitor_watchlist.iter().find(|w| &w.id == watch_id))
+                    .map(|watch| watch.shared_to.clone())
+                    .unwrap_or_default();
+                return Ok(Some((post.owner.clone(), shared)));
             }
             if let Some(watch) = store.competitor_watchlist.iter().find(|item| item.id == id) {
-                return Ok(Some(watch.owner.clone()));
+                return Ok(Some((watch.owner.clone(), watch.shared_to.clone())));
             }
             Ok(None)
         })?;
-        if let Some(owner) = owner {
-            if !crate::identity::owner_matches(&owner) {
+        if let Some((owner, shared)) = target {
+            let allowed = if strict {
+                crate::identity::owner_matches(&owner)
+            } else {
+                crate::identity::can_access(&owner, &shared)
+            };
+            if !allowed {
                 return Err("对象不存在".to_string());
             }
         }
@@ -89,15 +106,20 @@ fn guard_owned_target(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let owner = with_store(state, |store| {
+        let target = with_store(state, |store| {
             Ok(store
                 .competitor_watchlist
                 .iter()
                 .find(|item| item.id == watch_id)
-                .map(|item| item.owner.clone()))
+                .map(|item| (item.owner.clone(), item.shared_to.clone())))
         })?;
-        if let Some(owner) = owner {
-            if !crate::identity::owner_matches(&owner) {
+        if let Some((owner, shared)) = target {
+            let allowed = if strict {
+                crate::identity::owner_matches(&owner)
+            } else {
+                crate::identity::can_access(&owner, &shared)
+            };
+            if !allowed {
                 return Err("博主不存在".to_string());
             }
         }
@@ -138,6 +160,11 @@ pub fn handle_monitor_channel(
         "monitor:set-spike-threshold",
         "monitor:chrome-shutdown",
         "monitor:chrome-launch",
+        // 分配博主给 web 用户：只有管理员能做（他也是唯一能看见全部用户表的人）。
+        "monitor:watch-assign",
+        "monitor:web-users",
+        // 清孤儿数据会跨用户删记录，只允许管理员。
+        "monitor:purge-orphans",
     ];
     if !crate::identity::is_admin() && ADMIN_ONLY.contains(&channel) {
         return Some(Err("该操作仅管理员可用".to_string()));
@@ -150,6 +177,9 @@ pub fn handle_monitor_channel(
             "monitor:watch-add" => watch_add(state, payload),
             "monitor:watch-list" => watch_list(state, payload),
             "monitor:watch-remove" => watch_remove(state, payload),
+            "monitor:watch-assign" => watch_assign(state, payload),
+            "monitor:web-users" => list_web_users(state),
+            "monitor:purge-orphans" => purge_orphans(state),
             "monitor:fetch" => fetch_monitor(state, payload, None, false),
             "monitor:post-list" => post_list(state, payload),
             "monitor:inject-topic" => inject_topic(state, payload),
@@ -538,6 +568,8 @@ fn watch_add(state: &State<'_, AppState>, payload: &Value) -> Result<Value, Stri
     let record = crate::CompetitorWatchRecord {
         id: make_id("watch"),
         owner,
+        // 新建的博主默认不分配：只有创建者（以及 admin）可见，之后由管理员手动分配。
+        shared_to: Vec::new(),
         name,
         platform,
         profile_url,
@@ -608,8 +640,8 @@ fn watch_list(state: &State<'_, AppState>, payload: &Value) -> Result<Value, Str
             println!("[monitor] cleaned {cleaned} legacy history-backfill flags");
         }
         let mut items: Vec<_> = store.competitor_watchlist.iter().cloned().collect();
-        // 按请求身份过滤：桌面端（admin）看全部，web 用户只看自己的。
-        items.retain(|item| crate::identity::owner_matches(&item.owner));
+        // 按请求身份过滤：桌面端（admin）看全部；web 用户看「自己的」+「被分配给他的」。
+        items.retain(|item| crate::identity::can_access(&item.owner, &item.shared_to));
         if only_enabled {
             items.retain(|item| item.enabled);
         }
@@ -647,6 +679,101 @@ fn watch_remove(state: &State<'_, AppState>, payload: &Value) -> Result<Value, S
     })
 }
 
+/// 把博主分配（或取消分配）给指定 web 用户（`monitor:watch-assign`）。
+///
+/// 只改 `shared_to`，不动 `owner`：抓取产物仍记在 owner 名下，
+/// 分配 = 让被分配者在 web 端「看得见、能抓、能下载」；删除权仍只归 owner。
+/// 仅管理员可调用（`ADMIN_ONLY` 拦截）。
+fn watch_assign(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
+    let id = str_field(payload, "id").ok_or_else(|| "缺少 id".to_string())?;
+    let users: Vec<String> = payload
+        .get("users")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    with_store_mut(state, |store| {
+        let Some(watch) = store.competitor_watchlist.iter_mut().find(|item| item.id == id) else {
+            return Err("博主不存在".to_string());
+        };
+        let mut next: Vec<String> = Vec::new();
+        for user in users {
+            // admin 本来就全可见；owner 本人也本来就可见 —— 写进名单没有意义。
+            if user == "admin" || crate::identity::owner_equals(&watch.owner, &user) {
+                continue;
+            }
+            if !next.contains(&user) {
+                next.push(user);
+            }
+        }
+        watch.shared_to = next;
+        watch.updated_at = now_i64().to_string();
+        Ok(json!({ "success": true, "sharedTo": watch.shared_to }))
+    })
+}
+
+/// 列出可分配的 web 用户（`monitor:web-users`）。
+///
+/// 账号表不归 daemon 管（由 web 网关维护 `users.json`），所以这里按几个常见位置找它：
+/// 环境变量 → 当前工作目录 → store 所在目录 → 可执行文件目录。
+/// 找不到就返回空列表，前端退化成「手输用户名」，不当作错误。
+fn list_web_users(state: &State<'_, AppState>) -> Result<Value, String> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(custom) = std::env::var("BEAV_USERS_FILE") {
+        let custom = custom.trim();
+        if !custom.is_empty() {
+            candidates.push(std::path::PathBuf::from(custom));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        for rel in ["users.json", "../users.json", "desktop/users.json", "../../users.json"] {
+            candidates.push(cwd.join(rel));
+        }
+    }
+    if let Some(dir) = state.store_path.parent() {
+        candidates.push(dir.join("users.json"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("users.json"));
+        }
+    }
+    let Some(path) = candidates.into_iter().find(|candidate| candidate.exists()) else {
+        return Ok(json!({ "users": [], "found": false }));
+    };
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| format!("读取 {} 失败: {error}", path.display()))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("解析 {} 失败: {error}", path.display()))?;
+    let users: Vec<Value> = value
+        .get("users")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let username = item.get("username").and_then(Value::as_str)?.trim();
+                    // admin 不需要「被分配」：桌面端本来就全可见。
+                    if username.is_empty() || username == "admin" {
+                        return None;
+                    }
+                    Some(json!({
+                        "username": username,
+                        "role": item.get("role").and_then(Value::as_str).unwrap_or("user"),
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(json!({ "users": users, "found": true, "path": path.display().to_string() }))
+}
+
 /// 清空全部「对标博主」与「全部动态」数据。
 ///
 /// 危险操作，仅由 UI 二次确认后调用。`with_store_mut` 会触发 `schedule_store_persist`，
@@ -673,17 +800,69 @@ fn post_remove(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
     let id = str_field(payload, "id").ok_or_else(|| "缺少 id".to_string())?;
     with_store_mut(state, |store| {
         let before = store.monitored_posts.len();
+        let mut removed = false;
         store.monitored_posts.retain(|item| {
             if item.id != id {
                 return true;
             }
-            // 保留「这条不属于当前身份」的记录，不让 web 用户删掉别人的帖子。
-            crate::identity::owner_matches(&item.owner)
+            // retain 的返回值语义是「**保留**」，所以要取反：
+            // 只有「不属于当前身份」的记录才保留，不被 web 用户删掉别人的帖子。
+            // （原先少写了 `!`：管理员对任何 owner 都匹配 → 恒保留 → 谁点了删除都
+            //   只会得到「动态不存在」，帖子其实一条都没删掉。）
+            if crate::identity::owner_matches(&item.owner) {
+                removed = true;
+                return false;
+            }
+            true
         });
-        if store.monitored_posts.len() == before {
+        if !removed || store.monitored_posts.len() == before {
             return Err("动态不存在".to_string());
         }
-        Ok(json!({ "success": true }))
+        // 级联清掉这条帖子的互动快照：快照只按 post_id 关联，帖子没了就永远是孤儿，
+        // 但还会被「数据复盘」按作者聚合进走势里。
+        let before_snapshots = store.post_snapshots.len();
+        store.post_snapshots.retain(|snapshot| snapshot.post_id != id);
+        let removed_snapshots = before_snapshots - store.post_snapshots.len();
+        Ok(json!({ "success": true, "removedSnapshots": removed_snapshots }))
+    })
+}
+
+/// 清理孤儿数据（`monitor:purge-orphans`，管理员专用）。
+///
+/// 两种孤儿：
+/// 1. 帖子：`watchId` 指向一个已不存在的博主（删博主不级联删帖子）——
+///    界面里永远显示不出来，但还占着库；
+/// 2. 快照：`postId` 指向一条已不存在的帖子（帖子被删时没级联，或按老版本删的）。
+///
+/// 快照这类残留必须按「现存帖子集合」反查，不能只跟着本次删掉的帖子走 ——
+/// 帖子早在上一版删掉了，那时还没级联，留下的快照就永远清不到。
+///
+/// `watchId` 为空的帖子不算孤儿（临时抓取进来的帖子本来就不挂在博主下）。
+fn purge_orphans(state: &State<'_, AppState>) -> Result<Value, String> {
+    with_store_mut(state, |store| {
+        let known: std::collections::HashSet<String> =
+            store.competitor_watchlist.iter().map(|watch| watch.id.clone()).collect();
+        let before_posts = store.monitored_posts.len();
+        store.monitored_posts.retain(|post| {
+            !post
+                .watch_id
+                .as_ref()
+                .is_some_and(|watch_id| !known.contains(watch_id))
+        });
+        let removed_posts = before_posts - store.monitored_posts.len();
+
+        let alive: std::collections::HashSet<String> =
+            store.monitored_posts.iter().map(|post| post.id.clone()).collect();
+        let before_snapshots = store.post_snapshots.len();
+        store
+            .post_snapshots
+            .retain(|snapshot| alive.contains(&snapshot.post_id));
+        let removed_snapshots = before_snapshots - store.post_snapshots.len();
+        Ok(json!({
+            "success": true,
+            "removedPosts": removed_posts,
+            "removedSnapshots": removed_snapshots,
+        }))
     })
 }
 
@@ -738,7 +917,16 @@ fn post_detail(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
             .cloned())
     })?
     .ok_or_else(|| "动态不存在".to_string())?;
-    if !crate::identity::owner_matches(&record.owner) {
+    // 打开详情是只读操作：被分配的博主也要能打开，所以用放宽规则（owner 或 sharedTo）。
+    let shared = with_store(state, |store| {
+        Ok(record
+            .watch_id
+            .as_ref()
+            .and_then(|watch_id| store.competitor_watchlist.iter().find(|item| &item.id == watch_id))
+            .map(|watch| watch.shared_to.clone())
+            .unwrap_or_default())
+    })?;
+    if !crate::identity::can_access(&record.owner, &shared) {
         return Err("动态不存在".to_string());
     }
 
@@ -2050,8 +2238,22 @@ fn post_list(state: &State<'_, AppState>, payload: &Value) -> Result<Value, Stri
         .and_then(|value| usize::try_from(value).ok());
     // 纯读：用读锁，避免每次切换博主都触发一次整库落盘（2MB JSON）。
     with_store(state, |store| {
+        // 可见博主：自己的 + 被分配给我的。帖子只冗余了 owner，
+        // 「被分配」记在 watch 上，所以这里按 watchId 做一次归属传播。
+        let visible_watch_ids: std::collections::HashSet<&str> = store
+            .competitor_watchlist
+            .iter()
+            .filter(|watch| crate::identity::can_access(&watch.owner, &watch.shared_to))
+            .map(|watch| watch.id.as_str())
+            .collect();
         let mut items: Vec<_> = store.monitored_posts.iter().cloned().collect();
-        items.retain(|item| crate::identity::owner_matches(&item.owner));
+        items.retain(|item| {
+            crate::identity::owner_matches(&item.owner)
+                || item
+                    .watch_id
+                    .as_deref()
+                    .is_some_and(|watch_id| visible_watch_ids.contains(watch_id))
+        });
         if let Some(id) = &watch_id {
             items.retain(|item| item.watch_id.as_deref() == Some(id));
         }

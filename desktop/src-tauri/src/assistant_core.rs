@@ -1186,6 +1186,10 @@ const SSE_EVENT_NAMES: &[&str] = &[
     "llm-readiness:state-changed",
     "manuscripts:render-progress",
     "manuscripts:write-proposal",
+    // 对标监控：web 端靠 SSE 收这两个事件才能显示「补历史的下载/转写进度」。
+    // 白名单漏了它们 → 桌面端有进度条、web 端一片安静。
+    "monitor:backfill-progress",
+    "monitor:prefetch-done",
     "plugins:changed",
     "redclaw:runner-status",
     "redclaw:task-event",
