@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { isTauriRuntime } from '../bridge/browserHost';
 import { Radar, Plus, RefreshCw, Trash2, ExternalLink, Zap, Sparkles, Check, X, Eye, Loader2, Link2, Lock, LogOut, ChevronDown, ChevronLeft, ChevronRight, FlaskConical, BookOpen, Copy, Download, Video, Film, History, AudioLines, Users } from 'lucide-react';
 import { createPortal } from 'react-dom';
@@ -7,6 +7,7 @@ import type { MonitorChromeStatus, MonitorChromeLaunchResult, MonitorChromeTestR
 import { resolveAssetUrl } from '../utils/pathManager';
 import { appConfirm } from '../utils/appDialogs';
 import { CDP_PLATFORMS, PLATFORM_HOME, PLATFORMS, type CdpPlatform } from '../constants/platforms';
+import { APP_BRAND } from '../config/brand';
 
 /** 是否是内容平台链接（小红书/抖音/B站/微博）—— 这些链接含会话凭证。 */
 function isPlatformUrl(url: string): boolean {
@@ -51,7 +52,13 @@ interface MonitoredPost {
   mediaType?: string;
   coverUrl?: string | null;
   images?: string[];
-  content: string;
+  /**
+   * 正文。**列表接口已投影，不下发正文**；只有详情接口 `post_detail` 会返回完整值。
+   * 需要正文的地方一律从 `detailPost` 取，不要假设列表项里有。
+   */
+  content?: string;
+  /** 列表投影里的轻量标记：正文是否非空（卡片据此决定「拆解」按钮是否可点）。 */
+  hasContent?: boolean;
   /** 详情页是否成功抓取过（图/标题抓到即算，纯图/无正文笔记也算）。作为缓存钥匙，避免无正文帖每次打开都重抓。 */
   detailFetched?: boolean;
   excerpt: string | null;
@@ -79,8 +86,117 @@ interface MonitoredPost {
   videoError?: string | null;
   /** 本地视频是否含音轨（null/undefined = 未探测）。抖音 DASH 常只给视频轨，无音轨则无法转写。 */
   videoHasAudio?: boolean | null;
+  /**
+   * 语音转写状态（来自 post_video_analyses，由列表投影下发）：
+   * `''` = 没跑过分析，`pending` = 已抽帧待转写，`ok` / `no-audio` / `not-configured` / `failed`。
+   */
+  transcriptStatus?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * 把详情接口返回的完整记录合并回「已投影的列表项」，只同步卡片真正用到的字段。
+ *
+ * **绝不能 `{...p, ...full}`**：那会把 content / images 一起塞回列表项，
+ * 点开一条就把正文重新灌进内存里的整份列表，投影等于白做。
+ */
+function mergeSlimPost(base: MonitoredPost, full: MonitoredPost): MonitoredPost {
+  return {
+    ...base,
+    detailFetched: full.detailFetched ?? base.detailFetched,
+    hasContent: Boolean(full.content?.trim()) || base.hasContent,
+    coverUrl: full.coverUrl ?? base.coverUrl,
+    mediaType: full.mediaType ?? base.mediaType,
+    title: full.title || base.title,
+    excerpt: full.excerpt ?? base.excerpt,
+    publishedAt: full.publishedAt ?? base.publishedAt,
+    likes: full.likes,
+    comments: full.comments,
+    collects: full.collects,
+    deconstructed: full.deconstructed ?? base.deconstructed,
+    videoStatus: full.videoStatus ?? base.videoStatus,
+    videoLocalPath: full.videoLocalPath ?? base.videoLocalPath,
+    videoPreviewPath: full.videoPreviewPath ?? base.videoPreviewPath,
+    videoSize: full.videoSize ?? base.videoSize,
+    videoDownloadedAt: full.videoDownloadedAt ?? base.videoDownloadedAt,
+    videoError: full.videoError ?? base.videoError,
+    videoHasAudio: full.videoHasAudio ?? base.videoHasAudio,
+    updatedAt: full.updatedAt ?? base.updatedAt,
+  };
+}
+
+/**
+ * 把各平台形态不一的发布时间解析成 Date；解析不出返回 null（归入「未知时间」）。
+ *
+ * 各平台原始文案差异极大：`2026-10-03` / `2026年10月3日` / `10-03` / `3天前` / `刚刚`。
+ * 只做「够用」的兼容：能被识别的参与时间筛选，识别不了的一律算未知，
+ * 绝不猜年份（猜错会让一条今年的帖子被筛到「更早」里，比不筛更糟）。
+ */
+function parsePublishedAt(raw: string | null | undefined): Date | null {
+  const s = String(raw ?? '').trim();
+  if (!s) return null;
+  const now = new Date();
+
+  if (s === '刚刚' || s === '今天') return now;
+  if (s === '昨天') return new Date(now.getTime() - 86_400_000);
+  const rel = s.match(/^(\d+)\s*(分钟|小时|天|周)前$/);
+  if (rel) {
+    const n = Number(rel[1]);
+    const unitMs = rel[2] === '分钟' ? 60_000 : rel[2] === '小时' ? 3_600_000 : rel[2] === '天' ? 86_400_000 : 604_800_000;
+    return new Date(now.getTime() - n * unitMs);
+  }
+
+  const full = s.match(/(20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})/);
+  if (full) return new Date(Number(full[1]), Number(full[2]) - 1, Number(full[3]));
+
+  // 无年份短格式（`10-03` / `10月3日`）补当前年
+  const md = s.match(/(?:^|[^\d])(\d{1,2})[-/月](\d{1,2})(?![\d])/);
+  if (md) return new Date(now.getFullYear(), Number(md[1]) - 1, Number(md[2]));
+
+  return null;
+}
+
+/**
+ * 把发布时间归一成 `YYYY-MM-DD`。
+ *
+ * 各平台原始串格式完全不同（`2026-09-23` / `10-03` / `2026年10月3日` / `3天前` / ISO 带时分），
+ * 直接渲染会让同一行出现两种日期写法。这里复用 `parsePublishedAt`，
+ * 保证「显示出来的日期」和「时间筛选用的日期」是同一个判断，不会出现显示 10-03 却按别的日子筛。
+ *
+ * 解析不出时**原样返回**而不是显示空——宁可能看到原始文案，也别把信息吞掉。
+ */
+function formatYmd(raw: string | null | undefined): string {
+  const s = String(raw ?? '').trim();
+  if (!s) return '';
+  const iso = s.match(/^(20\d{2})-(\d{1,2})-(\d{1,2})/);
+  if (iso) {
+    const [, y, m, d] = iso;
+    return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+  }
+  const at = parsePublishedAt(s);
+  if (!at) return s;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
+}
+
+/** 列表筛选下拉的统一样式（与「方法论库」过滤栏保持一致）。 */
+const selectCls =
+  'bg-surface-secondary border border-border rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-accent-primary';
+
+/**
+ * 视频下载状态的**单一真源**，卡片徽标与筛选器都必须走这里。
+ *
+ * 历史数据里 `videoStatus` 与本地文件可能不同步（例如状态还是 `none` 但 `videoLocalPath`
+ * 已经有值，或反之）。只要两处各自读字段，就可能出现「筛『未下载』却仍看到『已下载』徽标」
+ * 这种自相矛盾的界面 —— 统一成一个函数后，二者不可能再分歧。
+ */
+function resolveVideoStatus(post: MonitoredPost): 'none' | 'downloading' | 'done' | 'failed' {
+  const raw = String(post.videoStatus ?? '').trim();
+  if (raw === 'done' || raw === 'downloading' || raw === 'failed') return raw;
+  // 状态缺失/为空，但本地已有文件 → 视为已下载（否则永远筛不出来，卡片也不显示徽标）
+  if (post.videoLocalPath || post.videoPreviewPath) return 'done';
+  return 'none';
 }
 
 /** 爆文拆解沉淀：一篇对标帖经 LLM 拆出的方法论要素（对应后端 PostDeconstructionRecord）。 */
@@ -135,6 +251,12 @@ const platformLabel = (code: string): string => {
   return found ? found.label : (code || '网页');
 };
 
+/**
+ * 时间戳 → `YYYY-MM-DD HH:mm`。
+ *
+ * 全局统一这一种写法：左栏「上次抓取」、卡片「抓取」、视频「分析于 / 下载于」、
+ * 方法论库的沉淀时间都走这里，避免同屏出现 `10/28 13:22` 和 `2026-10-28` 两种格式。
+ */
 const formatTs = (ts: string | null | undefined): string => {
   if (!ts) return '—';
   const n = Number(ts);
@@ -143,7 +265,8 @@ const formatTs = (ts: string | null | undefined): string => {
   if (ms < 1e12) ms *= 1000; // 兼容秒级时间戳
   const d = new Date(ms);
   if (Number.isNaN(d.getTime())) return ts;
-  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+  const pad = (x: number) => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 };
 
 /** 把一篇拆解沉淀格式化成可复制的纯文本（用于「复制方法论」）。 */
@@ -573,6 +696,12 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [watchesError, setWatchesError] = useState<string | null>(null);
   const [postsError, setPostsError] = useState<string | null>(null);
 
+  // —— 帖子列表筛选（关键字 / 视频下载 / 语音转写 / 发布时间）——
+  const [postQuery, setPostQuery] = useState('');
+  const [videoFilter, setVideoFilter] = useState('');
+  const [transcriptFilter, setTranscriptFilter] = useState('');
+  const [dateFilter, setDateFilter] = useState('');
+
   const [addOpen, setAddOpen] = useState(false);
   const [addForm, setAddForm] = useState<{
     name: string;
@@ -595,7 +724,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [assignLoading, setAssignLoading] = useState(false);
   const [assignError, setAssignError] = useState('');
 
-  // —— 本地详情弹窗（点标题在 Beav 内看正文，不跳平台）——
+  // —— 本地详情弹窗（点标题在应用内看正文，不跳平台）——
   const [detailPost, setDetailPost] = useState<MonitoredPost | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -1379,33 +1508,14 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
     // 同理清空上一条的视频分析（下载态 / 错误 / 分析结果都跟着 detailPost 走）。
     setVideoAnalysis(null);
     setVideoError(null);
-    // 已抓取过（正文有 or 已标记 detailFetched）且非主动刷新 → 直接本地展示，秒开、不请求后端。
-    // 纯图/无正文笔记 content 永远空，但 detailFetched 为真 → 同样命中缓存，不再反复重抓。
-    // 图片列表已随详情抓取落库（post.images）；老数据没图时用封面兜底，避免二次打开空白。
-    const hasCachedBody = Boolean(post.content && post.content.trim());
-    // 纯图/无正文笔记没有 body，但有图也算有效缓存（避免每次打开都重抓 10-20s）。
-    const hasCachedVisual = Boolean(
-      post.detailFetched && (((post.images && post.images.length) > 0) || post.coverUrl),
-    );
+    // 列表接口已投影（不含正文/图片），无法再靠 `post.content` 判断缓存命中。
+    // 改为：先用「入参快照 + 封面兜底」把面板立刻打开，避免空白等待；
+    // 真正的正文与图片随后由 post_detail 补上 —— 命中 store 缓存时是纯内存读，很快，
+    // 只有从未抓过正文的帖子才会真的走 CDP（那本来就要等 10-20s）。
     console.log(
-      `[monitor] openDetail id=${post.id} contentLen=${post.content ? post.content.length : 0} ` +
-        `detailFetched=${String(post.detailFetched)} images=${post.images ? post.images.length : 0} ` +
-        `hasCachedBody=${hasCachedBody} hasCachedVisual=${hasCachedVisual}`,
+      `[monitor] openDetail id=${post.id} detailFetched=${String(post.detailFetched)} ` +
+        `hasContent=${String(post.hasContent)} refresh=${String(refresh)}`,
     );
-    if (!refresh && (hasCachedBody || hasCachedVisual)) {
-      setDetailPost(post);
-      setDetailImages(
-        Array.isArray(post.images) && post.images.length
-          ? post.images
-          : post.coverUrl
-            ? [post.coverUrl]
-            : [],
-      );
-      setDetailNote(null);
-      setDetailOpen(true);
-      setDetailLoading(false);
-      return;
-    }
     if (!refresh) {
       // 非刷新：先打开面板并展示已有缓存（图片/封面兜底），避免二次打开空白，再异步覆盖。
       setDetailPost(post);
@@ -1428,38 +1538,25 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
         images?: string[] | null;
         note?: string;
       };
-      // 优先用后端回传的 post；失败回退到入参 post（保留当前展示）。
-      // 防回归：后端这次没拿到正文（fetched:false / 超时）时，绝不能把已有正文覆盖成空。
+      // 优先用后端回传的 post。后端已保证「这次没抓到就不覆盖正文」（Rust 侧 `if fetched`），
+      // 所以这里不需要再做正文回填——列表项本来也没有正文可回填。
       const incomingPost = result?.post ?? post;
-      const keepOldBody = !incomingPost.content?.trim() && post.content?.trim();
-      const mergedPost = keepOldBody
-        ? { ...incomingPost, content: post.content, detailFetched: post.detailFetched ?? incomingPost.detailFetched }
-        : incomingPost;
       console.log(
         `[monitor] openDetail result id=${post.id} fetched=${String(result?.fetched)} ` +
           `note=${JSON.stringify(String(result?.note || ''))} ` +
-          `beforeLen=${post.content ? post.content.length : 0} ` +
-          `afterLen=${mergedPost.content ? mergedPost.content.length : 0}`,
+          `contentLen=${incomingPost.content ? incomingPost.content.length : 0} ` +
+          `images=${Array.isArray(result?.images) ? result.images.length : 0}`,
       );
-      setDetailPost(mergedPost);
+      setDetailPost(incomingPost);
       // 抓到有效图片就用新的；否则保留现有缩略图（prefill 已兜底 cover/image），不清空。
       const incomingImages = Array.isArray(result?.images) ? result.images : [];
       if (incomingImages.length) setDetailImages(incomingImages);
       setDetailNote(result?.note || null);
-      // 回写列表状态：让卡片带上正文+图片，下次直接命中客户端缓存，无需再进后端。
-      // 注意：刷新（refresh=true）也要回写，否则二次打开仍读不到新抓到的图。
+      // 回写列表：只同步卡片会用到的轻量字段（mergeSlimPost），
+      // 绝不能把 content/images 一起铺回去，否则投影白做。
       if (result?.post) {
         setPosts((prev) =>
-          prev.map((p) =>
-            p.id === mergedPost.id
-              ? {
-                  ...p,
-                  ...mergedPost,
-                  // 同样保护：新结果正文为空时保留列表原有的正文。
-                  content: mergedPost.content?.trim() ? mergedPost.content : p.content,
-                }
-              : p,
-          ),
+          prev.map((p) => (p.id === incomingPost.id ? mergeSlimPost(p, incomingPost) : p)),
         );
       }
     } catch (e) {
@@ -1586,7 +1683,10 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
 
   // 拆解一篇对标帖：调后端 LLM 拆解并落库，结果写入 deconResult 供详情弹窗展示。
   const runDeconstruct = useCallback(async (post: MonitoredPost) => {
-    if (!post.content || !post.content.trim()) {
+    // 列表已投影（不含正文），这里只在「明确已知无正文」时提前拦截；
+    // 有正文的情况下直接把 id 交给后端，由后端做最终校验。
+    const hasBody = post.hasContent ?? Boolean(post.content?.trim());
+    if (!hasBody) {
       setDeconError('该帖本地暂无正文，请先在详情里「重新抓正文」后再拆解');
       return;
     }
@@ -1801,6 +1901,54 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const selectedWatch = watches.find((w) => w.id === selectedWatchId) || null;
   const uninjectedCount = posts.filter((p) => !p.topicInjected).length;
 
+  /** 任一筛选生效时，头部显示「筛选后 / 总数」。 */
+  const filtersActive = Boolean(postQuery.trim() || videoFilter || transcriptFilter || dateFilter);
+
+  /** 四个筛选器（关键字 / 视频下载 / 语音转写 / 发布时间）联合过滤后的列表。 */
+  const visiblePosts = useMemo(() => {
+    const q = postQuery.trim().toLowerCase();
+    const nowMs = Date.now();
+    const windowDays = dateFilter && dateFilter !== 'unknown' ? Number(dateFilter) : 0;
+    return posts.filter((post) => {
+      if (q) {
+        const haystack = `${post.title || ''} ${post.author || ''} ${post.excerpt || ''}`.toLowerCase();
+        if (!haystack.includes(q)) return false;
+      }
+      // 视频下载 / 语音转写只对视频帖有意义：图文帖的 videoStatus 恒为 "none"，
+      // 不先按 mediaType 挡一下，「未下载」会把所有图文帖一起捞进来。
+      if (videoFilter) {
+        if (post.mediaType !== 'video') return false;
+        if (resolveVideoStatus(post) !== videoFilter) return false;
+      }
+      if (transcriptFilter) {
+        if (post.mediaType !== 'video') return false;
+        // `''` 已经是「全部」，所以「未分析」用哨兵值区分，否则两个选项会撞在一起。
+        if (transcriptFilter === '__none__') {
+          if ((post.transcriptStatus || '') !== '') return false;
+        } else if ((post.transcriptStatus || '') !== transcriptFilter) {
+          return false;
+        }
+      }
+      if (dateFilter) {
+        const at = parsePublishedAt(post.publishedAt);
+        if (dateFilter === 'unknown') {
+          if (at) return false;
+        } else {
+          if (!at) return false;
+          if (nowMs - at.getTime() > windowDays * 86_400_000) return false;
+        }
+      }
+      return true;
+    });
+  }, [posts, postQuery, videoFilter, transcriptFilter, dateFilter]);
+
+  const clearPostFilters = useCallback(() => {
+    setPostQuery('');
+    setVideoFilter('');
+    setTranscriptFilter('');
+    setDateFilter('');
+  }, []);
+
   return (
     <div className="flex h-full">
       {/* 监控列表 - 左栏 */}
@@ -1931,7 +2079,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               <p className="text-[11px] leading-relaxed text-text-tertiary">
                 小红书 / 抖音 / B 站需要登录态抓取。
                 {isTauriRuntime()
-                  ? '先选平台点「打开登录页」，在弹出的 Chrome 内完成登录（cookie 仅存于本机独立 profile）；也可点「扫码登录」用手机 App 扫。之后 Beav 复用登录态抓取。'
+                  ? `先选平台点「打开登录页」，在弹出的 Chrome 内完成登录（cookie 仅存于本机独立 profile）；也可点「扫码登录」用手机 App 扫。之后 ${APP_BRAND.displayName} 复用登录态抓取。`
                   : '点「扫码登录」用手机 App 扫服务器上的二维码即可（服务器上的账号对所有用户共享）。'}
               </p>
 
@@ -2062,78 +2210,6 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 {platformLoginState === true && (
                   <div className="text-[11px] text-emerald-600">平台已登录，抓取会使用该账号的完整视角。</div>
                 )}
-
-                {/* 登录态迁移：平台对新设备扫码会风控验证，扫码走不通时用这个 */}
-                <details className="rounded-md border border-border bg-surface-secondary/40 px-2.5 py-1.5">
-                  <summary className="text-[11px] cursor-pointer text-text-secondary hover:text-text-primary">
-                    扫码过不去？用「登录态迁移」（绕开风控）
-                  </summary>
-                  <div className="mt-2 space-y-2 text-[11px] leading-relaxed text-text-tertiary">
-                    <div>
-                      1. 在<b className="text-text-secondary">已登录的机器</b>（比如你自己的电脑）点「导出」，
-                      把复制的 JSON 发到这台服务器；
-                      <br />
-                      2. 在这里粘贴 JSON 后点「导入」；
-                      <br />
-                      3. 点「检测登录状态」确认。
-                    </div>
-                    <div className="flex gap-1.5">
-                      <button
-                        onClick={() => {
-                          void (async () => {
-                            try {
-                              const result = await window.ipcRenderer.monitor.chromeExportCookies(chromeLoginPlatform);
-                              if (!result?.count) {
-                                showToast('err', '没导出到 cookie：这台机器的 Chrome 可能未启动或未登录');
-                                return;
-                              }
-                              await navigator.clipboard.writeText(JSON.stringify(result));
-                              showToast('ok', `已复制 ${result.count} 条 cookie，贴到另一台机器的导入框`);
-                            } catch (e) {
-                              showToast('err', `导出失败：${String(e)}`);
-                            }
-                          })();
-                        }}
-                        className="flex-1 px-2 py-1 rounded border border-border hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
-                      >
-                        导出到剪贴板
-                      </button>
-                      <button
-                        onClick={() => {
-                          void (async () => {
-                            try {
-                              const text = await navigator.clipboard.readText();
-                              const parsed = JSON.parse(text) as { cookies?: unknown[] };
-                              const cookies = Array.isArray(parsed) ? parsed : parsed?.cookies;
-                              if (!Array.isArray(cookies) || !cookies.length) {
-                                showToast('err', '剪贴板里没有有效的 cookie JSON');
-                                return;
-                              }
-                              const result = await window.ipcRenderer.monitor.chromeImportCookies(
-                                chromeLoginPlatform,
-                                cookies,
-                              );
-                              if (result?.success) {
-                                showToast('ok', `已导入 ${result.imported} 条 cookie，正在检测登录状态…`);
-                                await checkPlatformLogin(true);
-                              } else {
-                                showToast('err', '导入失败');
-                              }
-                            } catch (e) {
-                              showToast('err', `导入失败：${String(e)}`);
-                            }
-                          })();
-                        }}
-                        className="flex-1 px-2 py-1 rounded border border-border hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
-                      >
-                        从剪贴板导入
-                      </button>
-                    </div>
-                    <div className="text-[10px] text-amber-700/80">
-                      ⚠️ cookie 等同登录凭证，只在两台自己的机器之间传递，别发到公开地方。
-                    </div>
-                  </div>
-                </details>
               </div>
 
               {chromeTestResult && (
@@ -2371,256 +2447,338 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
 
       {/* 帖子动态 - 右栏 */}
       <div className="flex-1 flex flex-col min-w-0">
-        {/* 头部 */}
-        <div className="px-6 py-4 border-b border-border">
-          <div className="flex items-center justify-between gap-3 flex-wrap">
-            <div className="min-w-0">
-              <h1 className="text-lg font-semibold text-text-primary flex items-center gap-2">
-                {selectedWatch ? (
-                  <>
-                    {selectedWatch.name}
-                    <span className="text-[11px] font-normal px-2 py-0.5 rounded-full bg-surface-secondary text-text-tertiary">
-                      {platformLabel(selectedWatch.platform)}
-                    </span>
-                  </>
-                ) : (
-                  '全部动态'
-                )}
-              </h1>
-              <p className="text-xs text-text-tertiary mt-0.5">
-                {selectedWatch?.profileUrl ? (
-                  <button onClick={() => void openExternal(selectedWatch.profileUrl)} className="inline-flex items-center gap-1 hover:text-accent-primary">
-                    <Link2 className="w-3 h-3" />主页链接
-                  </button>
-                ) : '抓取到的对标帖子'}
-              </p>
-            </div>
+        {/* 临时抓取：全局入口，不属于任何博主 → 独立成块 */}
+        <div className="shrink-0 px-4 pt-4">
+          <div className="rounded-xl border border-border bg-surface-primary p-3">
             <div className="flex items-center gap-2">
+              <input
+                value={adhocUrl}
+                onChange={(e) => setAdhocUrl(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && void handleAdhocFetch()}
+                placeholder="粘贴博主主页或单篇帖子链接，临时抓取（不加入监控列表）"
+                className="flex-1 bg-surface-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
+              />
               <button
-                onClick={() => { setMethodsAuthor(''); setMethodsPlatform(''); setMethodsOpen(true); }}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
-                title="浏览已沉淀的爆文拆解方法论库"
+                onClick={() => {
+                  if (fetching) {
+                    showToast('err', '有抓取任务正在进行，请稍候再试');
+                    return;
+                  }
+                  void handleAdhocFetch();
+                }}
+                aria-disabled={fetching || !adhocUrl.trim()}
+                className={clsx(
+                  'inline-flex items-center gap-1.5 px-3 py-2 text-sm rounded-lg bg-accent-primary text-white transition-colors',
+                  fetching || !adhocUrl.trim() ? 'opacity-50 cursor-not-allowed' : 'hover:bg-accent-primary/90',
+                )}
               >
-                <BookOpen className="w-3.5 h-3.5" />
-                方法论库
-              </button>
-              {uninjectedCount > 0 && (
-                <button
-                  onClick={() => void handleInjectAll()}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md bg-accent-primary text-white hover:bg-accent-primary/90 transition-colors"
-                >
-                  <Sparkles className="w-3.5 h-3.5" />
-                  全部加入选题
-                </button>
-              )}
-              <button
-                onClick={() => void loadPosts()}
-                className="p-1.5 text-text-tertiary hover:text-accent-primary hover:bg-surface-primary rounded transition-colors"
-                title="刷新动态"
-              >
-                <RefreshCw className={clsx('w-4 h-4', loadingPosts && 'animate-spin')} />
-              </button>
-              <button
-                onClick={() => void handleClearPosts()}
-                disabled={posts.length === 0}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-red-500 hover:border-red-200 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                title="清空全部动态（不影响对标博主）"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                清空动态
+                {fetchingWatchId === '__adhoc__' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                抓取
               </button>
             </div>
+            <div className="mt-2 text-[11px] text-text-tertiary">
+              单次抓取固定 30 条（web / 小红书 / 抖音 / B 站统一生效）；「补历史」走深翻不受此限制，B 站还会在补历史时额外补全该 UP 的全部合集与收藏夹。
+            </div>
           </div>
+        </div>
+        {/* 博主信息 + 帖子列表：同一个 block（该博主的元信息 + 它的帖子） */}
+        <div className="flex-1 flex flex-col min-h-0 mx-4 mt-4 mb-4 rounded-xl border border-border overflow-hidden bg-surface-primary">
+          <div className="px-4 pt-3 pb-1 shrink-0">
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div className="min-w-0">
+                <h1 className="text-lg font-semibold text-text-primary flex items-center gap-2">
+                  {selectedWatch ? (
+                    <>
+                      {selectedWatch.name}
+                      <span className="text-[11px] font-normal px-2 py-0.5 rounded-full bg-surface-secondary text-text-tertiary">
+                        {platformLabel(selectedWatch.platform)}
+                      </span>
+                    </>
+                  ) : (
+                    '全部动态'
+                  )}
+                </h1>
+                <p className="text-xs text-text-tertiary mt-0.5">
+                  {selectedWatch?.profileUrl ? (
+                    <button onClick={() => void openExternal(selectedWatch.profileUrl)} className="inline-flex items-center gap-1 hover:text-accent-primary">
+                      <Link2 className="w-3 h-3" />主页链接
+                    </button>
+                  ) : '抓取到的对标帖子'}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => { setMethodsAuthor(''); setMethodsPlatform(''); setMethodsOpen(true); }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                  title="浏览已沉淀的爆文拆解方法论库"
+                >
+                  <BookOpen className="w-3.5 h-3.5" />
+                  方法论库
+                </button>
+                {uninjectedCount > 0 && (
+                  <button
+                    onClick={() => void handleInjectAll()}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md bg-accent-primary text-white hover:bg-accent-primary/90 transition-colors"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    全部加入选题
+                  </button>
+                )}
+                <button
+                  onClick={() => void loadPosts()}
+                  className="p-1.5 text-text-tertiary hover:text-accent-primary hover:bg-surface-primary rounded transition-colors"
+                  title="刷新动态"
+                >
+                  <RefreshCw className={clsx('w-4 h-4', loadingPosts && 'animate-spin')} />
+                </button>
+                <button
+                  onClick={() => void handleClearPosts()}
+                  disabled={posts.length === 0}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-red-500 hover:border-red-200 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  title="清空全部动态（不影响对标博主）"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  清空动态
+                </button>
+              </div>
+            </div>
 
-          {/* 临时抓取链接 */}
-          <div className="mt-3 flex items-center gap-2">
-            <input
-              value={adhocUrl}
-              onChange={(e) => setAdhocUrl(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && void handleAdhocFetch()}
-              placeholder="粘贴博主主页或单篇帖子链接，临时抓取（不加入监控列表）"
-              className="flex-1 bg-surface-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
-            />
-            <button
-              onClick={() => {
-                if (fetching) {
-                  showToast('err', '有抓取任务正在进行，请稍候再试');
-                  return;
-                }
-                void handleAdhocFetch();
-              }}
-              aria-disabled={fetching || !adhocUrl.trim()}
-              className={clsx(
-                'inline-flex items-center gap-1.5 px-3 py-2 text-sm rounded-lg bg-accent-primary text-white transition-colors',
-                fetching || !adhocUrl.trim() ? 'opacity-50 cursor-not-allowed' : 'hover:bg-accent-primary/90',
+            {/* 筛选条：关键字 / 视频下载 / 语音转写 / 发布时间 */}
+            <div className="mt-2.5 flex items-center gap-2 flex-wrap">
+              <input
+                value={postQuery}
+                onChange={(e) => setPostQuery(e.target.value)}
+                placeholder="搜索标题 / 作者 / 摘要"
+                className="w-56 bg-surface-secondary border border-border rounded-lg px-2.5 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-accent-primary"
+              />
+              <select
+                value={videoFilter}
+                onChange={(e) => setVideoFilter(e.target.value)}
+                className={selectCls}
+                title="按视频下载状态筛选"
+              >
+                <option value="">视频：全部</option>
+                <option value="done">已下载</option>
+                <option value="downloading">下载中</option>
+                <option value="failed">下载失败</option>
+                <option value="none">未下载</option>
+              </select>
+              <select
+                value={transcriptFilter}
+                onChange={(e) => setTranscriptFilter(e.target.value)}
+                className={selectCls}
+                title="按语音转写状态筛选"
+              >
+                <option value="">转写：全部</option>
+                <option value="ok">已转写</option>
+                <option value="pending">待转写</option>
+                <option value="no-audio">无音轨</option>
+                <option value="failed">转写失败</option>
+                <option value="not-configured">未配置 ASR</option>
+                <option value="__none__">未分析</option>
+              </select>
+              <select
+                value={dateFilter}
+                onChange={(e) => setDateFilter(e.target.value)}
+                className={selectCls}
+                title="按发布时间筛选"
+              >
+                <option value="">时间：全部</option>
+                <option value="7">近 7 天</option>
+                <option value="30">近 30 天</option>
+                <option value="90">近 90 天</option>
+                <option value="unknown">时间未知</option>
+              </select>
+              {filtersActive && (
+                <div className="ml-auto flex items-center gap-2">
+                  <span className="text-[11px] text-text-tertiary whitespace-nowrap">
+                    {visiblePosts.length} / {posts.length}
+                  </span>
+                  <button
+                    onClick={clearPostFilters}
+                    className="text-[11px] text-text-tertiary hover:text-accent-primary whitespace-nowrap"
+                  >
+                    清除
+                  </button>
+                </div>
               )}
-            >
-              {fetchingWatchId === '__adhoc__' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
-              抓取
-            </button>
-          </div>
-          {/* 抓取条数已固定，不再开放配置（后端 SCAN_LIMIT=30） */}
-          <div className="mt-2 text-[11px] text-text-tertiary">
-            单次抓取固定 30 条（web / 小红书 / 抖音 / B 站统一生效）；「补历史」走深翻不受此限制，B 站还会在补历史时额外补全该 UP 的全部合集与收藏夹。
+            </div>
+
           </div>
           {fetchNote && (
-            <div className="mt-2 text-[12px] text-text-tertiary bg-surface-secondary/60 border border-border rounded-lg px-3 py-2">
+            <div className="mx-4 mt-3 text-[12px] text-text-tertiary bg-surface-secondary/60 border border-border rounded-lg px-3 py-2">
               {fetchNote}
             </div>
           )}
-        </div>
 
-        {/* 帖子列表 */}
-        <div className="flex-1 overflow-auto p-4 space-y-3">
-          {postsError && posts.length === 0 ? (
-            <div className="text-center text-sm py-16">
-              <p className="text-red-500 mb-2">加载动态失败</p>
-              <p className="text-text-tertiary text-xs mb-3 break-words max-w-md mx-auto">{postsError}</p>
-              <button
-                onClick={() => void loadPosts()}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />重试
-              </button>
-            </div>
-          ) : loadingPosts && posts.length === 0 ? (
-            <div className="text-center text-text-tertiary text-sm py-16">加载中...</div>
-          ) : posts.length === 0 ? (
-            <div className="text-center text-text-tertiary py-16">
-              <Zap className="w-10 h-10 mx-auto mb-3 opacity-30" />
-              <p className="text-sm">还没有抓取到的动态</p>
-              <p className="text-xs mt-1">从左侧选择一个博主点击「抓取」，或在上方粘贴链接。</p>
-            </div>
-          ) : (
-            posts.map((post) => (
-              <div
-                key={post.id}
-                className="rounded-xl border border-border bg-surface-primary p-4 transition-colors"
-                // 跳过屏外卡片的渲染/布局，长列表（100+）滚动和切换明显更快。
-                style={{ contentVisibility: 'auto', containIntrinsicSize: '220px' }}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      {post.isNew && (
-                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-sky-100 text-sky-700">
-                          <Sparkles className="w-3 h-3" />新抓取
+          {/* 帖子列表 */}
+          <div className="flex-1 overflow-auto p-4 space-y-3">
+            {postsError && posts.length === 0 ? (
+              <div className="text-center text-sm py-16">
+                <p className="text-red-500 mb-2">加载动态失败</p>
+                <p className="text-text-tertiary text-xs mb-3 break-words max-w-md mx-auto">{postsError}</p>
+                <button
+                  onClick={() => void loadPosts()}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />重试
+                </button>
+              </div>
+            ) : loadingPosts && posts.length === 0 ? (
+              <div className="text-center text-text-tertiary text-sm py-16">加载中...</div>
+            ) : posts.length === 0 ? (
+              <div className="text-center text-text-tertiary py-16">
+                <Zap className="w-10 h-10 mx-auto mb-3 opacity-30" />
+                <p className="text-sm">还没有抓取到的动态</p>
+                <p className="text-xs mt-1">从左侧选择一个博主点击「抓取」，或在上方粘贴链接。</p>
+              </div>
+            ) : visiblePosts.length === 0 ? (
+              // 有数据但被筛选条件全挡掉了 —— 必须和「一条都没有」区分开，
+              // 否则用户会以为是抓取失败。
+              <div className="text-center text-text-tertiary py-16">
+                <Zap className="w-10 h-10 mx-auto mb-3 opacity-30" />
+                <p className="text-sm">没有符合条件的动态</p>
+                <p className="text-xs mt-1">
+                  当前共 {posts.length} 条，试试放宽筛选条件。
+                </p>
+                <button
+                  onClick={clearPostFilters}
+                  className="mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                >
+                  清除筛选
+                </button>
+              </div>
+            ) : (
+              visiblePosts.map((post) => (
+                <div
+                  key={post.id}
+                  className="rounded-xl border border-border bg-surface-primary p-4 transition-colors"
+                  // 跳过屏外卡片的渲染/布局，长列表（100+）滚动和切换明显更快。
+                  style={{ contentVisibility: 'auto', containIntrinsicSize: '220px' }}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {post.isNew && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-sky-100 text-sky-700">
+                            <Sparkles className="w-3 h-3" />新抓取
+                          </span>
+                        )}
+                        {post.deconstructed && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-accent-primary/10 text-accent-primary">
+                            <FlaskConical className="w-3 h-3" />已拆解
+                          </span>
+                        )}
+                        <span className="text-[11px] px-1.5 py-0.5 rounded-full bg-surface-secondary text-text-tertiary">
+                          {platformLabel(post.platform)}
                         </span>
-                      )}
-                      {post.deconstructed && (
-                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-accent-primary/10 text-accent-primary">
-                          <FlaskConical className="w-3 h-3" />已拆解
-                        </span>
-                      )}
-                      <span className="text-[11px] px-1.5 py-0.5 rounded-full bg-surface-secondary text-text-tertiary">
-                        {platformLabel(post.platform)}
-                      </span>
-                      {post.mediaType === 'video' && (
-                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-purple-100 text-purple-700">
-                          视频
-                        </span>
-                      )}
-                      {post.mediaType === 'video' && post.videoStatus === 'done' && (
-                        <span
-                          className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700"
-                          title="视频本体已下载到本地，可进详情播放与分析"
-                        >
-                          <Check className="w-2.5 h-2.5" />已下载
-                        </span>
-                      )}
-                      {post.mediaType === 'video' && post.videoStatus === 'downloading' && (
-                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">
-                          <Loader2 className="w-2.5 h-2.5 animate-spin" />下载中
-                        </span>
-                      )}
-                      {post.mediaType === 'video' && post.videoStatus === 'failed' && (
-                        <span
-                          className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-red-100 text-red-700"
-                          title={post.videoError || '视频下载失败，可进详情重试'}
-                        >
-                          下载失败
-                        </span>
+                        {post.mediaType === 'video' && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-purple-100 text-purple-700">
+                            视频
+                          </span>
+                        )}
+                        {post.mediaType === 'video' && resolveVideoStatus(post) === 'done' && (
+                          <span
+                            className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700"
+                            title="视频本体已下载到本地，可进详情播放与分析"
+                          >
+                            <Check className="w-2.5 h-2.5" />已下载
+                          </span>
+                        )}
+                        {post.mediaType === 'video' && resolveVideoStatus(post) === 'downloading' && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">
+                            <Loader2 className="w-2.5 h-2.5 animate-spin" />下载中
+                          </span>
+                        )}
+                        {post.mediaType === 'video' && resolveVideoStatus(post) === 'failed' && (
+                          <span
+                            className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-red-100 text-red-700"
+                            title={post.videoError || '视频下载失败，可进详情重试'}
+                          >
+                            下载失败
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        onClick={() => void openDetail(post)}
+                        className="mt-2 text-left block w-full"
+                        title={`在 ${APP_BRAND.displayName} 内查看详情`}
+                      >
+                        <h3 className="text-sm font-semibold text-text-primary hover:text-accent-primary line-clamp-2 leading-snug">
+                          {post.title || '(无标题)'}
+                        </h3>
+                      </button>
+                      <div className="text-xs text-text-tertiary mt-1">
+                        {post.author}
+                        {post.authorUrl && (
+                          <button onClick={() => void openExternal(post.authorUrl)} className="ml-1 inline-flex items-center hover:text-accent-primary">
+                            <ExternalLink className="w-3 h-3" />
+                          </button>
+                        )}
+                        <span className="mx-1.5">·</span>
+                        {post.publishedAt ? (
+                          <>
+                            发布 {formatYmd(post.publishedAt)}
+                            <span className="mx-1.5">·</span>
+                            抓取 {formatTs(post.updatedAt)}
+                          </>
+                        ) : (
+                          <>抓取 {formatTs(post.updatedAt)}</>
+                        )}
+                      </div>
+                      {post.excerpt && (
+                        <p className="text-xs text-text-secondary mt-2 line-clamp-3 leading-relaxed">
+                          {post.excerpt}
+                        </p>
                       )}
                     </div>
-                    <button
-                      onClick={() => void openDetail(post)}
-                      className="mt-2 text-left block w-full"
-                      title="在 Beav 内查看详情"
-                    >
-                      <h3 className="text-sm font-semibold text-text-primary hover:text-accent-primary line-clamp-2 leading-snug">
-                        {post.title || '(无标题)'}
-                      </h3>
-                    </button>
-                    <div className="text-xs text-text-tertiary mt-1">
-                      {post.author}
-                      {post.authorUrl && (
-                        <button onClick={() => void openExternal(post.authorUrl)} className="ml-1 inline-flex items-center hover:text-accent-primary">
-                          <ExternalLink className="w-3 h-3" />
+
+                    <div className="shrink-0 flex flex-col items-end gap-2">
+                      {post.topicInjected ? (
+                        <span className="inline-flex items-center gap-1 text-[11px] text-emerald-600 bg-emerald-50 px-2 py-1 rounded-md">
+                          <Check className="w-3 h-3" />已入选题
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => void handleInject(post)}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors whitespace-nowrap"
+                          title="加入选题中心"
+                        >
+                          <Sparkles className="w-3.5 h-3.5" />加入选题
                         </button>
                       )}
-                      <span className="mx-1.5">·</span>
-                      {post.publishedAt ? (
-                        <>
-                          发布 {post.publishedAt}
-                          <span className="mx-1.5">·</span>
-                          抓取 {formatTs(post.updatedAt)}
-                        </>
-                      ) : (
-                        <>抓取 {formatTs(post.updatedAt)}</>
-                      )}
-                    </div>
-                    {post.excerpt && (
-                      <p className="text-xs text-text-secondary mt-2 line-clamp-3 leading-relaxed">
-                        {post.excerpt}
-                      </p>
-                    )}
-                  </div>
-
-                  <div className="shrink-0 flex flex-col items-end gap-2">
-                    {post.topicInjected ? (
-                      <span className="inline-flex items-center gap-1 text-[11px] text-emerald-600 bg-emerald-50 px-2 py-1 rounded-md">
-                        <Check className="w-3 h-3" />已入选题
-                      </span>
-                    ) : (
                       <button
-                        onClick={() => void handleInject(post)}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors whitespace-nowrap"
-                        title="加入选题中心"
+                        onClick={() => { void openDetail(post); if (post.hasContent) void runDeconstruct(post); }}
+                        disabled={!post.hasContent || deconLoading}
+                        className="inline-flex items-center gap-1 text-[11px] text-text-tertiary hover:text-accent-primary disabled:opacity-40"
+                        title={post.hasContent ? '拆解这篇爆文的方法论' : '需先抓到正文'}
                       >
-                        <Sparkles className="w-3.5 h-3.5" />加入选题
+                        <FlaskConical className="w-3 h-3" />拆解
                       </button>
-                    )}
-                    <button
-                      onClick={() => { void openDetail(post); if (post.content?.trim()) void runDeconstruct(post); }}
-                      disabled={!post.content?.trim() || deconLoading}
-                      className="inline-flex items-center gap-1 text-[11px] text-text-tertiary hover:text-accent-primary disabled:opacity-40"
-                      title={post.content?.trim() ? '拆解这篇爆文的方法论' : '需先抓到正文'}
-                    >
-                      <FlaskConical className="w-3 h-3" />拆解
-                    </button>
-                    <button
-                      onClick={() => void openExternal(post.postUrl)}
-                      className="inline-flex items-center gap-1 text-[11px] text-text-tertiary hover:text-accent-primary"
-                      title="打开原文"
-                    >
-                      <ExternalLink className="w-3 h-3" />原文
-                    </button>
-                    <button
-                      onClick={() => void handlePostRemove(post.id)}
-                      className="inline-flex items-center gap-1 text-[11px] text-text-tertiary hover:text-red-500"
-                      title="删除这条动态"
-                    >
-                      <Trash2 className="w-3 h-3" />删除
-                    </button>
+                      <button
+                        onClick={() => void openExternal(post.postUrl)}
+                        className="inline-flex items-center gap-1 text-[11px] text-text-tertiary hover:text-accent-primary"
+                        title="打开原文"
+                      >
+                        <ExternalLink className="w-3 h-3" />原文
+                      </button>
+                      <button
+                        onClick={() => void handlePostRemove(post.id)}
+                        className="inline-flex items-center gap-1 text-[11px] text-text-tertiary hover:text-red-500"
+                        title="删除这条动态"
+                      >
+                        <Trash2 className="w-3 h-3" />删除
+                      </button>
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))
-          )}
+              ))
+            )}
+          </div>
         </div>
       </div>
 
-      {/* 本地详情弹窗 —— 点卡片标题打开，正文在 Beav 内看，不跳平台 */}
+      {/* 本地详情弹窗 —— 点卡片标题打开，正文在应用内看，不跳平台 */}
       {detailOpen && detailPost && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
@@ -2641,9 +2799,6 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   </span>
                 )}
                 <span className="text-xs text-text-tertiary truncate">{detailPost.author}</span>
-                {detailPost.publishedAt && (
-                  <span className="text-xs text-text-tertiary shrink-0">· {detailPost.publishedAt}</span>
-                )}
               </div>
               <button onClick={() => setDetailOpen(false)} className="text-text-tertiary hover:text-text-primary shrink-0">
                 <X className="w-4 h-4" />
@@ -2654,6 +2809,16 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               <h2 className="text-base font-semibold text-text-primary leading-snug">
                 {detailPost.title || '(无标题)'}
               </h2>
+
+              {/* 发布时间：固定占位（抓不到就显式写「未知」）。
+                  之前只在头部标签行尾部挂一个 `· 日期`，抖音日期解析失败时整段消失，
+                  根本分不清是「没抓」还是「这条没有日期」。 */}
+              <p className="text-xs text-text-tertiary">
+                发布时间{' '}
+                <span className="font-medium text-text-secondary">
+                  {detailPost.publishedAt ? formatYmd(detailPost.publishedAt) : '未知'}
+                </span>
+              </p>
 
               {detailLoading && (
                 <div className="flex items-center gap-2 text-xs text-text-tertiary">

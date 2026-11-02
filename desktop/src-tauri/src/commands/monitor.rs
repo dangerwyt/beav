@@ -372,7 +372,7 @@ fn chrome_launch(app: &AppHandle, payload: &Value) -> Result<Value, String> {
         "platform": platform,
         "debugPort": port,
         "profileDir": profile.display().to_string(),
-        "note": "已为你打开登录页，请在弹出的 Chrome 中完成登录。每个平台有独立 profile（cookie 隔离）。Beav 不会保存你的密码，只复用这次登录的 cookie。",
+        "note": format!("已为你打开登录页，请在弹出的 Chrome 中完成登录。每个平台有独立 profile（cookie 隔离）。{} 不会保存你的密码，只复用这次登录的 cookie。", app_brand_display_name()),
     }))
 }
 
@@ -1060,21 +1060,54 @@ fn post_detail(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
                 if let Some(cover) = cached_cover.as_ref() {
                     item.cover_url = Some(cover.clone());
                 }
-                if let Some(author) = detail
-                    .get("author")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    item.author = author.to_string();
+                // 作者：**有监控归属时一律不覆盖**。
+                //
+                // 列表抓取阶段 author 已经写成 watch.name（该 watch 的博主本人），这是权威值；
+                // 详情页的 author 来自页面兜底链，会误抓正文里的 `@提及`（如「@抖音科技」）
+                // 或推荐位的其他作者，于是同一作者裂成多个导出目录（实测踩坑）。
+                // 只有「没有归属的临时帖（adhoc）」或「当前作者为空」才采用详情页的值。
+                if detail_author_may_override(item.watch_id.as_deref(), &item.author) {
+                    if let Some(author) = detail
+                        .get("author")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        item.author = author.to_string();
+                    }
                 }
-                if let Some(date) = detail
+                let incoming_date = detail
                     .get("date")
                     .and_then(Value::as_str)
                     .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    item.published_at = Some(date.to_string());
+                    .filter(|value| !value.is_empty());
+                match incoming_date {
+                    Some(date) => item.published_at = Some(date.to_string()),
+                    None => {
+                        // 抖音抽不到发布时间时留一条诊断（`dateDebug` 只在抖音分支里出现）：
+                        // 空字符串 = DOM 选择器与两条 SSR 兜底全失效；有值 = 命中了但格式没解析出来。
+                        // 不影响落库，纯粹为下次定位。
+                        if detail.get("dateDebug").is_some() {
+                            crate::logging::emit_legacy_line(
+                                crate::logging::event::LogSource::Host,
+                                crate::logging::event::LogLevel::Warn,
+                                "monitor",
+                                "monitor.detail.date_missing",
+                                format!(
+                                    "[monitor detail] 未解析到发布时间 platform={} dateDebug={:?} url={}",
+                                    item.platform,
+                                    detail.get("dateDebug").and_then(Value::as_str).unwrap_or(""),
+                                    item.post_url
+                                ),
+                                json!({
+                                    "postId": item.id,
+                                    "platform": item.platform,
+                                    "dateDebug": detail.get("dateDebug").cloned().unwrap_or(Value::Null),
+                                }),
+                                None,
+                            );
+                        }
+                    }
                 }
                 let likes = detail.get("likes").and_then(Value::as_i64).unwrap_or(0);
                 if likes > 0 {
@@ -2225,6 +2258,57 @@ fn get_spike_threshold(state: &State<'_, AppState>) -> Result<Value, String> {
     })
 }
 
+/// 列表投影：只返回卡片渲染 + 详情预取需要的字段，**剔除 `content` / `images`**。
+///
+/// 真实正文动辄 1~5 KB/条，一屏 500 条时就是 1~2 MB 的纯浪费；而列表卡片只显示
+/// 标题 / 摘要 / 互动数，正文与图片列表要到详情弹窗才用得上 —— 那里由 `post_detail`
+/// 单独取（命中 store 缓存时是纯内存读，不联网）。
+///
+/// 仍保留 `hasContent` 布尔：卡片据此决定「拆解」按钮是否可点，
+/// 否则前端为了一个真假值又得把整篇正文拿下来。
+fn project_post_for_list(item: &crate::MonitoredPostRecord, transcript_status: &str) -> Value {
+    json!({
+        "id": item.id,
+        "owner": item.owner,
+        "watchId": item.watch_id,
+        "platform": item.platform,
+        "author": item.author,
+        "authorUrl": item.author_url,
+        "postUrl": item.post_url,
+        "title": item.title,
+        "mediaType": item.media_type,
+        "coverUrl": item.cover_url,
+        "detailFetched": item.detail_fetched,
+        // 正文被投影掉了，但卡片要据此禁用「拆解」按钮，所以单独给一个布尔。
+        "hasContent": !item.content.trim().is_empty(),
+        "excerpt": item.excerpt,
+        "publishedAt": item.published_at,
+        "likes": item.likes,
+        "comments": item.comments,
+        "collects": item.collects,
+        "prevLikes": item.prev_likes,
+        "prevComments": item.prev_comments,
+        "isNew": item.is_new,
+        "spike": item.spike,
+        "spikeRatio": item.spike_ratio,
+        "capturedVia": item.captured_via,
+        "topicInjected": item.topic_injected,
+        "deconstructed": item.deconstructed,
+        "videoStatus": item.video_status,
+        "videoLocalPath": item.video_local_path,
+        "videoPreviewPath": item.video_preview_path,
+        "videoSize": item.video_size,
+        "videoDownloadedAt": item.video_downloaded_at,
+        "videoError": item.video_error,
+        "videoHasAudio": item.video_has_audio,
+        // 语音转写状态，来自 post_video_analyses（列表筛选要用，所以一并投影）：
+        // "" = 没跑过分析；pending = 已抽帧待转写；ok / no-audio / not-configured / failed。
+        "transcriptStatus": transcript_status,
+        "createdAt": item.created_at,
+        "updatedAt": item.updated_at,
+    })
+}
+
 fn post_list(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
     let watch_id = str_field(payload, "watchId").or_else(|| str_field(payload, "watch_id"));
     let spike_only = payload
@@ -2246,30 +2330,60 @@ fn post_list(state: &State<'_, AppState>, payload: &Value) -> Result<Value, Stri
             .filter(|watch| crate::identity::can_access(&watch.owner, &watch.shared_to))
             .map(|watch| watch.id.as_str())
             .collect();
-        let mut items: Vec<_> = store.monitored_posts.iter().cloned().collect();
-        items.retain(|item| {
-            crate::identity::owner_matches(&item.owner)
-                || item
-                    .watch_id
-                    .as_deref()
-                    .is_some_and(|watch_id| visible_watch_ids.contains(watch_id))
-        });
-        if let Some(id) = &watch_id {
-            items.retain(|item| item.watch_id.as_deref() == Some(id));
-        }
-        if spike_only {
-            items.retain(|item| item.spike);
-        }
-        items.sort_by(|left, right| {
+        // 只持有**引用**并就地过滤/排序/截断，最后才投影成 JSON。
+        // 早期实现是 `iter().cloned().collect()` 先把全库克隆一遍再 retain ——
+        // 服务器上帖子总量上万时，那份 clone 与「只看这一个博主的 500 条」毫无关系，纯浪费。
+        let mut matched: Vec<&crate::MonitoredPostRecord> = store
+            .monitored_posts
+            .iter()
+            .filter(|item| {
+                crate::identity::owner_matches(&item.owner)
+                    || item
+                        .watch_id
+                        .as_deref()
+                        .is_some_and(|watch_id| visible_watch_ids.contains(watch_id))
+            })
+            .filter(|item| match &watch_id {
+                Some(id) => item.watch_id.as_deref() == Some(id.as_str()),
+                None => true,
+            })
+            .filter(|item| !spike_only || item.spike)
+            .collect();
+        matched.sort_by(|left, right| {
             right
                 .updated_at
                 .cmp(&left.updated_at)
                 .then_with(|| right.created_at.cmp(&left.created_at))
         });
         if let Some(max) = limit {
-            items.truncate(max.max(1));
+            matched.truncate(max.max(1));
         }
-        Ok(json!(items))
+        // 转写状态单独存在 post_video_analyses 里，这里建一次 postId → status 映射，
+        // 让列表能按「语音转写状态」筛选（只读引用，不额外 clone）。
+        let transcript_by_post: std::collections::HashMap<&str, &str> = store
+            .post_video_analyses
+            .iter()
+            .map(|analysis| {
+                (
+                    analysis.post_id.as_str(),
+                    analysis.transcript_status.as_str(),
+                )
+            })
+            .collect();
+        // 列表走投影：正文/图片不随列表下发（详情弹窗单独经 post_detail 取）。
+        // 截断之后再投影，所以 limit 生效时连投影开销都只付前 N 条。
+        Ok(Value::Array(
+            matched
+                .iter()
+                .map(|item| {
+                    let status = transcript_by_post
+                        .get(item.id.as_str())
+                        .copied()
+                        .unwrap_or("");
+                    project_post_for_list(item, status)
+                })
+                .collect(),
+        ))
     })
 }
 
@@ -3857,6 +3971,22 @@ fn platform_label(platform: &str) -> String {
     }
 }
 
+/// 详情页抽到的作者是否允许覆盖记录里已有的作者。
+///
+/// 背景：列表抓取阶段 `author` 写的是 `watch.name`（该监控项的博主本人），这是权威值。
+/// 详情页的 `author` 来自页面兜底链（SSR → `_ROUTER_DATA.item_list[0]` → 作用域 DOM），
+/// 会误抓正文里的 `@提及`（如「@抖音科技」「@抖音精选 App官方账号」）或推荐位的其他作者。
+/// 一旦让它覆盖，同一个博主会因为不同帖子的 SSR 命中情况不同而裂成多个导出目录
+/// （导出路径是 `导出根/平台/日期/作者/标题`）。
+///
+/// 因此：**有监控归属且当前作者非空时，拒绝详情页覆盖**；
+/// 仅「无归属的临时帖（adhoc）」或「当前作者为空」才采用详情页的值。
+fn detail_author_may_override(watch_id: Option<&str>, current_author: &str) -> bool {
+    let has_watch = watch_id.map(str::trim).is_some_and(|value| !value.is_empty());
+    let has_author = !current_author.trim().is_empty();
+    !(has_watch && has_author)
+}
+
 /// 把文件名非法字符（Windows：`\ / : * ? " < > |` 及控制字符）替换为 `_` 并压缩连续下划线。
 fn sanitize_fs_name(s: &str) -> String {
     const ILLEGAL: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
@@ -4957,6 +5087,11 @@ pub fn run_daily_prefetch(app: AppHandle) -> Result<Value, String> {
         }
     }
 
+    // 视频候选先攒着，等所有博主都处理完再统一跑两阶段流水线（见下方 run_videos_two_phase）。
+    // 原来是在「博主 → 帖子」的双重循环里「下载一条 → 转写一条」串行做，
+    // 10 条视频就要串 10 轮，每轮都含 下载(~30s) + 抽帧 + 转写(~20s)。
+    let mut pending_videos: Vec<String> = Vec::new();
+
     for watch in &watches {
         stats.watched += 1;
         let fetch = match fetch_monitor(
@@ -5036,7 +5171,8 @@ pub fn run_daily_prefetch(app: AppHandle) -> Result<Value, String> {
                 continue;
             }
 
-            // 3) 视频帖自动下载 + 转写（仅小红书 / 抖音，且尚未下载过）
+            // 3) 只登记视频候选（仅小红书 / 抖音，且尚未下载过）——
+            //    真正的下载 + 转写在所有博主处理完后由 run_videos_two_phase 统一并行跑。
             let rec = with_store(&state, |store| {
                 Ok(store.monitored_posts.iter().find(|p| p.id == id).cloned())
             })?;
@@ -5052,43 +5188,19 @@ pub fn run_daily_prefetch(app: AppHandle) -> Result<Value, String> {
                 .unwrap_or((false, false, false));
 
             if is_video && platform_ok && status_none {
-                match download_video(&app, &state, &json!({ "id": id })) {
-                    Ok(_) => {
-                        stats.videos += 1;
-                        match analyze_video(&app, &state, &json!({ "id": id })) {
-                            Ok(_) => stats.transcribed += 1,
-                            Err(error) => {
-                                stats.failed += 1;
-                                crate::logging::emit_legacy_line(
-                                    crate::logging::event::LogSource::Host,
-                                    crate::logging::event::LogLevel::Warn,
-                                    "monitor",
-                                    "monitor.daily.transcribe_failed",
-                                    format!(
-                                        "[monitor daily] transcribe for {id} failed: {error}"
-                                    ),
-                                    json!({ "postId": id, "error": error }),
-                                    None,
-                                );
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        stats.failed += 1;
-                        crate::logging::emit_legacy_line(
-                            crate::logging::event::LogSource::Host,
-                            crate::logging::event::LogLevel::Warn,
-                            "monitor",
-                            "monitor.daily.download_failed",
-                            format!("[monitor daily] video download for {id} failed: {error}"),
-                            json!({ "postId": id, "error": error }),
-                            None,
-                        );
-                    }
-                }
+                pending_videos.push(id);
             }
         }
     }
+
+    // 3) 视频阶段：两阶段并行（下载 VIDEO_PARALLEL_WORKERS 路 → 转写 TRANSCRIBE_PARALLEL_WORKERS 路）。
+    //    与补历史的 spawn_video_workers_ex 同构，区别只在于这里必须**同步等待并拿回计数**
+    //    写进 summary，否则前端看到的 videosDownloaded / videosTranscribed 会恒为 0。
+    let (videos_done, transcribed_done, video_failed) =
+        run_videos_two_phase(&app, pending_videos);
+    stats.videos += videos_done;
+    stats.transcribed += transcribed_done;
+    stats.failed += video_failed;
 
     let summary = json!({
         "success": true,
@@ -5125,6 +5237,152 @@ pub fn run_daily_prefetch(app: AppHandle) -> Result<Value, String> {
 /// - 进度用原子计数累加，`fetch_add` 返回值唯一 → `videos-done` 恰好触发一次。
 fn spawn_video_workers(app: AppHandle, watch_id: String, video_ids: Vec<String>) {
     spawn_video_workers_ex(app, watch_id, video_ids, false)
+}
+
+/// 每日预取的视频阶段：**同步**跑两阶段并行流水线并返回统计。
+///
+/// - 阶段一（`VIDEO_PARALLEL_WORKERS` 路）：下载 → 抽帧。
+///   抽帧用 `analyze_video({ skipTranscript: true })`，它会建好 `post_video_analyses`
+///   记录并把 `transcript_status` 置为 `pending`，阶段二据此接棒。
+/// - 阶段二（`TRANSCRIBE_PARALLEL_WORKERS` 路）：`transcribe_video_only` 只补语音转写。
+///
+/// 为什么不在下载 worker 里顺手转写：转写是「抽音频 → 上传 → 等 ASR 返回」，单条 10~40s，
+/// 串进去会把并行度吃掉（补历史那边已有同样结论）。分阶段后两条流水线互不阻塞。
+///
+/// 与 `spawn_video_workers_ex` 的区别只有一点：那个是 fire-and-forget（后台补历史用），
+/// 这里是**同步等待**——每日预取要把 `videosDownloaded` / `videosTranscribed` / `failed`
+/// 写进 summary 返回给前端，异步版本这三个数会恒为 0。
+///
+/// 返回 `(下载成功数, 转写成功数, 失败数)`；失败数含下载失败、抽帧失败、转写失败。
+fn run_videos_two_phase(app: &AppHandle, video_ids: Vec<String>) -> (i64, i64, i64) {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let total = video_ids.len();
+    if total == 0 {
+        return (0, 0, 0);
+    }
+
+    let queue = Arc::new(Mutex::new(video_ids.into_iter().collect::<VecDeque<String>>()));
+    let pending = Arc::new(Mutex::new(Vec::<String>::new()));
+    let downloaded = Arc::new(AtomicI64::new(0));
+    let transcribed = Arc::new(AtomicI64::new(0));
+    let failed = Arc::new(AtomicI64::new(0));
+
+    // 阶段一：并行下载 + 抽帧（跳过转写）
+    let download_workers = VIDEO_PARALLEL_WORKERS.min(total).max(1);
+    std::thread::scope(|scope| {
+        for _ in 0..download_workers {
+            let app = app.clone();
+            let queue = Arc::clone(&queue);
+            let pending = Arc::clone(&pending);
+            let downloaded = Arc::clone(&downloaded);
+            let failed = Arc::clone(&failed);
+            scope.spawn(move || {
+                let state = app.state::<AppState>();
+                loop {
+                    // 锁中毒也要取回内层数据：否则一次 panic 会把剩余队列静默吐掉。
+                    let next = queue
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .pop_front();
+                    let Some(id) = next else { break };
+
+                    if let Err(error) = download_video(&app, &state, &json!({ "id": id.clone() })) {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        crate::logging::emit_legacy_line(
+                            crate::logging::event::LogSource::Host,
+                            crate::logging::event::LogLevel::Warn,
+                            "monitor",
+                            "monitor.daily.download_failed",
+                            format!("[monitor daily] video download for {id} failed: {error}"),
+                            json!({ "postId": id, "error": error }),
+                            None,
+                        );
+                        continue;
+                    }
+                    downloaded.fetch_add(1, Ordering::Relaxed);
+
+                    match analyze_video(
+                        &app,
+                        &state,
+                        &json!({ "id": id.clone(), "skipTranscript": true }),
+                    ) {
+                        Ok(_) => pending
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(id),
+                        Err(error) => {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            crate::logging::emit_legacy_line(
+                                crate::logging::event::LogSource::Host,
+                                crate::logging::event::LogLevel::Warn,
+                                "monitor",
+                                "monitor.daily.analyze_failed",
+                                format!("[monitor daily] video analyze for {id} failed: {error}"),
+                                json!({ "postId": id, "error": error }),
+                                None,
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // 阶段二：并行转写（只补转写，不重下不重抽帧）
+    let batch: Vec<String> = std::mem::take(
+        &mut *pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    let batch_total = batch.len();
+    if batch_total > 0 {
+        let tqueue = Arc::new(Mutex::new(batch.into_iter().collect::<VecDeque<String>>()));
+        let transcribe_workers = TRANSCRIBE_PARALLEL_WORKERS.min(batch_total).max(1);
+        std::thread::scope(|scope| {
+            for _ in 0..transcribe_workers {
+                let app = app.clone();
+                let tqueue = Arc::clone(&tqueue);
+                let transcribed = Arc::clone(&transcribed);
+                let failed = Arc::clone(&failed);
+                scope.spawn(move || {
+                    let state = app.state::<AppState>();
+                    loop {
+                        let next = tqueue
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .pop_front();
+                        let Some(id) = next else { break };
+                        match transcribe_video_only(&app, &state, &json!({ "id": id.clone() })) {
+                            Ok(_) => {
+                                transcribed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(error) => {
+                                failed.fetch_add(1, Ordering::Relaxed);
+                                crate::logging::emit_legacy_line(
+                                    crate::logging::event::LogSource::Host,
+                                    crate::logging::event::LogLevel::Warn,
+                                    "monitor",
+                                    "monitor.daily.transcribe_failed",
+                                    format!("[monitor daily] transcribe for {id} failed: {error}"),
+                                    json!({ "postId": id, "error": error }),
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    (
+        downloaded.load(Ordering::Relaxed),
+        transcribed.load(Ordering::Relaxed),
+        failed.load(Ordering::Relaxed),
+    )
 }
 
 /// 带模式的视频 worker：`patch_only` 为真时只补音轨（视频轨不重下、帧不重抽）。
@@ -6038,8 +6296,29 @@ pub fn start_monitor_scheduler(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_four_digit_year, published_before_cutoff, resolve_watch_id, watch_dedupe_key,
+        detail_author_may_override, extract_four_digit_year, published_before_cutoff,
+        resolve_watch_id, watch_dedupe_key,
     };
+
+    /// 回归守卫：有监控归属的帖子，详情页作者不得覆盖 watch.name。
+    ///
+    /// 实测事故：同一博主的三条抖音帖子导出成三个目录 ——「@抖音精选 App官方账号」
+    /// 「@抖音科技」「拿幸·AI启示录」。前两个是详情页兜底链抓到的正文 `@提及`，
+    /// 因为旧代码在 `post_detail` 里无条件 `item.author = detail.author`。
+    #[test]
+    fn detail_author_never_overrides_watch_author() {
+        // 有归属 + 已有作者 → 拒绝覆盖（核心回归）
+        assert!(!detail_author_may_override(Some("watch-1"), "拿幸·AI启示录"));
+        // 有归属但作者为空 → 允许补一个
+        assert!(detail_author_may_override(Some("watch-1"), ""));
+        assert!(detail_author_may_override(Some("watch-1"), "   "));
+        // 无归属（adhoc 临时帖）→ 允许采用详情页作者
+        assert!(detail_author_may_override(None, "任意作者"));
+        assert!(detail_author_may_override(None, ""));
+        // 空 / 空白 watch_id 视同无归属
+        assert!(detail_author_may_override(Some(""), "已有作者"));
+        assert!(detail_author_may_override(Some("  "), "已有作者"));
+    }
 
     /// 回归守卫：年份下限判定宁可漏删不可误删。
     ///
