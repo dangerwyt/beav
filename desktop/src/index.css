@@ -1672,6 +1672,18 @@ select {
   color: rgb(var(--color-text-primary) / 1);
 }
 
+/* Web 端右上角的「登出」：它是最靠右的元素，右侧留白要比桌面端更明显，
+   否则会贴着窗口边缘（桌面端右侧是系统窗口按钮，不需要额外留白）。 */
+.app-titlebar-logout {
+  margin-right: 6px;
+  text-decoration: none;
+}
+
+.app-titlebar-logout:hover {
+  background: rgb(var(--color-surface-primary) / 0.88);
+  color: rgb(var(--color-text-primary) / 1);
+}
+
 .app-titlebar-window-controls {
   display: inline-flex;
   align-items: stretch;

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, lazy, Suspense, type ReactNode } from 'react';
-import { FileText, Loader2, MessageSquareWarning } from 'lucide-react';
+import { FileText, Loader2 } from 'lucide-react';
 import { AppDialogsHost } from './components/AppDialogsHost';
 import { Layout } from './components/Layout';
 import { AppOnboarding, getAppAcquisitionSource, hasSeenAppOnboarding, markAppOnboardingSeen } from './components/AppOnboarding';
@@ -84,7 +84,6 @@ function AuthenticatedApp({ onOpenAppOnboarding }: { onOpenAppOnboarding: () => 
   const {
     feedbackReportOpen,
     feedbackReportContext,
-    openFeedbackReport,
     closeFeedbackReport,
     notifyFeedbackReportSubmitted,
   } = useFeedbackReportDialog(currentView);
@@ -185,18 +184,7 @@ function AuthenticatedApp({ onOpenAppOnboarding }: { onOpenAppOnboarding: () => 
           return null;
         }}
         renderTitleBarActions={({ currentView }) => (
-          <>
-            {currentView === 'redclaw' && !isManuscriptEditorActive ? redClawTitleBarActions : null}
-            <button
-              type="button"
-              onClick={() => openFeedbackReport({ sourcePage: currentView })}
-              className="app-titlebar-button"
-              title="反馈问题"
-              aria-label="反馈问题"
-            >
-              <MessageSquareWarning className="w-[13px] h-[13px]" strokeWidth={1.75} />
-            </button>
-          </>
+            currentView === 'redclaw' && !isManuscriptEditorActive ? redClawTitleBarActions : null
         )}
       >
         {isManuscriptEditorActive && activeManuscriptEditorFile && (

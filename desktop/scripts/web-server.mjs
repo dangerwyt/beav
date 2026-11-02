@@ -273,12 +273,24 @@ async function handleFileProxy(req, res, url) {
 }
 
 const server = http.createServer((req, res) => {
+  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+  const pathname = decodeURIComponent(url.pathname);
+
+  // 登出：单机版用的是 HTTP Basic Auth，**凭据由浏览器保管**，服务端清不掉。
+  // 这里回 401 + 新的 WWW-Authenticate，浏览器会重新弹窗要凭据，
+  // 用户换个用户名/密码即可（浏览器也可能自动带上缓存的旧凭据）。
+  if (pathname === '/logout') {
+    res.writeHead(401, {
+      'WWW-Authenticate': 'Basic realm="Beav", charset="UTF-8"',
+      'Cache-Control': 'no-store',
+    });
+    return res.end('logged out');
+  }
+
   if (!basicAuthOk(req)) {
     res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Beav", charset="UTF-8"' });
     return res.end('auth required');
   }
-  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-  const pathname = decodeURIComponent(url.pathname);
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);

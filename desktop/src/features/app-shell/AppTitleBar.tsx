@@ -4,7 +4,7 @@ import {
   type ReactNode,
   type SetStateAction,
 } from 'react';
-import { Bell, Minus, Moon, PanelLeft, Search, Square, Sun, X } from 'lucide-react';
+import { Bell, LogOut, Minus, Moon, PanelLeft, Search, Square, Sun, X } from 'lucide-react';
 import { clsx } from 'clsx';
 import { APP_BRAND } from '../../config/brand';
 import type { ThemeMode } from '../../config/theme';
@@ -149,6 +149,21 @@ export function AppTitleBar({
             ? <Sun className="w-[13px] h-[13px]" strokeWidth={1.75} />
             : <Moon className="w-[13px] h-[13px]" strokeWidth={1.75} />}
         </button>
+        {/* 登出：只在 Web 端有意义 ——
+            桌面端没有「账号会话」这层（登录由官方账号体系管），登出后无从谈起。
+            Web 端是网关发的 beav_session cookie，必须有地方清掉，否则换个浏览器
+            还带着上一位用户的身份。网关的 /logout 会清 cookie 并 302 回 /login。 */}
+        {!isTauriRuntime() && (
+          <a
+            href="/logout"
+            className="app-titlebar-button app-titlebar-logout"
+            title="登出"
+            aria-label="登出"
+            data-no-window-drag
+          >
+            <LogOut className="w-[13px] h-[13px]" strokeWidth={1.75} />
+          </a>
+        )}
         {/* 窗口最小化/最大化/关闭只在 Tauri 桌面端有意义 ——
             Web 端 `platform` 判的是**浏览器所在机器**（在 Windows 上访问 web 也会判成 windows），
             但浏览器里根本没有可控制的原生窗口。 */}
