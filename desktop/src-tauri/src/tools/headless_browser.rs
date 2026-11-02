@@ -3051,14 +3051,20 @@ async fn scrape_post_detail_once(
                         }
                     } catch (e) {}
                     if (!author) {
+                        // 同样**只按当前视频 id 取**，不再拿 item_list[0]。
+                        // item_list 是「当前视频 + 相关推荐」的混排列表，第 0 条未必是当前视频，
+                        // 直接取会把推荐位的其他作者写成这条帖子的作者
+                        // （与上面 itemModule 分支同一个教训；这是同一作者裂成多个导出目录的另一个来源）。
                         try {
                             const rd = window._ROUTER_DATA;
                             const ld = rd && (rd.loaderData || rd.loader_data);
-                            if (ld) {
+                            const vid = (location.pathname.match(/\/video\/(\d+)/) || [])[1];
+                            if (ld && vid) {
                                 for (const k in ld) {
                                     const arr = ld[k] && ld[k].videoInfoRes && ld[k].videoInfoRes.item_list;
-                                    const first = arr && arr[0];
-                                    if (first) { author = String(pickAuthor(first) || '').trim(); if (author) break; }
+                                    if (!Array.isArray(arr)) continue;
+                                    const hit = arr.find((it) => it && String(it.aweme_id || it.awemeId || '') === vid);
+                                    if (hit) { author = String(pickAuthor(hit) || '').trim(); if (author) break; }
                                 }
                             }
                         } catch (e) {}
@@ -3071,27 +3077,41 @@ async fn scrape_post_detail_once(
                             || txt('.account-name');
                     }
                     if (!author) {
-                        // 只在「视频信息区」内找作者主页链接，避开侧栏/顶栏导航
+                        // 只在「视频信息区」内找作者主页链接，避开侧栏/顶栏导航。
+                        // **不要**再放 `.video-info-detail a[href*="/user/"] span`：
+                        // 那是正文描述容器，里面的 `@提及` 同样是 /user/ 链接，
+                        // 会把「@抖音科技」这类提及当成作者（实测导致同一作者裂成多个导出目录）。
+                        // 另外逐个过滤：位于描述区内的、以 @ 开头的，一律跳过。
+                        const descSelectors = ['[data-e2e="video-desc"]', '.video-info-detail', '[data-e2e="video-desc-text"]'];
+                        const inDesc = (el) => descSelectors.some((sel) => { try { return !!el.closest(sel); } catch (e) { return false; } });
                         const scoped = document.querySelectorAll(
                             '[data-e2e="video-detail"] a[href*="/user/"] span, '
-                            + '.video-info-detail a[href*="/user/"] span, '
                             + '[data-e2e="video-info"] a[href*="/user/"] span'
                         );
                         for (const el of scoped) {
                             const t = (el.textContent || '').trim();
-                            if (t) { author = t; break; }
+                            if (!t || t.charAt(0) === '@' || inDesc(el)) continue;
+                            author = t;
+                            break;
                         }
                     }
                     // 去掉昵称尾部「· 关注」等装饰
                     if (author) author = author.replace(/[·\s]+$/g, '').trim();
+                    // 提及护栏：正文里的 `@某人` 不是作者，以 @ 开头一律丢弃
+                    if (author && /^@/.test(author)) {
+                        author = '';
+                    }
                     // 导航词护栏：命中即判为误抓，置空（交给上层回退平台名，不落库成垃圾作者）
                     if (author && /^(我的|我的主页|首页|朋友|关注|推荐|搜索|消息|我|通知|私信|发布|登录|抖音|精选|商城|团购|直播)$/.test(author)) {
                         author = '';
                     }
                     // 发布时间：现版抖音 DOM 已不再用 `video-create-time`/`.create-time`（恒空），
                     // 改为多候选 + SSR `createTime` 兜底（见下方 formatDate）。
+                    // `dateSrc` 仅作诊断：抓不到时能一眼看出是「DOM/SSR 全失效」还是「压根没这字段」。
+                    let dateSrc = '';
                     date = txt('[data-e2e="video-publish-time"]') || txt('.video-publish-time')
                         || txt('[data-e2e="video-create-time"]') || txt('.create-time');
+                    if (date) dateSrc = 'dom';
                     // 互动数：旧 `.count` / `.digg-count` 选择器在现版抖音 DOM 已失效（常全为 0）。
                     // 三道兜底：① 动作按钮包裹节点文本（图标是 svg，text≈计数）；
                     // ② 更宽的 data-e2e 候选（feed-* 命名）；③ __INITIAL_STATE__ / _ROUTER_DATA。
@@ -3136,7 +3156,9 @@ async fn scrape_post_detail_once(
                             const im = window.__INITIAL_STATE__ && window.__INITIAL_STATE__.itemModule;
                             if (im) {
                                 const vid = (location.pathname.match(/\/video\/(\d+)/) || [])[1];
-                                const it = im[vid] || Object.values(im)[0];
+                                // 只用当前视频的条目：`Object.values(im)[0]` 可能是推荐位别的视频，
+                                // 拿错会让点赞/评论/收藏串号，进而误判「爆文」（spike）。
+                                const it = vid ? (im[vid] || null) : null;
                                 if (it) stats = it.stats || it.statistics || null;
                             }
                         } catch (e) {}
@@ -3166,32 +3188,49 @@ async fn scrape_post_detail_once(
                             const p = (x) => String(x).padStart(2, '0');
                             return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
                         };
+                        // **必须与当前视频 id 严格对应**。早期写成 `im[vid] || Object.values(im)[0]`、
+                        // `item_list[0]`，取不到就退化成「列表第一条」——那可能是相关推荐里另一个视频。
+                        // 抽错日期比抽不到危险得多：补历史会按 `published_before_cutoff` 把
+                        // 「年份早于下限」的帖子**直接删除**，一条 2026 的帖子配上 2023 的错日期就没了。
+                        const vidNow = (location.pathname.match(/\/video\/(\d+)/) || [])[1] || '';
+                        const sameAweme = (it) => {
+                            if (!it) return false;
+                            const id = String(it.aweme_id || it.awemeId || it.awemeID || '');
+                            return !!vidNow && id === vidNow;
+                        };
                         let createTs = 0;
                         try {
                             const im = window.__INITIAL_STATE__ && window.__INITIAL_STATE__.itemModule;
-                            if (im) {
-                                const vid = (location.pathname.match(/\/video\/(\d+)/) || [])[1];
-                                const it = im[vid] || Object.values(im)[0];
-                                if (it) createTs = Number(it.createTime || it.create_time || 0) || 0;
-                            }
+                            const it = vidNow && im ? (im[vidNow] || null) : null;
+                            if (it) createTs = Number(it.createTime || it.create_time || 0) || 0;
                         } catch (e) {}
                         if (!createTs) {
                             try {
                                 const rd = window._ROUTER_DATA;
                                 const ld = rd && (rd.loaderData || rd.loader_data);
-                                if (ld) {
+                                if (ld && vidNow) {
                                     for (const k in ld) {
                                         const arr = ld[k] && ld[k].videoInfoRes && ld[k].videoInfoRes.item_list;
-                                        const first = arr && arr[0];
-                                        if (first) {
-                                            createTs = Number(first.create_time || first.createTime || 0) || 0;
+                                        if (!Array.isArray(arr)) continue;
+                                        const hit = arr.find(sameAweme) || null;
+                                        if (hit) {
+                                            createTs = Number(hit.create_time || hit.createTime || 0) || 0;
                                             if (createTs) break;
                                         }
                                     }
                                 }
                             } catch (e) {}
                         }
-                        if (createTs) date = formatDate(createTs);
+                        if (createTs) { date = formatDate(createTs); dateSrc = 'ssr'; }
+                    }
+                    // 发布时间最后兜底：页面可见文本里的独立 `YYYY-MM-DD`。
+                    // 只认完整年月日，绝不接受「3天前」这类相对日期——那会随时间腐坏，
+                    // 且解析不出年份时上层按「不早于下限」保留，宁可不填也不能填错。
+                    if (!date) {
+                        const area = document.querySelector('[data-e2e="video-detail"], .video-info-detail, [data-e2e="video-info"]');
+                        const t = (area && area.textContent ? area.textContent : '').replace(/\s+/g, ' ');
+                        const m = t.match(/(?:^|[^\d])(20\d{2}-\d{2}-\d{2})(?![\d])/);
+                        if (m) { date = m[1]; dateSrc = 'text'; }
                     }
                     // 抖音封面：video 的 poster、播放器占位图、og:image 兜底
                     const v = document.querySelector('video[poster]');
@@ -3231,7 +3270,8 @@ async fn scrape_post_detail_once(
                 }
                 return { ok: true, title: title, content: content, author: author, date: date,
                          likes: likes, collects: collects, comments: comments,
-                         mediaType: mediaType, cover: cover, images: images, contentDebug: contentDebug };
+                         mediaType: mediaType, cover: cover, images: images, contentDebug: contentDebug,
+                         dateDebug: dateSrc };
             })()
         "#;
         client.evaluate(&session_id, extractor, false).await
