@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="./images/beav-icon.png" alt="Beav" width="88">
+  <img src="./images/beav-icon.png" alt="小霸王" width="88">
 </p>
 
-<h1 align="center">Beav</h1>
+<h1 align="center">小霸王</h1>
 
 <p align="center">
   <strong>An all-in-one AI content operations workspace, from trend capture to scheduled creation.</strong>
@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <a href="https://beav.pro/download"><img src="https://img.shields.io/badge/⬇️%20Download%20Beav-Get%20Started-C56F2C?style=for-the-badge&logoColor=white" alt="Download Beav" height="56"></a>
+  <a href="https://beav.pro/download"><img src="https://img.shields.io/badge/⬇️%20Download%20Beav-Get%20Started-C56F2C?style=for-the-badge&logoColor=white" alt="Download 小霸王" height="56"></a>
 </p>
 
 <p align="center">
@@ -28,17 +28,17 @@
 </p>
 
 <p align="center">
-  <img src="./images/beav-product-hero.png" alt="Beav AI content operations workspace" width="50%">
+  <img src="./images/beav-product-hero.png" alt="小霸王 AI content operations workspace" width="50%">
 </p>
 
-> RedBox is now **Beav**. Existing local data and workspaces are unaffected.
+> RedBox is now **小霸王**. Existing local data and workspaces are unaffected.
 
 ## Why this project?
 
 - **Content work gets buried in sources:** operators review large volumes of material, track trends, and search for inspiration every day. AI can accelerate this work, but creators still need one purpose-built tool connecting capture, topic discovery, and creation.
 - **General AI does not understand content assets:** tools such as Codex and Workbody focus on programming or general office work. They are not designed to serve as both a long-term source library and an ongoing creation workspace for content creators.
 
-That is why Beav exists: to turn AI into a sustainable source library and operations workspace built for content creators.
+That is why 小霸王 exists: to turn AI into a sustainable source library and operations workspace built for content creators.
 
 ## Workflow
 
@@ -91,7 +91,7 @@ Every capability below is implemented today.
 
 ## Quick start
 
-1. Install Beav from the [download page](https://beav.pro/download).
+1. Install 小霸王 from the [download page](https://beav.pro/download).
 2. Create one workspace for an account or brand.
 3. Open `Settings → AI` to use the official AI service or configure your own endpoint, API key, and model.
 4. For browser capture, get the Chrome / Edge extension from the [latest Release](https://github.com/Jamailar/Beav/releases/latest).
@@ -105,7 +105,7 @@ Every capability below is implemented today.
 
 ## Agent integration
 
-External agents such as Codex, Hermes, and OpenClaw can use the local ACP Agent Gateway to reuse Beav sessions, sources, task status, and manuscript references.
+External agents such as Codex, Hermes, and OpenClaw can use the local ACP Agent Gateway to reuse 小霸王 sessions, sources, task status, and manuscript references.
 
 ## Community
 
@@ -114,7 +114,7 @@ External agents such as Codex, Hermes, and OpenClaw can use the local ACP Agent 
 - [Issues](https://github.com/Jamailar/Beav/issues)
 - [Bilibili video tutorial](https://www.bilibili.com/video/BV12LNn6nEem/)
 
-Beav is independently developed and maintained by [JambaHailar](https://x.com/JambaHailar).
+小霸王 is independently developed and maintained by [JambaHailar](https://x.com/JambaHailar).
 
 ## License
 

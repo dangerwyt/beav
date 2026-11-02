@@ -1,3 +1,5 @@
+import { APP_BRAND } from '../config/brand';
+
 export function isTauriRuntime(): boolean {
   if (typeof window === 'undefined') {
     return false;
@@ -98,7 +100,7 @@ export async function invokeBrowserHost(channel: string, payload?: unknown): Pro
     }
   }
   if (primary) throw new Error(ipcErrorMessage(primary.response, primary.value));
-  throw new Error('无法连接 Beav 服务（daemon 未启动？）');
+  throw new Error(`无法连接 ${APP_BRAND.displayName} 服务（daemon 未启动？）`);
 }
 
 export function browserPayloadForCommand(command: string, args?: unknown): unknown {

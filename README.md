@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="./images/beav-icon.png" alt="Beav" width="88">
+  <img src="./images/beav-icon.png" alt="小霸王" width="88">
 </p>
 
-<h1 align="center">Beav</h1>
+<h1 align="center">小霸王</h1>
 
 <p align="center">
   <strong>AI 自媒体工作台</strong>
@@ -43,17 +43,17 @@
 </p>
 
 <p align="center">
-  <img src="./images/beav-product-hero.png" alt="Beav AI 内容运营工作空间" width="50%">
+  <img src="./images/beav-product-hero.png" alt="小霸王 AI 内容运营工作空间" width="50%">
 </p>
 
-> RedBox 已更名为 **Beav**；原有本地数据和工作空间不受影响。
+> RedBox 已更名为 **小霸王**；原有本地数据和工作空间不受影响。
 
 ## 为什么需要这个项目？
 
 - **运营时间被素材吞噬**：内容运营每天都要审阅大量素材、追踪热点、寻找灵感。AI 已能显著加速这些高频工作，但缺少把采集、选题和创作串起来的专用工具。
 - **通用 AI 不懂内容资产**：Codex、Workbody 等工具主要面向程序员或通用办公，并非为自媒体工作者设计，难以同时承担长期素材库与持续创作工作台。
 
-Beav 因此而生：把 AI 变成自媒体工作者真正可持续使用的素材库和运营工作台。
+小霸王 因此而生：把 AI 变成自媒体工作者真正可持续使用的素材库和运营工作台。
 
 ## 工作流
 
@@ -73,7 +73,7 @@ Beav 因此而生：把 AI 变成自媒体工作者真正可持续使用的素�
 
 ### 媒体工坊与智能口播剪辑
 
-导入口播视频后，Beav 结合逐词转录、语义和声音停顿分析冗余片段，辅助处理重说、口头语和接缝。基础剪辑可应用到时间线，随后检查剪辑记录、直接修改字幕，并补充画中画、花字与镜头动效。可选人声降噪支持开关，方便比较处理前后的声音。
+导入口播视频后，小霸王 结合逐词转录、语义和声音停顿分析冗余片段，辅助处理重说、口头语和接缝。基础剪辑可应用到时间线，随后检查剪辑记录、直接修改字幕，并补充画中画、花字与镜头动效。可选人声降噪支持开关，方便比较处理前后的声音。
 
 视频工程在独立窗口中编辑，提供多轨时间线、画布变换、关键帧、转场、调色、蒙版和音频调整。右侧 AI 助手可结合当前工程继续修改，操作进入撤销历史。导出时可选择目标目录，查看渲染进度和失败原因，也可单独导出 SRT / WebVTT 字幕。
 
@@ -100,7 +100,7 @@ Beav 因此而生：把 AI 变成自媒体工作者真正可持续使用的素�
 热点页面把适合当前账号的内容与各平台热榜放在一起查看。账号热点会展示匹配账号方向的内容，并标出来源平台和榜单位置；平台热榜按来源分栏呈现，方便横向浏览小红书、知乎、V2EX 等平台的热门话题。遇到值得跟进的内容，可以直接发起 AI 讨论，将热点继续转成选题或创作思路。
 
 <p align="center">
-  <img src="./images/hotspots-page.jpg" alt="Beav 热点页面：账号热点与多平台热榜" width="90%">
+  <img src="./images/hotspots-page.jpg" alt="小霸王 热点页面：账号热点与多平台热榜" width="90%">
 </p>
 
 ### 随手可用的小工具
@@ -118,13 +118,13 @@ Beav 因此而生：把 AI 变成自媒体工作者真正可持续使用的素�
 
 ## 自动社媒调研
 
-围绕你的账号定位、选题目标和已有素材，Beav 会自主检索多个社交平台的公开内容，先筛选候选素材，再深读高价值内容。调研结果可直接沉淀到知识库，成为后续选题、写稿和创作时可检索、可复用的依据。
+围绕你的账号定位、选题目标和已有素材，小霸王 会自主检索多个社交平台的公开内容，先筛选候选素材，再深读高价值内容。调研结果可直接沉淀到知识库，成为后续选题、写稿和创作时可检索、可复用的依据。
 
-![Beav 自动检索并深读社媒内容](./images/automated-social-research.jpg)
+![小霸王 自动检索并深读社媒内容](./images/automated-social-research.jpg)
 
 ## 跨平台博主订阅
 
-订阅受支持平台的博主或创作者主页，Beav 可每日自动刷新最新内容，并保存到知识库；可用平台与抓取结果取决于当前数据来源和配置。你可以像追踪一个持续更新的素材源一样，随时检索、筛选和复用这些内容，不必反复手动打开各个平台查看更新。
+订阅受支持平台的博主或创作者主页，小霸王 可每日自动刷新最新内容，并保存到知识库；可用平台与抓取结果取决于当前数据来源和配置。你可以像追踪一个持续更新的素材源一样，随时检索、筛选和复用这些内容，不必反复手动打开各个平台查看更新。
 
 ![订阅博主后每日自动同步到知识库](./images/creator-subscription-daily-sync.jpg)
 
@@ -162,7 +162,7 @@ Beav 因此而生：把 AI 变成自媒体工作者真正可持续使用的素�
 
 ### 经销代理
 
-如希望成为 Beav 的经销或代理合作伙伴，请填写 [Beav 经销代理合作申请表](https://my.feishu.cn/share/base/form/shrcnYe6rZBbfQNvgeDIEHClWUc)。
+如希望成为 小霸王 的经销或代理合作伙伴，请填写 [小霸王 经销代理合作申请表](https://my.feishu.cn/share/base/form/shrcnYe6rZBbfQNvgeDIEHClWUc)。
 
 ## 产品截图
 
@@ -180,13 +180,13 @@ Beav 因此而生：把 AI 变成自媒体工作者真正可持续使用的素�
 
 ## 快速开始
 
-1. 前往 [下载页](https://beav.pro/download) 安装 Beav。
+1. 前往 [下载页](https://beav.pro/download) 安装 小霸王。
 2. 为一个账号或品牌创建一个工作空间。
 3. 在 `设置 → AI` 使用官方 AI，或配置自己的 Endpoint、API Key 和模型。
 4. 如需网页采集，从 [最新 Release](https://github.com/Jamailar/Beav/releases/latest) 获取 Chrome / Edge 扩展。
 5. 从主页选题或日报开始创作；已有视频可进入媒体工坊进行剪辑，图片处理和账号规划从主页小工具打开。
 
-不确定某个功能怎么用时，可在对话中让 Beav 查询内置使用指南，再按当前版本的入口操作。
+不确定某个功能怎么用时，可在对话中让 小霸王 查询内置使用指南，再按当前版本的入口操作。
 
 ## 信任与边界
 
@@ -197,20 +197,20 @@ Beav 因此而生：把 AI 变成自媒体工作者真正可持续使用的素�
 
 ## Agent 插件
 
-Beav Creator 插件让 Codex Desktop 或 WorkBuddy 通过 MCP 连接本机 Beav，把创作任务交给 Beav 内部 Agent；用户仍在 Beav UI 中查看、审批和编辑结果。
+小霸王 Creator 插件让 Codex Desktop 或 WorkBuddy 通过 MCP 连接本机 小霸王，把创作任务交给 小霸王 内部 Agent；用户仍在 小霸王 UI 中查看、审批和编辑结果。
 
-先安装并启动 Beav（CLI 用户运行 `beav open`），再把对应指令发给宿主 Agent：
+先安装并启动 小霸王（CLI 用户运行 `beav open`），再把对应指令发给宿主 Agent：
 
 **Codex**
 
 ```text
-/goal Read https://beav.pro/agent to install the Beav Creator plugin and set up a new task for me.
+/goal Read https://beav.pro/agent to install the 小霸王 Creator plugin and set up a new task for me.
 ```
 
 **WorkBuddy**
 
 ```text
-Read https://beav.pro/workbuddy to install the Beav Creator plugin and connect it to my local Beav workspace.
+Read https://beav.pro/workbuddy to install the 小霸王 Creator plugin and connect it to my local 小霸王 workspace.
 ```
 
 安装完成后，直接在 Codex 或 WorkBuddy 中描述任务即可；浏览器 UI 只供用户操作，不作为 Agent 控制通道。
@@ -222,11 +222,11 @@ Read https://beav.pro/workbuddy to install the Beav Creator plugin and connect i
 - [问题反馈](https://github.com/Jamailar/Beav/issues)
 - [Bilibili 视频教程](https://www.bilibili.com/video/BV12LNn6nEem/)
 
-Beav 由 [JambaHailar](https://x.com/JambaHailar) 独立开发和维护。
+小霸王 由 [JambaHailar](https://x.com/JambaHailar) 独立开发和维护。
 
 ## 开源版本说明
 
-Beav 的公开开源版本目前停留在 **2.5.0**，基于 **Tauri + Rust** 构建。该版本保留了当时产品的主要功能与实现，可用于学习、研究和技术交流；对应源码和历史版本请以本仓库的 Git 历史及 Releases 为准。
+小霸王 的公开开源版本目前停留在 **2.5.0**，基于 **Tauri + Rust** 构建。该版本保留了当时产品的主要功能与实现，可用于学习、研究和技术交流；对应源码和历史版本请以本仓库的 Git 历史及 Releases 为准。
 
 面向实际用户持续维护的正式版本同样采用 **Tauri + Rust** 技术栈，并在独立的代码基础上继续迭代。它与 2.5.0 的公开源码版本在功能和版本进度上并不相同，正式版本也可能包含开源版本没有的功能、性能改进和平台适配。因此，开源版本不是当前正式版的完整或即时镜像；如需使用最新正式版本，请从[官网下载安装](https://beav.pro/)。
 

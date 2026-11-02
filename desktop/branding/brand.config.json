@@ -205,13 +205,13 @@
       }
     },
     "beav": {
-      "displayName": "Beav",
-      "aiDisplayName": "Beav",
+      "displayName": "小霸王",
+      "aiDisplayName": "小霸王",
       "cargoPackageName": "beav",
-      "windowTitle": "Beav",
+      "windowTitle": "小霸王",
       "identifier": "com.redconvert.beav",
-      "htmlTitle": "Beav",
-      "tagline": "AI content workspace",
+      "htmlTitle": "小霸王",
+      "tagline": "AI 自媒体工作台",
       "downloadUrl": "",
       "founderXHandle": "@JambaHailar",
       "founderXUrl": "https://x.com/JambaHailar",

@@ -94,13 +94,13 @@ function randomizeAcquisitionSources(): AcquisitionSourceOption[] {
 const STEP_CONTENT: OnboardingStepContent[] = [
   {
     eyebrow: '品牌更名',
-    title: 'RedBox 正式更名为 Beav。',
-    desc: '产品能力和本地数据会继续保留；从 2.5.0 开始，新的应用名称和图标会统一使用 Beav。',
+    title: 'Beav 正式更名为 小霸王。',
+    desc: '产品能力和本地数据会继续保留；从 2.6.0 开始，新的应用名称和图标会统一使用 小霸王。',
     brandRename: {
-      previousName: 'RedBox',
-      currentName: 'Beav',
-      previousIconSrc: '/onboarding/brand/redbox-logo.png',
-      currentIconSrc: '/onboarding/brand/beav-logo.png',
+      previousName: 'Beav',
+      currentName: '小霸王',
+      previousIconSrc: '/onboarding/brand/beav-logo.png',
+      currentIconSrc: '/onboarding/brand/xiaobawang-logo.png',
     },
   },
   {

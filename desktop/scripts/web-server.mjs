@@ -36,6 +36,16 @@ const DAEMON_ORIGIN = new URL(DAEMON).origin;
 const BASIC_USER = process.env.WEB_BASIC_USER || '';
 const BASIC_PASS = process.env.WEB_BASIC_PASS || '';
 
+/** 产品名以 package.json 的 productName 为准（sync-brand 维护），避免这里二次硬编码品牌名。 */
+const APP_NAME = (() => {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    return String(pkg.productName || '').trim() || 'App';
+  } catch {
+    return 'App';
+  }
+})();
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -281,14 +291,14 @@ const server = http.createServer((req, res) => {
   // 用户换个用户名/密码即可（浏览器也可能自动带上缓存的旧凭据）。
   if (pathname === '/logout') {
     res.writeHead(401, {
-      'WWW-Authenticate': 'Basic realm="Beav", charset="UTF-8"',
+      'WWW-Authenticate': `Basic realm="${APP_NAME}", charset="UTF-8"`,
       'Cache-Control': 'no-store',
     });
     return res.end('logged out');
   }
 
   if (!basicAuthOk(req)) {
-    res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Beav", charset="UTF-8"' });
+    res.writeHead(401, { 'WWW-Authenticate': `Basic realm="${APP_NAME}", charset="UTF-8"` });
     return res.end('auth required');
   }
 
