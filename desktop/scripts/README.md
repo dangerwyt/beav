@@ -23,6 +23,8 @@
 - [maintenance/clean-douyin-titles.mjs](/desktop/scripts/maintenance/clean-douyin-titles.mjs): 回洗存量抖音标题（去前导「置顶」/点赞数、去重复文案）。`--dry-run` 只报告；`--self-test` 跑 10 条回归用例；`--store <path>` 指定文件
 - [maintenance/fix-video-audio-flag.mjs](/desktop/scripts/maintenance/fix-video-audio-flag.mjs): 用 ffprobe 探测本地视频是否含音轨，回填 `videoHasAudio` 并把无音轨的分析记录标为 `no-audio`。`--dry-run` / `--store` / `--ffprobe` 可用
 - [maintenance/dedupe-watch-list.mjs](/desktop/scripts/maintenance/dedupe-watch-list.mjs): 检测 / 合并「同一用户下重复的监控项」（同一主页被建了多条）。重复项会让两个 watch 轮流抓同一批帖子，而落库按 (owner, 裸URL) 去重 → 只有一个 watch 能拿到帖子，另一个卡片恒显示「已收录 0 篇」。默认 `--dry-run` 只报告，`--merge` 才实际合并（帖子迁移到保留的主项，同一条帖子不重复入库）
+- [maintenance/switch-routes-to-relayrouter.mjs](/desktop/scripts/maintenance/switch-routes-to-relayrouter.mjs): 把 `ai_model_routes_json` 里的多模态 scope（embedding / image / videoAnalysis / voiceTts / visualIndex）从官方源切到 RelayRouter，chat 与 transcription 不动；`voiceClone` 因 RelayRouter 无克隆类模型而**保持官方**。默认 `--dry-run` 只报告，`--apply` 才写入（先自动备份 store）。**必须先退出应用**，否则内存快照会覆盖写入
+- [maintenance/fix-post-authors.mjs](/desktop/scripts/maintenance/fix-post-authors.mjs): 修复被详情页误抓污染的帖子作者名。旧版 `post_detail` 会无条件用详情页作者覆盖记录，而详情页兜底链会把正文里的 `@提及`（如「@抖音科技」）或推荐位作者当成作者 → 同一博主在导出目录里裂成多个作者文件夹。规则：有 `watch_id` 且 watch 仍存在时，作者应为 `watch.name`。`--dry-run` 只报告；`--apply` 写入；加 `--merge-dirs` 还会按 `.beav-post-id` 标记把裂开的导出目录挪回正确作者下并清理空目录。**必须先退出应用**
 - [sync-wb-memory.mjs](/desktop/scripts/sync-wb-memory.mjs): 同步 WorkBuddy 的**工作区记忆**到另一台机器。WorkBuddy 的云端 profile、用户级 MEMORY.md、对话历史都跟账号走（换机自动有），**只有工作区记忆**（`<workspace>/.workbuddy/memory/`）是纯本地文件，需要手动同步。`status` 看状态 / `push` 导出到私有 git 仓库 / `pull` 合并回来（同名文件按 mtime 新者胜，冲突会列出来）。仓库路径用 `WB_MEMORY_REPO` 指定（默认 `~/wb-memory`），工作区用 `WB_WORKSPACE` 指定（默认按记忆文件数自动选）
 
 ## Artifact Paths
