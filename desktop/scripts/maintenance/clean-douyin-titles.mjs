@@ -35,7 +35,10 @@ const dryRun = process.argv.includes('--dry-run');
 const STRONG_UNIT = /^[个种条步招篇次位项]/;
 const WEAK_UNIT = /^[月日年天分秒岁]/;
 const LEAD_PIN = /^(?:置顶|置頂)\s*/;
-const LEAD_NUM = /^[\d.]+\s*(?:万|w|W|k|K)?\s*/;
+// 开头的数字前缀（可能是播放量：`1.8万` / `667`）。
+// `+` 必须一起匹配：`30+亿美元` 里的 `30+` 是一整个数量表达，
+// 只匹配 `30` 会把 `+` 留在正文里，剥完变成「+亿美元」这种残缺标题。
+const LEAD_NUM = /^[\d.]+\+?\s*(?:万|w|W|k|K)?\s*/;
 
 function commonPrefixLen(a, b) {
   const n = Math.min(a.length, b.length);
@@ -74,9 +77,21 @@ export function cleanTitle(raw, content = '') {
     // 「日」当成日期量词（`1.8万` 数字位数为 1 ≤ 2），误伤率不低。
     const body = String(content ?? '').replace(/\s+/g, ' ').trim();
     const digitsOf = (s) => String(s || '').replace(/[^\d.]/g, '').replace(/\.+$/, '');
+    // 判断「这个数字是不是标题的一部分」。
+    //
+    // 判据：**正文里是否紧邻着（可隔着少量非数字字符）出现同一个数字**。
+    //   · `30+亿美元` → 正文 `第8集 | 30+亿美元！…` 里紧邻着 `30+` → 数字是标题的一部分，不剥。
+    //   · `1.8万日本资产泡沫` → 正文 `日本资产泡沫…` 里没有 `1.8` → 它是播放量前缀，该剥。
+    //
+    // 为什么不用「正文第一个数字 == 标题数字」：正文第一个数字可能是集数
+    // （`第8集 | 30+亿美元` → 第一个数字是 8），数字比较必然对不上。
+    // 为什么不用「正文是否包含 rest」：`1.8万日本资产泡沫` 的 rest（`日本资产泡沫…`）
+    // 本来就完整出现在正文里，会被误判成「数字属于标题」→ 播放量剥不掉。
     const digits = digitsOf(m[0]);
-    const bodyDigits = digitsOf((body.match(/^\D{0,8}(\d[\d.]*\+?\s*[万wWkK]?)/) || [])[1] || '');
-    const digitsInBody = digits !== '' && bodyDigits !== '' && bodyDigits === digits;
+    const numRe = digits
+      ? new RegExp(`\\D{0,4}${digits.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`)
+      : null;
+    const digitsInBody = Boolean(numRe && numRe.test(body));
     const shouldStrip = body
       ? !digitsInBody
       : !unitBlocked;
@@ -132,6 +147,18 @@ function selfTest() {
       '667大家能对出下联吗？ @赵镭老师 #语文',
       '大家能对出下联吗？ @赵镭老师 #语文',
       '大家能对出下联吗？ @赵镭老师 #语文',
+    ],
+    [
+      '正文带集数前缀+加号数字(实测样本)',
+      '30+亿美元！新加坡史上最大洗钱案 #洗钱罪 #一口气看懂经济学',
+      '30+亿美元！新加坡史上最大洗钱案 #洗钱罪 #一口气看懂经济学',
+      '第8集 | 30+亿美元！新加坡史上最大洗钱案 #洗钱罪 #一口气看懂经济学',
+    ],
+    [
+      '正文无该数字=播放量前缀(实测样本)',
+      '3.9万年过好了，AI能帮我们更加有钱花么？ #闲鱼富苏季 #闲鱼 #上闲鱼有钱花年过好了，AI能帮我们更加有钱花么？',
+      '年过好了，AI能帮我们更加有钱花么？ #闲鱼富苏季 #闲鱼 #上闲鱼有钱花',
+      '年过好了，AI能帮我们更加有钱花么？ #闲鱼富苏季  #闲鱼 #上闲鱼有钱花',
     ],
   ];
 
