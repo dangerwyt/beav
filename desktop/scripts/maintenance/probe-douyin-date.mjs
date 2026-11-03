@@ -224,11 +224,13 @@ const PROBE = String.raw`(() => {
     itemCreateTime: it ? (it.createTime || it.create_time || 0) : 0,
     routerData: router,
     dom: {
-      publishTime: txt('[data-e2e="video-publish-time"]'),
-      videoCreateTime: txt('[data-e2e="video-create-time"]'),
-      createTimeCls: txt('.create-time'),
-      authorName: txt('[data-e2e="author-name"]'),
-      desc: txt('[data-e2e="video-desc"]').slice(0, 80),
+      // 直接列出应用实际会用的选择器，逐一取值 —— 这样能判断「选择器对不对」
+      // 与「应用求值时机对不对」是两件事。
+      appDetailVideoPublishTime: txt('[data-e2e="detail-video-publish-time"]'),
+      appOldPublishTime: txt('[data-e2e="video-publish-time"]'),
+      appVideoDesc: txt('[data-e2e="video-desc"]'),
+      appVideoInfoDetail: txt('.video-info-detail'),
+      appAuthorName: txt('[data-e2e="author-name"]'),
     },
     areaTextSample: areaText,
     dateHits,
@@ -258,6 +260,13 @@ const PROBE = String.raw`(() => {
     if (!pick) { console.error('store 里没有抖音视频帖，请用 --url 指定'); process.exit(1); }
     targetUrl = pick.postUrl;
     console.log(`从 store 挑了一条：${pick.id}  publishedAt=${JSON.stringify(pick.publishedAt)}`);
+  } else {
+    const hit = douyin.find((p) => String(p.postUrl || '').split('?')[0] === targetUrl.split('?')[0]);
+    if (hit) {
+      console.log(`store 记录：publishedAt=${JSON.stringify(hit.publishedAt)}  detailFetched=${hit.detailFetched}  updatedAt=${hit.updatedAt}`);
+    } else {
+      console.log('store 里没有这条 URL（可能是临时抓取的，或 URL 带参数不一致）');
+    }
   }
   console.log(`目标 URL: ${targetUrl}`);
 
