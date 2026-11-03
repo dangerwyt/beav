@@ -19,6 +19,23 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { resolveStorePath } from './_store-path.mjs';
 
+/**
+ * 复刻 Rust `sanitize_fs_name()` + 导出时的 32 字符截断，用来和磁盘上的作者目录名比对。
+ * 不这么做的话，作者名里含非法字符或被截断时永远对不上，会反复计划移动同一个目录。
+ */
+function sanitizeAuthorDir(name) {
+  const ILLEGAL = new Set(['\\', '/', ':', '*', '?', '"', '<', '>', '|']);
+  let out = Array.from(String(name ?? ''))
+    .map((c) => {
+      const code = c.codePointAt(0) ?? 0;
+      return ILLEGAL.has(c) || code < 0x20 || code === 0x7f ? '_' : c;
+    })
+    .join('');
+  while (out.includes('__')) out = out.split('__').join('_');
+  out = out.trim().replace(/^_+|_+$/g, '');
+  return Array.from(out).slice(0, 32).join('');
+}
+
 const MARKER = '.beav-post-id';
 
 function parseArgs(argv) {
@@ -136,8 +153,16 @@ if (args.mergeDirs) {
     console.log(`\n[merge-dirs] 导出根不存在（来源: ${exportResolved.from}），跳过: ${exportRoot}`);
   } else {
     console.log(`\n=== 扫描导出目录 ===\n根: ${exportRoot}（来源: ${exportResolved.from}）`);
-    // 用 postId → 目标作者 建立映射，避免依赖平台中文名 / 日期格式
-    const todoByPostId = new Map(candidates.map((c) => [c.postId, c]));
+    // **直接按「帖子 → 应有作者目录名」判定，不依赖 candidates**。
+    // 早期版本从 candidates 推导待移动集合，于是出现：上一次 --apply 已经把 author 修好、
+    // candidates 归零，再跑 --merge-dirs 就一个目录都不移 —— 目录永远合不上。
+    const postById = new Map(posts.map((p) => [String(p.id), p]));
+    const expectedAuthorDir = (post) => {
+      const wid = String(post.watchId ?? '').trim();
+      const watch = wid ? watchById.get(wid) : null;
+      const name = String(watch?.name ?? '').trim() || String(post.author ?? '').trim();
+      return sanitizeAuthorDir(name) || '未知作者';
+    };
     const markers = [];
     const walk = (dir, depth) => {
       if (depth > 6) return;
@@ -152,22 +177,26 @@ if (args.mergeDirs) {
     walk(exportRoot, 0);
     console.log(`发现 ${markers.length} 个 ${MARKER} 标记`);
 
+    let orphan = 0;
     for (const m of markers) {
       let postId = '';
       try { postId = fs.readFileSync(m.markerPath, 'utf8').trim(); } catch { continue; }
-      const todo = todoByPostId.get(postId);
-      if (!todo) continue;
+      const post = postById.get(postId);
+      if (!post) { orphan += 1; continue; }
+      const to = expectedAuthorDir(post);
       const titleDir = m.dir;
       const authorDir = path.dirname(titleDir);
       const dateDir = path.dirname(authorDir);
-      if (path.basename(authorDir) === todo.to) continue;
+      const from = path.basename(authorDir);
+      if (from === to) continue;
 
-      const targetDir = path.join(dateDir, todo.to);
+      const targetDir = path.join(dateDir, to);
       const destDir = path.join(targetDir, path.basename(titleDir));
-      moves.push({ postId, titleDir, destDir, targetDir, from: path.basename(authorDir), to: todo.to, conflict: fs.existsSync(destDir) });
+      moves.push({ postId, titleDir, destDir, targetDir, from, to, conflict: fs.existsSync(destDir) });
     }
+    if (orphan) console.log(`其中 ${orphan} 个标记对应的帖子已不在库中（跳过）`);
 
-    console.log(`\n需要移动 ${moves.length} 个帖子目录`);
+    console.log(`\n需要移动 ${moves.length} 个帖子目录（冲突跳过 ${moves.filter((m) => m.conflict).length} 个）`);
     for (const mv of moves) {
       console.log(`  ${mv.conflict ? '[冲突跳过] ' : ''}${mv.from}/… → ${mv.to}/${path.basename(mv.titleDir)}`);
     }
