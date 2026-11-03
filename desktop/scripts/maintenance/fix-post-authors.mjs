@@ -385,11 +385,6 @@ if (!candidates.length && !moves.length && !renames.length) {
   process.exit(0);
 }
 
-const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
-const backup = `${args.store}.bak-${stamp}`;
-fs.copyFileSync(args.store, backup);
-console.log(`\n已备份 store -> ${backup}`);
-
 const byId = new Map(posts.map((p) => [p.id, p]));
 let fixed = 0;
 for (const c of candidates) {
@@ -398,8 +393,20 @@ for (const c of candidates) {
   post.author = c.to;
   fixed += 1;
 }
-fs.writeFileSync(args.store, `${JSON.stringify(store, null, 2)}\n`, 'utf8');
-console.log(`已修正 ${fixed} 条帖子的 author`);
+
+// 只有真的改了 author 才写盘。`--merge-dirs` / `--rename-dirs` 只动磁盘时，
+// 写 store 是纯风险：桌面端在跑的话，它的内存快照可能把这次写入覆盖回去，
+// 徒增「改了但没生效」的困惑。
+if (fixed > 0) {
+  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
+  const backup = `${args.store}.bak-${stamp}`;
+  fs.copyFileSync(args.store, backup);
+  fs.writeFileSync(args.store, `${JSON.stringify(store, null, 2)}\n`, 'utf8');
+  console.log(`\n已备份 store -> ${backup}`);
+  console.log(`已修正 ${fixed} 条帖子的 author`);
+} else {
+  console.log('\nauthor 无需修正，跳过写 store（正在运行的应用不受影响）');
+}
 
 /* ---------- 4. 真正移动目录 ---------- */
 let movedOk = 0;
