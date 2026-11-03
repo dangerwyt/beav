@@ -36,6 +36,42 @@ function sanitizeAuthorDir(name) {
   return Array.from(out).slice(0, 32).join('');
 }
 
+/** 在 dir 的直接子目录里找「`.beav-post-id` 等于 postId」的那个目录。 */
+function findDirOwnedBy(dir, postId) {
+  let entries = [];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return null; }
+  for (const ent of entries) {
+    if (!ent.isDirectory()) continue;
+    const candidate = path.join(dir, ent.name);
+    try {
+      if (fs.readFileSync(path.join(candidate, MARKER), 'utf8').trim() === postId) return candidate;
+    } catch { /* 该子目录没有标记文件 */ }
+  }
+  return null;
+}
+
+/**
+ * 目标目录下的唯一落点，规则对齐 Rust 导出（`try_export_post_product`）：
+ * 先试原标题目录名，被占就用 `{标题}_{postId}`；仍被占再追加序号。
+ *
+ * 为什么必须这样：同一作者下「标题前 10 字相同」的帖子很常见
+ * （比如一堆 `【抖音独家】Open…`），导出侧本来就是靠 `_{postId}` 后缀区分的。
+ * 早期脚本「目标存在就跳过」，结果这批帖子永远搬不过去。
+ */
+function uniqueDestDir(targetDir, baseName, postId) {
+  const samePost = findDirOwnedBy(targetDir, postId);
+  if (samePost) return samePost;
+  const first = path.join(targetDir, baseName);
+  if (!fs.existsSync(first)) return first;
+  const withId = path.join(targetDir, `${baseName}_${postId}`);
+  if (!fs.existsSync(withId)) return withId;
+  for (let n = 2; n < 1000; n += 1) {
+    const next = path.join(targetDir, `${baseName}_${postId}_${n}`);
+    if (!fs.existsSync(next)) return next;
+  }
+  return withId;
+}
+
 const MARKER = '.beav-post-id';
 
 function parseArgs(argv) {
@@ -191,14 +227,32 @@ if (args.mergeDirs) {
       if (from === to) continue;
 
       const targetDir = path.join(dateDir, to);
-      const destDir = path.join(targetDir, path.basename(titleDir));
-      moves.push({ postId, titleDir, destDir, targetDir, from, to, conflict: fs.existsSync(destDir) });
+      const titleName = path.basename(titleDir);
+
+      // 目标作者下已经存在「同一个帖子」的目录 → 源是重复副本，不用搬。
+      const own = findDirOwnedBy(targetDir, postId);
+      if (own) {
+        moves.push({ postId, titleDir, destDir: own, targetDir, from, to, titleName, kind: 'duplicate' });
+        continue;
+      }
+
+      // 目标下同名目录被别人占了（同一作者标题前 10 字相同很常见）→
+      // 复刻 Rust 导出的兜底：`{标题}_{postId}`，仍撞就再追加序号。
+      const destDir = uniqueDestDir(targetDir, titleName, postId);
+      moves.push({ postId, titleDir, destDir, targetDir, from, to, titleName, kind: 'move' });
     }
     if (orphan) console.log(`其中 ${orphan} 个标记对应的帖子已不在库中（跳过）`);
 
-    console.log(`\n需要移动 ${moves.length} 个帖子目录（冲突跳过 ${moves.filter((m) => m.conflict).length} 个）`);
+    const dupCount = moves.filter((m) => m.kind === 'duplicate').length;
+    const renameCount = moves.filter((m) => m.kind === 'move' && path.basename(m.destDir) !== m.titleName).length;
+    console.log(`\n需要处理 ${moves.length} 个帖子目录（重命名避让 ${renameCount} · 重复副本 ${dupCount}）`);
     for (const mv of moves) {
-      console.log(`  ${mv.conflict ? '[冲突跳过] ' : ''}${mv.from}/… → ${mv.to}/${path.basename(mv.titleDir)}`);
+      if (mv.kind === 'duplicate') {
+        console.log(`  [重复] ${mv.from}/${mv.titleName} —— 目标已有同一帖子，源目录留待手动清理`);
+      } else {
+        const renamed = path.basename(mv.destDir) !== mv.titleName ? '  (重命名避让)' : '';
+        console.log(`  ${mv.from}/… → ${mv.to}/${path.basename(mv.destDir)}${renamed}`);
+      }
     }
   }
 }
@@ -237,9 +291,9 @@ let movedFail = 0;
 if (args.mergeDirs && moves.length) {
   const touchedAuthorDirs = new Set();
   for (const mv of moves) {
-    if (mv.conflict) {
+    if (mv.kind === 'duplicate') {
       movedSkip += 1;
-      console.log(`  — 跳过（目标已存在）: ${mv.destDir}`);
+      console.log(`  — 重复副本，未移动: ${mv.from}/${mv.titleName}`);
       continue;
     }
     try {
@@ -247,7 +301,8 @@ if (args.mergeDirs && moves.length) {
       fs.renameSync(mv.titleDir, mv.destDir);
       touchedAuthorDirs.add(path.dirname(mv.titleDir));
       movedOk += 1;
-      console.log(`  ✔ ${mv.from}/ → ${mv.to}/${path.basename(mv.titleDir)}`);
+      const renamed = path.basename(mv.destDir) !== mv.titleName ? '  (重命名避让)' : '';
+      console.log(`  ✔ ${mv.from}/${mv.titleName} → ${mv.to}/${path.basename(mv.destDir)}${renamed}`);
     } catch (e) {
       movedFail += 1;
       console.log(`  ✘ 失败 ${mv.titleDir}`);
@@ -265,8 +320,7 @@ if (args.mergeDirs && moves.length) {
       }
     } catch { /* 忽略 */ }
   }
-  console.log(`
-移动结果：成功 ${movedOk} · 冲突跳过 ${movedSkip} · 失败 ${movedFail} · 清理空目录 ${removed}`);
+  console.log(`\n移动结果：成功 ${movedOk} · 重复副本 ${movedSkip} · 失败 ${movedFail} · 清理空目录 ${removed}`);
 }
 
 /* ---------- 5. 移动后重新扫一遍，确认真的归位 ---------- */
