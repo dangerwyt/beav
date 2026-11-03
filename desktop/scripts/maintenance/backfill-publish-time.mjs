@@ -1,20 +1,25 @@
 /**
- * 批量补「发布时间」：对 `publishedAt` 为空的帖子逐条触发 `post_detail(refresh=true)`。
+ * 批量补「发布时间」或「正文」：逐条触发 `post_detail(refresh=true)`。
  *
  * 走 daemon 的 `/api/ipc/invoke`，等价于界面上对每条帖子点一次「重新抓正文」，
  * 但可以批量、有进度、可中断续跑（已补上的下次自动跳过）。
  *
+ * `--reason content` 用于洗「正文退化成标题」的帖子（平台改版、提取器只拿到
+ * h1 时会出现）。因为 `post_detail` 有「新正文不短于旧正文才覆盖」的保护，
+ * 重抓只会把短的升级成完整的，不会反过来把好数据冲掉，所以跑一遍是无害的。
+ *
  * 前置：
  *   - 桌面端必须正在运行（daemon 监听 31937），且平台 Chrome 已登录；
- *   - 正文提取目前对抖音是"仅标题级"，所以**必须**先有 post_detail 的
- *     「新正文不短于旧正文才覆盖」保护，否则会把已有正文冲掉。
+ *   - 正文提取目前对抖音是「仅标题级」的版本必须已修复，否则洗了也没用。
  *
  * 用法：
  *   node scripts/maintenance/backfill-publish-time.mjs --dry-run
  *   node scripts/maintenance/backfill-publish-time.mjs --limit 10
- *   node scripts/maintenance/backfill-publish-time.mjs --limit 200 --concurrency 2
+ *   node scripts/maintenance/backfill-publish-time.mjs --reason content --limit 100
  *
  * 参数：
+ *   --reason R       `publish-time`（默认，挑 publishedAt 为空的）
+ *                    或 `content`（挑正文等于标题、或比标题还短的）
  *   --limit N        本次最多处理多少条（默认 20，先小批量验证）
  *   --concurrency N  并发数（默认 2；每条都会开一个 CDP 标签页，太高容易触发风控）
  *   --platform P     平台（默认 douyin，传 all 表示不限）
@@ -36,8 +41,14 @@ const hasFlag = (name) => process.argv.includes(`--${name}`);
 const LIMIT = Number(arg('limit', '20')) || 20;
 const CONCURRENCY = Math.max(1, Math.min(6, Number(arg('concurrency', '2')) || 2));
 const PLATFORM = arg('platform', 'douyin');
+const REASON = arg('reason', 'publish-time');
 const DAEMON = String(arg('daemon', 'http://127.0.0.1:31937')).replace(/\/+$/, '');
 const DRY = hasFlag('dry-run');
+
+if (!['publish-time', 'content'].includes(REASON)) {
+  console.error(`--reason 只支持 publish-time | content，收到: ${REASON}`);
+  process.exit(1);
+}
 
 const storeResolved = resolveStorePath(arg('store'));
 const storeFile = storeResolved.file;
@@ -46,19 +57,28 @@ if (!fs.existsSync(storeFile)) {
   process.exit(1);
 }
 
+const isHttpUrl = (v) => /^https?:\/\//.test(String(v || ''));
+
 function loadPosts() {
   const store = JSON.parse(fs.readFileSync(storeFile, 'utf8'));
   const all = Array.isArray(store.monitoredPosts) ? store.monitoredPosts : [];
   return all.filter((p) => {
     if (PLATFORM !== 'all' && String(p.platform) !== PLATFORM) return false;
-    if (String(p.publishedAt || '').trim()) return false;
-    return /^https?:\/\//.test(String(p.postUrl || ''));
+    if (!isHttpUrl(p.postUrl)) return false;
+    if (REASON === 'content') {
+      // 正文等于标题、或比标题还短 → 疑似被提取成了标题级
+      const c = String(p.content || '').trim();
+      const t = String(p.title || '').trim();
+      return c === t || c.length < t.length;
+    }
+    return !String(p.publishedAt || '').trim();
   });
 }
 
 const pending = loadPosts();
 console.log(`store: ${storeFile}（来源: ${storeResolved.from}）`);
-console.log(`平台=${PLATFORM} · 待补发布时间 ${pending.length} 条 · 本次处理 ${Math.min(LIMIT, pending.length)} 条 · 并发 ${CONCURRENCY}`);
+const REASON_LABEL = REASON === 'content' ? '正文疑似标题级' : '缺少发布时间';
+console.log(`平台=${PLATFORM} · ${REASON_LABEL} ${pending.length} 条 · 本次处理 ${Math.min(LIMIT, pending.length)} 条 · 并发 ${CONCURRENCY}`);
 
 if (pending.length === 0) {
   console.log('没有需要补的帖子');
@@ -97,7 +117,15 @@ async function refreshOne(post) {
   const text = await res.text();
   let json;
   try { json = JSON.parse(text); } catch { throw new Error(`返回非 JSON: ${text.slice(0, 120)}`); }
-  const got = String(json?.post?.publishedAt || '').trim();
+  const post2 = json?.post || {};
+  if (REASON === 'content') {
+    const nowLen = String(post2.content || '').trim().length;
+    const beforeLen = String(post.content || '').trim().length;
+    // 看的是「有没有变长」而不是绝对长度：短文案本来就可能等于标题
+    if (nowLen > beforeLen) return { ok: true, value: `${beforeLen}→${nowLen} 字` };
+    return { ok: false, value: '', reason: json?.note || (json?.fetched ? `没变长（${beforeLen}→${nowLen}）` : '抓取失败') };
+  }
+  const got = String(post2.publishedAt || '').trim();
   if (got) return { ok: true, value: got };
   return { ok: false, value: '', reason: json?.note || (json?.fetched ? '抓到了但没解析出发布时间' : '抓取失败') };
 }
