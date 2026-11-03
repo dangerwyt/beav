@@ -4007,6 +4007,18 @@ fn sanitize_fs_name(s: &str) -> String {
 }
 
 /// 标题前 `n` 个字符（按 Unicode 字符计）作为四级目录名；空标题回退「未命名」。
+/// 导出四级目录取标题前多少个字符。
+///
+/// 原来写死 10，在中文场景下明显不够：`【抖音独家】` 这类栏目前缀就占 6 个字符，
+/// 剩 4 个只能装下 `Open`，于是 `【抖音独家】OpenAI Images 2.5 重磅发布` 与
+/// `【抖音独家】OpenAI 为何紧急暂停 Astra 测试？` 会撞成同一个目录名，
+/// 后者只能靠 `_{postId}` 后缀区分，目录树可读性很差。
+/// 20 个字符足以覆盖到真正的区分点，同时离文件系统单段 255 字节的上限还很远。
+///
+/// 注意：只影响**此后首次导出**的帖子；已导出的目录靠 `.beav-post-id` 复用
+/// （见 `find_own_export_dir`），不会被改名，所以老数据不会出现新旧两份。
+const EXPORT_TITLE_PREFIX_LEN: usize = 20;
+
 fn title_export_prefix(title: &str, n: usize) -> String {
     let trimmed = title.trim();
     if trimmed.is_empty() {
@@ -4518,7 +4530,7 @@ fn try_export_post_product(
     let l2 = l1.join(&date);
     let l3 = l2.join(&author);
 
-    let title_prefix = title_export_prefix(&post.title, 10);
+    let title_prefix = title_export_prefix(&post.title, EXPORT_TITLE_PREFIX_LEN);
     let l4 = match find_own_export_dir(&l3, post_id) {
         Some(d) => d,
         None => {
@@ -6434,5 +6446,35 @@ mod tests {
         // 无主页 URL → 不判重（返回 None）
         assert!(watch_dedupe_key("alice", "xiaohongshu", None).is_none());
         assert!(watch_dedupe_key("alice", "xiaohongshu", Some("   ")).is_none());
+    }
+
+    /// 回归守卫：导出目录名按标题前 20 个字符取，中文栏目前缀不该把标题「吃光」。
+    ///
+    /// 实测事故：`【抖音独家】` 占 6 个字符，取前 10 只剩 `Open`，
+    /// 三条标题完全不同的帖子撞成同一个目录名，只能靠 `_{postId}` 后缀区分，
+    /// 目录树里一堆 `【抖音独家】Open_mpost-1793...` 根本认不出是哪条。
+    #[test]
+    fn export_title_prefix_keeps_chinese_titles_distinct() {
+        let titles = [
+            "【抖音独家】OpenAI Images 2.5 重磅发布",
+            "【抖音独家】OpenAI 为何紧急暂停 Astra 测试？",
+            "【抖音独家】OpenAI 宣布与微软分家",
+        ];
+        let prefixes: Vec<String> = titles
+            .iter()
+            .map(|t| super::title_export_prefix(t, super::EXPORT_TITLE_PREFIX_LEN))
+            .collect();
+        for (i, a) in prefixes.iter().enumerate() {
+            for b in prefixes.iter().skip(i + 1) {
+                assert_ne!(a, b, "标题前缀不该相撞：{a}");
+            }
+        }
+        // 按 Unicode 字符切，不会把中文切坏；尾部空格被 sanitize_fs_name 的 trim 去掉
+        assert_eq!(prefixes[0], "【抖音独家】OpenAI Images");
+        // 空标题回退
+        assert_eq!(
+            super::title_export_prefix("   ", super::EXPORT_TITLE_PREFIX_LEN),
+            "未命名"
+        );
     }
 }
