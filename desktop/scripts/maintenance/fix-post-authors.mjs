@@ -72,6 +72,19 @@ function uniqueDestDir(targetDir, baseName, postId) {
   return withId;
 }
 
+/**
+ * 强制加 `_{postId}` 后缀的唯一落点（忽略原标题名能否直接用）。
+ * 用于 rename 报 ENOTEMPTY/EEXIST 后的重试。
+ */
+function forcedUniqueDir(targetDir, baseName, postId) {
+  for (let n = 1; n < 1000; n += 1) {
+    const name = n === 1 ? `${baseName}_${postId}` : `${baseName}_${postId}_${n}`;
+    const candidate = path.join(targetDir, name);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+  return path.join(targetDir, `${baseName}_${postId}_overflow`);
+}
+
 const MARKER = '.beav-post-id';
 
 function parseArgs(argv) {
@@ -298,15 +311,36 @@ if (args.mergeDirs && moves.length) {
     }
     try {
       fs.mkdirSync(mv.targetDir, { recursive: true });
-      fs.renameSync(mv.titleDir, mv.destDir);
+      // **执行时再算一次唯一落点**：规划是整批算的，而同一作者下「标题前 10 字相同」
+      // 的帖子很多（`【抖音独家】Anth…`、`Clau…`、`Deep…`），规划时这些目标目录都还
+      // 不存在，于是全算成同一个名字；执行到第二条就 ENOTEMPTY。
+      const dest = uniqueDestDir(mv.targetDir, mv.titleName, mv.postId);
+      if (fs.existsSync(dest)) {
+        // uniqueDestDir 只有在「目标已有同一帖子」时才会返回已存在路径
+        movedSkip += 1;
+        console.log(`  — 重复副本，跳过: ${mv.from}/${mv.titleName}`);
+        continue;
+      }
+      fs.renameSync(mv.titleDir, dest);
       touchedAuthorDirs.add(path.dirname(mv.titleDir));
       movedOk += 1;
-      const renamed = path.basename(mv.destDir) !== mv.titleName ? '  (重命名避让)' : '';
-      console.log(`  ✔ ${mv.from}/${mv.titleName} → ${mv.to}/${path.basename(mv.destDir)}${renamed}`);
+      const renamed = path.basename(dest) !== mv.titleName ? '  (重命名避让)' : '';
+      console.log(`  ✔ ${mv.from}/${mv.titleName} → ${mv.to}/${path.basename(dest)}${renamed}`);
     } catch (e) {
-      movedFail += 1;
-      console.log(`  ✘ 失败 ${mv.titleDir}`);
-      console.log(`     原因: ${e.message}`);
+      // ENOTEMPTY/EEXIST：目标在检查之后才被占用（大小写/Unicode 归一化、并发都可能）
+      // → 强制加 `_{postId}` 后缀重试一次，避免整条失败。
+      try {
+        const retryDest = forcedUniqueDir(mv.targetDir, mv.titleName, mv.postId);
+        fs.renameSync(mv.titleDir, retryDest);
+        touchedAuthorDirs.add(path.dirname(mv.titleDir));
+        movedOk += 1;
+        console.log(`  ✔ ${mv.from}/${mv.titleName} → ${mv.to}/${path.basename(retryDest)}  (重试避让)`);
+      } catch (retryError) {
+        movedFail += 1;
+        console.log(`  ✘ 失败 ${mv.titleDir}`);
+        console.log(`     原因: ${e.message}`);
+        console.log(`     重试仍失败: ${retryError.message}`);
+      }
     }
   }
 
