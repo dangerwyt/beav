@@ -2935,6 +2935,11 @@ async fn scrape_post_detail_once(
                 const isBili = /bilibili\.com/i.test(location.hostname);
                 const isXhs = !isBili && !!document.querySelector('#detail-title, .note-content, #detail-desc');
                 let title = '', content = '', author = '', date = '';
+                // `dateSrc` 是诊断字段，但要放在**外层**声明：它由各平台分支赋值、
+                // 在三平台共用的 return 里读取。之前误在抖音的 else 块里 `let`，
+                // 块结束就出作用域 → return 处 ReferenceError，把**所有平台**的
+                // 详情抓取一起弄挂了（表现为「抓正文失败: dateSrc is not defined」）。
+                let dateSrc = '';
                 let likes = 0, collects = 0, comments = 0;
                 let mediaType = 'image', cover = '';
                 const images = [];
@@ -3110,7 +3115,7 @@ async fn scrape_post_detail_once(
                     // 实测（2026-11）页面上渲染成 `<span data-e2e="detail-video-publish-time">
                     // 2026-09-18 19:42</span>`，class 是构建 hash（`AxYDNgtW`）不能依赖。
                     // `dateSrc` 仅作诊断：抓不到时能看出是「DOM/SSR 全失效」还是「压根没这字段」。
-                    let dateSrc = '';
+                    // 注意它已在函数外层声明，这里**不能再 let**（否则又回到块级作用域）。
                     date = txt('[data-e2e="detail-video-publish-time"]')
                         || txt('[data-e2e="video-publish-time"]') || txt('.video-publish-time')
                         || txt('[data-e2e="video-create-time"]') || txt('.create-time');
