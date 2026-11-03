@@ -3776,6 +3776,25 @@ fn strip_srt_timestamps(srt: &str) -> String {
 ///
 /// 视频本体需先经 `monitor:download-video` 落盘；转写需在设置里配置 transcription 服务，
 /// 未配置时 transcript 留空（不报错，仅跳过）。LLM 摘要（`summary`）暂未接入，可后续复用 deconstruct 链路。
+/// 抽帧结果能否直接复用（= 视频没变过）。
+///
+/// 判据：目录里已有帧，且最新一帧的时间不早于「视频下载完成时间」。
+/// `downloaded_at_secs == 0` 表示老数据没有该字段，此时只要目录里有帧就复用
+/// （没有更可靠的判据，重抽一次的代价远大于用旧帧的风险）。
+fn frames_are_reusable(
+    has_frames: bool,
+    latest_frame_secs: Option<i64>,
+    downloaded_at_secs: i64,
+) -> bool {
+    if !has_frames {
+        return false;
+    }
+    match latest_frame_secs {
+        Some(secs) => downloaded_at_secs == 0 || secs >= downloaded_at_secs,
+        None => false,
+    }
+}
+
 fn analyze_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
     let id = str_field(payload, "id").ok_or_else(|| "缺少 id".to_string())?;
     let record = with_store_mut(state, |store| {
@@ -3791,33 +3810,66 @@ fn analyze_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value) 
     let frames_dir = dir.join(&id).join("frames");
     std::fs::create_dir_all(&frames_dir).map_err(|e| format!("创建帧目录失败：{e}"))?;
 
-    // 抽帧：每 5s 一帧（客户需求：5 秒间隔、不限制张数，长视频按真实时长全量抽）
-    let ff = ffmpeg_program(Some(app))?;
-    let frame_pattern = frames_dir.join("frame_%03d.jpg").display().to_string();
-    let _ = Command::new(&ff)
-        .arg("-y")
-        .arg("-i")
-        .arg(&local_path)
-        .arg("-vf")
-        .arg("fps=1/5")
-        .arg(&frame_pattern)
-        .output();
+    let read_frames = || -> Vec<String> {
+        std::fs::read_dir(&frames_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| {
+                        let p = e.path();
+                        if p.extension().map(|x| x == "jpg").unwrap_or(false) {
+                            Some(p.display().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
 
-    let frames: Vec<String> = std::fs::read_dir(&frames_dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|e| {
-                    let p = e.path();
-                    if p.extension().map(|x| x == "jpg").unwrap_or(false) {
-                        Some(p.display().to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let existing_frames = read_frames();
+
+    // 帧还能不能直接复用：目录里有帧，且最新一帧不早于「视频下载完成时间」。
+    //
+    // 为什么要这个判断：抽帧是 `fps=1/5` 解全片，46 分钟的视频要抽 550 帧，
+    // 每次都重跑纯属白烧 CPU —— 尤其是「转写失败后点重新分析」这种场景，
+    // 本来只想重跑 ASR，却连抽帧一起重来。重新下载会刷新 video_downloaded_at，
+    // 旧帧自动失效、照常重抽，所以不需要额外的 force 开关。
+    let latest_frame_secs = existing_frames
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
+        .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .max();
+    let downloaded_at_secs = record.video_downloaded_at.map(|ms| ms / 1000).unwrap_or(0);
+    let video_exists = Path::new(&local_path).exists();
+    let frames_reusable = frames_are_reusable(
+        !existing_frames.is_empty(),
+        latest_frame_secs,
+        downloaded_at_secs,
+    );
+
+    let frames: Vec<String> = if frames_reusable {
+        existing_frames
+    } else if !video_exists {
+        // 分析完会 `delete_original_after_analysis` 删掉原片、只留代理，
+        // 而 video_local_path 仍指向已删的原片 —— 此时抽帧必然失败（且错误被
+        // `let _ =` 吞掉）。没有源文件就老老实实用现有帧，别做无用功。
+        existing_frames
+    } else {
+        let ff = ffmpeg_program(Some(app))?;
+        let frame_pattern = frames_dir.join("frame_%03d.jpg").display().to_string();
+        let _ = Command::new(&ff)
+            .arg("-y")
+            .arg("-i")
+            .arg(&local_path)
+            .arg("-vf")
+            .arg("fps=1/5")
+            .arg(&frame_pattern)
+            .output();
+        read_frames()
+    };
 
     // 语音转写：默认在抽帧后同步跑；`skipTranscript` 时为「只抽帧」模式（下载 worker 用），
     // 转写交给 `spawn_transcribe_workers` 的后置队列，避免 ASR 等待阻塞下载并行度。
@@ -6486,5 +6538,25 @@ mod tests {
             super::title_export_prefix("   ", super::EXPORT_TITLE_PREFIX_LEN),
             "未命名"
         );
+    }
+
+    /// 回归守卫：视频没变过就不要再抽帧。
+    ///
+    /// 抽帧是 `fps=1/5` 解全片，46 分钟的视频要抽 550 帧；重复点「分析视频」
+    /// 或转写失败后重试时，本来只想重跑 ASR，却每次都把整片重解一遍。
+    #[test]
+    fn frames_reusable_only_when_video_unchanged() {
+        // 没有帧 → 必须抽
+        assert!(!super::frames_are_reusable(false, Some(2_000), 1_000));
+        assert!(!super::frames_are_reusable(false, None, 1_000));
+        // 帧比视频下载时间新 → 复用
+        assert!(super::frames_are_reusable(true, Some(2_000), 1_000));
+        assert!(super::frames_are_reusable(true, Some(1_000), 1_000));
+        // 帧比视频旧 → 说明重新下载过，重抽
+        assert!(!super::frames_are_reusable(true, Some(999), 1_000));
+        // 老数据没有 video_downloaded_at → 有帧就复用
+        assert!(super::frames_are_reusable(true, Some(1), 0));
+        // 拿不到帧的 mtime → 不敢复用
+        assert!(!super::frames_are_reusable(true, None, 1_000));
     }
 }
