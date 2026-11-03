@@ -231,24 +231,29 @@ fs.writeFileSync(args.store, `${JSON.stringify(store, null, 2)}\n`, 'utf8');
 console.log(`已修正 ${fixed} 条帖子的 author`);
 
 /* ---------- 4. 真正移动目录 ---------- */
+let movedOk = 0;
+let movedSkip = 0;
+let movedFail = 0;
 if (args.mergeDirs && moves.length) {
-  let moved = 0;
   const touchedAuthorDirs = new Set();
   for (const mv of moves) {
     if (mv.conflict) {
-      console.log(`  跳过（目标已存在）: ${mv.destDir}`);
+      movedSkip += 1;
+      console.log(`  — 跳过（目标已存在）: ${mv.destDir}`);
       continue;
     }
     try {
       fs.mkdirSync(mv.targetDir, { recursive: true });
       fs.renameSync(mv.titleDir, mv.destDir);
       touchedAuthorDirs.add(path.dirname(mv.titleDir));
-      moved += 1;
+      movedOk += 1;
+      console.log(`  ✔ ${mv.from}/ → ${mv.to}/${path.basename(mv.titleDir)}`);
     } catch (e) {
-      console.log(`  移动失败 ${mv.titleDir}: ${e.message}`);
+      movedFail += 1;
+      console.log(`  ✘ 失败 ${mv.titleDir}`);
+      console.log(`     原因: ${e.message}`);
     }
   }
-  console.log(`已移动 ${moved} 个帖子目录`);
 
   // 清掉搬空的旧作者目录（只删空目录，且不碰导出根本身）
   let removed = 0;
@@ -260,15 +265,51 @@ if (args.mergeDirs && moves.length) {
       }
     } catch { /* 忽略 */ }
   }
-  console.log(`已清理 ${removed} 个空作者目录`);
+  console.log(`
+移动结果：成功 ${movedOk} · 冲突跳过 ${movedSkip} · 失败 ${movedFail} · 清理空目录 ${removed}`);
 }
 
-/* ---------- 5. 回读校验 ---------- */
+/* ---------- 5. 移动后重新扫一遍，确认真的归位 ---------- */
+if (args.mergeDirs && exportRoot && fs.existsSync(exportRoot)) {
+  const byId2 = new Map(posts.map((p) => [String(p.id), p]));
+  const expect2 = (post) => {
+    const wid = String(post.watchId ?? '').trim();
+    const w = wid ? watchById.get(wid) : null;
+    const name = String(w?.name ?? '').trim() || String(post.author ?? '').trim();
+    return sanitizeAuthorDir(name) || '未知作者';
+  };
+  const stillMisplaced = [];
+  const walk2 = (dir, depth) => {
+    if (depth > 6) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const ent of entries) {
+      const full = path.join(dir, ent.name);
+      if (ent.isFile() && ent.name === MARKER) {
+        let pid = '';
+        try { pid = fs.readFileSync(full, 'utf8').trim(); } catch { continue; }
+        const post = byId2.get(pid);
+        if (!post) continue;
+        const want = expect2(post);
+        const got = path.basename(path.dirname(dir));
+        if (got !== want) stillMisplaced.push(`${got}/ → ${want}/${path.basename(dir)}`);
+      } else if (ent.isDirectory()) walk2(full, depth + 1);
+    }
+  };
+  walk2(exportRoot, 0);
+  console.log(`
+=== 复核 === 仍错位 ${stillMisplaced.length} 个`);
+  stillMisplaced.slice(0, 5).forEach((s) => console.log(`  ${s}`));
+  if (stillMisplaced.length > 5) console.log(`  … 其余 ${stillMisplaced.length - 5} 个省略`);
+}
+
+/* ---------- 6. 回读校验（store 内 author 是否与 watch.name 一致）---------- */
 const check = JSON.parse(fs.readFileSync(args.store, 'utf8'));
-const stillBad = (check.monitored_posts ?? []).filter((p) => {
-  const wid = String(p.watch_id ?? '').trim();
+const stillBad = (check.monitoredPosts ?? []).filter((p) => {
+  const wid = String(p.watchId ?? '').trim();
   if (!wid) return false;
   const w = watchById.get(wid);
   return w && String(w.name ?? '').trim() && String(p.author ?? '').trim() !== String(w.name).trim();
 });
-console.log(`\n=== 回读校验 ===\n仍有不一致: ${stillBad.length} 条`);
+console.log(`
+=== 回读校验 === 仍有不一致: ${stillBad.length} 条`);
