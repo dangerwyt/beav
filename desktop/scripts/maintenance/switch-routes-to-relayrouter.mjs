@@ -15,7 +15,16 @@ import path from 'node:path';
 import { resolveStorePath } from './_store-path.mjs';
 
 /** scope -> [目标模型, 理由] */
+const CHAT_MODEL = 'deepseek-v4-flash-0731';
+
 const TARGETS = {
+  // chat 系列：**必须一起切**。服务器上桌面端带 BEAV_SKIP_OFFICIAL_LOGIN=1 启动，
+  // 官方源没有 token，留在 official 的话聊天/拆解/知识库全都会 401。
+  chat: [CHAT_MODEL, '主对话模型（拆解、摘要都走它）'],
+  knowledge: [CHAT_MODEL, '知识库问答'],
+  redclaw: [CHAT_MODEL, '内容创作 Agent'],
+  team: [CHAT_MODEL, '团队协作模式'],
+  wander: [CHAT_MODEL, '自动漫游/探索'],
   embedding: ['text-embedding-3-small', '同名模型，向量空间不变，无需重建索引'],
   image: ['gpt-image-2-c', '官方 gpt-image-2-cheap 的便宜档等价物（已实测通过）'],
   videoAnalysis: ['qwen3.8-omni-flash', '官方 qwen3.5-omni-flash 的升级版'],
@@ -44,11 +53,12 @@ const SKIP = {
 };
 
 function parseArgs(argv) {
-  const out = { apply: false, dryRun: false, store: '' };
+  const out = { apply: false, dryRun: false, ensureSource: false, store: '' };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--apply') out.apply = true;
     else if (a === '--dry-run') out.dryRun = true;
+    else if (a === '--ensure-source') out.ensureSource = true;
     else if (a === '--store') out.store = argv[++i];
   }
   return out;
@@ -56,7 +66,8 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2));
 if (!args.apply && !args.dryRun) {
-  console.error('用法: node scripts/maintenance/switch-routes-to-relayrouter.mjs --dry-run | --apply');
+  console.error('用法: node scripts/maintenance/switch-routes-to-relayrouter.mjs --dry-run | --apply [--ensure-source] [--store <路径>]');
+  console.error('  首次配置：RELAYROUTER_API_KEY=<key> ... --apply --ensure-source');
   process.exit(1);
 }
 const storeResolved = resolveStorePath(args.store);
@@ -76,9 +87,46 @@ const parseJson = (value) => (typeof value === 'string' ? JSON.parse(value) : va
 const routes = parseJson(settings.ai_model_routes_json) ?? {};
 const sources = parseJson(settings.ai_sources_json) ?? [];
 
+/**
+ * `--ensure-source`：没配过 RelayRouter 时顺手把源建出来（需要 RELAYROUTER_API_KEY）。
+ *
+ * 为什么放在脚本里：服务器上通常只有 SSH，去界面里点「添加供应商」很别扭；
+ * 而且切换路由本来就要先有源，两步合成一步少一次踩坑机会。
+ * Key 从环境变量读而不是命令行参数，避免留在 shell history / ps 输出里。
+ */
+let sourcesChanged = false;
+if (args.ensureSource) {
+  const apiKey = String(process.env.RELAYROUTER_API_KEY ?? '').trim();
+  const existing = sources.find((s) => String(s?.baseURL ?? '').toLowerCase().includes('relayrouter'));
+  if (!existing) {
+    if (!apiKey) {
+      console.error('缺少 RELAYROUTER_API_KEY 环境变量（新增源需要 API Key）');
+      console.error('用法：RELAYROUTER_API_KEY=<你的key> node scripts/maintenance/switch-routes-to-relayrouter.mjs --apply --ensure-source');
+      process.exit(1);
+    }
+    const created = {
+      id: 'relayrouter',
+      name: 'RelayRouter',
+      baseURL: 'https://api.relayrouter.ai/v1',
+      apiKey,
+      model: 'deepseek-v4-flash-0731',
+    };
+    sources.push(created);
+    sourcesChanged = true;
+    console.log(`将新增 AI 源：${created.name}（${created.baseURL}）`);
+  } else if (apiKey && apiKey !== existing.apiKey) {
+    existing.apiKey = apiKey;
+    sourcesChanged = true;
+    console.log('将更新 RelayRouter 的 API Key');
+  } else {
+    console.log('RelayRouter 源已存在，无需新增');
+  }
+}
+
 const relay = sources.find((s) => String(s?.baseURL ?? '').toLowerCase().includes('relayrouter'));
 if (!relay) {
   console.error('ai_sources_json 里找不到 RelayRouter 源');
+  console.error('先执行一次带 --ensure-source 并设置 RELAYROUTER_API_KEY，或在桌面端「设置 → AI 供应商」里添加。');
   process.exit(1);
 }
 const relayId = relay.id;
@@ -105,12 +153,13 @@ for (const [scope, why] of Object.entries(SKIP)) {
 }
 
 console.log(`\n共 ${changed.length} 项待改: ${changed.join(', ') || '无'}`);
+if (sourcesChanged) console.log('另需写入 ai_sources_json（新增/更新 RelayRouter 源）');
 
 if (args.dryRun) {
   console.log('\n[dry-run] 未写入');
   process.exit(0);
 }
-if (changed.length === 0) {
+if (changed.length === 0 && !sourcesChanged) {
   console.log('\n无需写入');
   process.exit(0);
 }
@@ -120,7 +169,8 @@ const backup = `${args.store}.bak-${stamp}`;
 fs.copyFileSync(args.store, backup);
 console.log(`\n已备份 -> ${backup}`);
 
-settings.ai_model_routes_json = JSON.stringify(routes);
+if (sourcesChanged) settings.ai_sources_json = JSON.stringify(sources);
+if (changed.length > 0) settings.ai_model_routes_json = JSON.stringify(routes);
 fs.writeFileSync(args.store, `${JSON.stringify(store, null, 2)}\n`, 'utf8');
 console.log(`已写入 ${args.store}`);
 
