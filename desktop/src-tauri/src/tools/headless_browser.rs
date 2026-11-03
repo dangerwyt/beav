@@ -3105,11 +3105,14 @@ async fn scrape_post_detail_once(
                     if (author && /^(我的|我的主页|首页|朋友|关注|推荐|搜索|消息|我|通知|私信|发布|登录|抖音|精选|商城|团购|直播)$/.test(author)) {
                         author = '';
                     }
-                    // 发布时间：现版抖音 DOM 已不再用 `video-create-time`/`.create-time`（恒空），
-                    // 改为多候选 + SSR `createTime` 兜底（见下方 formatDate）。
-                    // `dateSrc` 仅作诊断：抓不到时能一眼看出是「DOM/SSR 全失效」还是「压根没这字段」。
+                    // 发布时间：抖音新版把 data-e2e 从 `video-publish-time` 改成了
+                    // **`detail-video-publish-time`**（多一个 `detail-` 前缀），旧名字永远选不中。
+                    // 实测（2026-11）页面上渲染成 `<span data-e2e="detail-video-publish-time">
+                    // 2026-09-18 19:42</span>`，class 是构建 hash（`AxYDNgtW`）不能依赖。
+                    // `dateSrc` 仅作诊断：抓不到时能看出是「DOM/SSR 全失效」还是「压根没这字段」。
                     let dateSrc = '';
-                    date = txt('[data-e2e="video-publish-time"]') || txt('.video-publish-time')
+                    date = txt('[data-e2e="detail-video-publish-time"]')
+                        || txt('[data-e2e="video-publish-time"]') || txt('.video-publish-time')
                         || txt('[data-e2e="video-create-time"]') || txt('.create-time');
                     if (date) dateSrc = 'dom';
                     // 互动数：旧 `.count` / `.digg-count` 选择器在现版抖音 DOM 已失效（常全为 0）。
@@ -3223,13 +3226,15 @@ async fn scrape_post_detail_once(
                         }
                         if (createTs) { date = formatDate(createTs); dateSrc = 'ssr'; }
                     }
-                    // 发布时间最后兜底：页面可见文本里的独立 `YYYY-MM-DD`。
-                    // 只认完整年月日，绝不接受「3天前」这类相对日期——那会随时间腐坏，
-                    // 且解析不出年份时上层按「不早于下限」保留，宁可不填也不能填错。
+                    // 发布时间最后兜底：用「发布时间：」做锚点在整页文本里找。
+                    // 为什么不裸搜 `YYYY-MM-DD`：推荐位、评论区、章节时间戳里全是日期，
+                    // 随便抓一个很可能不是这条帖子的发布时间；而补历史会按
+                    // `published_before_cutoff` 把「年份早于下限」的帖子**直接删除**，
+                    // 抽错日期 = 静默丢数据。宁可留空（上层按「不早于下限」保留）。
+                    // 实测新版页面渲染成「举报发布时间：2026-09-18 19:42」。
                     if (!date) {
-                        const area = document.querySelector('[data-e2e="video-detail"], .video-info-detail, [data-e2e="video-info"]');
-                        const t = (area && area.textContent ? area.textContent : '').replace(/\s+/g, ' ');
-                        const m = t.match(/(?:^|[^\d])(20\d{2}-\d{2}-\d{2})(?![\d])/);
+                        const bodyText = (document.body.innerText || '').replace(/\s+/g, ' ');
+                        const m = bodyText.match(/发布时间[：:]\s*(20\d{2}-\d{2}-\d{2})/);
                         if (m) { date = m[1]; dateSrc = 'text'; }
                     }
                     // 抖音封面：video 的 poster、播放器占位图、og:image 兜底
