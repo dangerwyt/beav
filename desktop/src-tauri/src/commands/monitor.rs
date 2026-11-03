@@ -1061,7 +1061,16 @@ fn post_detail(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
                     if should_replace_content(&item.content, &content) {
                         item.content = content.clone();
                         item.excerpt = Some(content.chars().take(80).collect::<String>());
-                    }                }
+                    }
+                }
+                // 标题：列表页留下的脏标题（「播放量+文案+文案重复」）在这里纠正。
+                //
+                // 抖音列表页的 title 是拼接出来的，详情页抓到的文案是干净的，
+                // 所以用详情文案做真值来修；小红书 / B 站的 title 本来就是标题，
+                // 不满足「以数字开头」的条件，不会被改动。
+                if let Some(fixed_title) = corrected_title_from_detail(&item.title, &content) {
+                    item.title = fixed_title;
+                }
                 if let Some(mt) = detail
                     .get("mediaType")
                     .and_then(Value::as_str)
@@ -4245,6 +4254,116 @@ fn resolve_export_target(state: &State<'_, AppState>) -> Result<PathBuf, String>
 ///
 /// 返回（清洗后标题, 标签列表）。只有末尾形如 `#token`（token 内无空白）才会被剥离，
 /// 因此不会误伤正文中出现的 `#`。
+/// 用详情页抓到的干净文案纠正列表页留下的脏标题。
+///
+/// 背景：抖音**列表页**的 title 是「播放量 + 文案 + 文案重复一遍」拼出来的
+/// （`1.8万日本资产泡沫… 日本资产泡沫…`），而**详情页**抓到的 desc 是干净的
+/// （`日本资产泡沫…`）。`post_detail` 原本从不更新 title，于是脏标题永久留存，
+/// 只能靠事后清洗脚本回洗 —— 而新抓的帖子还会持续产生脏标题。
+///
+/// 规则（保守，宁可不改）：
+/// - 仅当**现有 title 以数字开头**（疑似播放量前缀）才考虑修正；
+/// - 详情文案里若**也出现**同一个数字（可隔 ≤4 个非数字字符）→
+///   说明那个数字属于文案（`4000亿…` / `30+亿…`），**不能剥**；
+/// - 详情文案里**没有**这个数字 → 它是列表页粘上来的播放量前缀，该剥；
+///   但剥掉后剩下的文案必须**出现在详情文案里**，否则说明判断错了，不改。
+///
+/// 详情文案里的「`第8集 | `」这类集数前缀会被剥掉：它属于正文编排，不属于标题。
+fn corrected_title_from_detail(list_title: &str, detail_text: &str) -> Option<String> {
+    let raw = list_title.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // 只处理「以数字开头」的疑似播放量前缀
+    let lead: String = raw.chars().take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '+').collect();
+    if lead.is_empty() {
+        return None;
+    }
+    // 剥掉数字（及其后的单位）后的剩余文案
+    let mut rest = raw[lead.len()..].trim_start();
+    for unit in ["万", "w", "W", "k", "K"] {
+        if let Some(stripped) = rest.strip_prefix(unit) {
+            rest = stripped.trim_start();
+            break;
+        }
+    }
+    if rest.len() < 6 {
+        return None;
+    }
+    // 详情文案（剥掉集数前缀）里若**也出现**同一个数字 → 那个数字属于文案
+    // （`4000亿…` / `30+亿…` / `2025车圈…`），不能剥。
+    let detail = strip_episode_prefix(detail_text);
+    if detail.is_empty() {
+        return None;
+    }
+    let digits: String = lead.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+    if digits.is_empty() {
+        return None;
+    }
+    if detail_contains_number_near(&detail, &digits) {
+        return None;
+    }
+    // 详情里**没有**这个数字 → 它是列表页粘上来的播放量前缀，该剥。
+    // 但剥掉后剩余文案必须**出现在详情里**，否则说明剥错了 → 不改。
+    if !detail.contains(rest) {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// 剥掉抖音文案开头的集数前缀：`第8集 | ` / `第 3 期｜` / `EP12 ` 等。
+fn strip_episode_prefix(raw: &str) -> String {
+    let text = raw.trim();
+    let bytes: Vec<char> = text.chars().collect();
+    // 「第 + 数字 + 集/期 + 可选分隔符」
+    if bytes.first().map(|c| *c == '第').unwrap_or(false) {
+        let mut idx = 1usize;
+        // 数字与「集/期」之间可能有空格：`第 3 期｜…`
+        while idx < bytes.len() && (bytes[idx].is_ascii_digit() || bytes[idx].is_whitespace()) {
+            idx += 1;
+        }
+        if idx > 1 && idx < bytes.len() && (bytes[idx] == '集' || bytes[idx] == '期') {
+            idx += 1;
+            // 跳过可选的分隔符与空白
+            while idx < bytes.len() && (bytes[idx].is_whitespace() || matches!(bytes[idx], '|' | '｜' | '·' | '・')) {
+                idx += 1;
+            }
+            return bytes[idx..].iter().collect::<String>().trim().to_string();
+        }
+    }
+    text.to_string()
+}
+
+/// 详情文案里是否「紧邻着」（可隔 ≤4 个非数字字符）出现指定数字。
+fn detail_contains_number_near(detail: &str, digits: &str) -> bool {
+    if digits.is_empty() {
+        return false;
+    }
+    let chars: Vec<char> = detail.chars().collect();
+    let dchars: Vec<char> = digits.chars().collect();
+    if dchars.len() > chars.len() {
+        return false;
+    }
+    for start in 0..=chars.len().saturating_sub(dchars.len()) {
+        // 前面最多允许 4 个非数字字符
+        let mut back = 0usize;
+        while back <= 4 && start > back {
+            let c = chars[start - back - 1];
+            if c.is_ascii_digit() {
+                break;
+            }
+            back += 1;
+        }
+        if back > 4 {
+            continue;
+        }
+        if chars[start..start + dchars.len()] == dchars[..] {
+            return true;
+        }
+    }
+    false
+}
+
 fn split_title_tags(raw: &str) -> (String, Vec<String>) {
     let mut tags: Vec<String> = Vec::new();
     let mut head = raw.trim().to_string();
@@ -6572,6 +6691,67 @@ mod tests {
         assert!(super::frames_are_reusable(true, Some(1), 0));
         // 拿不到帧的 mtime → 不敢复用
         assert!(!super::frames_are_reusable(true, None, 1_000));
+    }
+
+    /// 回归守卫：详情抓取时用干净文案纠正列表页的脏标题。
+    ///
+    /// 实测：抖音列表页 title = 「播放量 + 文案 + 文案重复」，
+    /// 详情页 desc 是干净的。修不好就只能靠事后清洗脚本回洗，新数据还会持续变脏。
+    #[test]
+    fn corrected_title_strips_play_count_prefix_only_when_detail_agrees() {
+        // 典型场景：列表脏、详情干净 → 剥掉播放量前缀
+        assert_eq!(
+            super::corrected_title_from_detail(
+                "1.8万日本资产泡沫，哪哪都是泡泡~ #财经 #日本经济",
+                "日本资产泡沫，哪哪都是泡泡~ #财经 #日本经济"
+            )
+            .as_deref(),
+            Some("日本资产泡沫，哪哪都是泡泡~ #财经 #日本经济")
+        );
+        // 详情带集数前缀，剥集数后仍应识别为「数字属于文案」→ 不改
+        assert_eq!(
+            super::corrected_title_from_detail(
+                "30+亿美元！新加坡史上最大洗钱案 #洗钱罪",
+                "第8集 | 30+亿美元！新加坡史上最大洗钱案 #洗钱罪"
+            ),
+            None
+        );
+        // 标题不以数字开头（小红书/B 站的正常标题）→ 不动
+        assert_eq!(
+            super::corrected_title_from_detail(
+                "10年没涨价的洗衣液，究竟藏了什么猫腻？ #洗衣液",
+                "10年没涨价的洗衣液，究竟藏了什么猫腻？ #洗衣液"
+            ),
+            None
+        );
+        // 详情里没有这个数字 → 说明它不是播放量前缀，只是标题内容 → 不动
+        assert_eq!(
+            super::corrected_title_from_detail(
+                "4000亿家电一哥，如何转型？ #原来家还可以这样",
+                "4000亿家电一哥，如何转型？ #原来家还可以这样"
+            ),
+            None
+        );
+        // 剥掉后剩余文案不在详情里 → 判断不可靠 → 不动
+        assert_eq!(
+            super::corrected_title_from_detail(
+                "1.8万完全不相干的文案 #话题",
+                "另一篇完全无关的正文内容"
+            ),
+            None
+        );
+    }
+
+    /// 回归守卫：集数前缀剥离。
+    #[test]
+    fn strip_episode_prefix_handles_common_forms() {
+        assert_eq!(super::strip_episode_prefix("第8集 | 30+亿美元！"), "30+亿美元！");
+        assert_eq!(super::strip_episode_prefix("第 3 期｜真实标题"), "真实标题");
+        assert_eq!(super::strip_episode_prefix("第8集真实标题"), "真实标题");
+        // 不是集数前缀 → 原样返回
+        assert_eq!(super::strip_episode_prefix("日本资产泡沫"), "日本资产泡沫");
+        assert_eq!(super::strip_episode_prefix("第8"), "第8");
+        assert_eq!(super::strip_episode_prefix(""), "");
     }
 
     /// 回归守卫：正文覆盖要按「脏/净」而不只是长度。
