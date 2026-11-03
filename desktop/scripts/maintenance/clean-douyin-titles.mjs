@@ -18,8 +18,9 @@
  *   node scripts/maintenance/clean-douyin-titles.mjs --store "D:/path/beav-state.json" --dry-run
  */
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 
 import { resolveStorePath, describeStorePath } from './_store-path.mjs';
 
@@ -53,16 +54,35 @@ function dedupeTail(s) {
   return s;
 }
 
-export function cleanTitle(raw) {
+export function cleanTitle(raw, content = '') {
   let t = String(raw ?? '').replace(/\s+/g, ' ').trim();
   if (!t) return '';
   t = t.replace(LEAD_PIN, '');
   const m = t.match(LEAD_NUM);
   if (m) {
     const rest = t.slice(m[0].length).trim();
-    const digitLen = m[0].replace(/[^\d]/g, '').length;
-    const blocked = STRONG_UNIT.test(rest) || (WEAK_UNIT.test(rest) && digitLen <= 2);
-    if (rest.length >= 6 && !blocked) t = rest;
+    // digitLen = 数字的**整数位数**（小数点不算一位）。
+    // 原来用 `replace(/[^\d]/g,'')` 会把 `1.8万` 算成 "18" → 2 位，
+    // 于是 `1.8万日本资产泡沫…` 被当成「1.8 日…」的弱量词而 protected，
+    // 播放量前缀反而剥不掉。正确口径：`1.8万` → 1 位，`4000亿` → 4 位。
+    const digitLen = (m[0].match(/\d+/g) || ['']).join('').length;
+    const unitBlocked = STRONG_UNIT.test(rest) || (WEAK_UNIT.test(rest) && digitLen <= 2);
+    // 有正文时，正文才是地面真值，**以正文为准**：
+    //   正文里也有这个数字 → 数字是标题的一部分（`4000亿…` / `2025车圈…`），不能剥；
+    //   正文里没有         → 它才是播放量前缀（`1.8万…`），该剥。
+    // 不用正文时，才退回「量词启发式」——但那个启发式会把「日本资产泡沫」的
+    // 「日」当成日期量词（`1.8万` 数字位数为 1 ≤ 2），误伤率不低。
+    const body = String(content ?? '').replace(/\s+/g, ' ').trim();
+    const digitsOf = (s) => String(s || '').replace(/[^\d.]/g, '').replace(/\.+$/, '');
+    const digits = digitsOf(m[0]);
+    const bodyDigits = digitsOf((body.match(/^\D{0,8}(\d[\d.]*\+?\s*[万wWkK]?)/) || [])[1] || '');
+    const digitsInBody = digits !== '' && bodyDigits !== '' && bodyDigits === digits;
+    const shouldStrip = body
+      ? !digitsInBody
+      : !unitBlocked;
+    if (rest.length >= 6 && shouldStrip) {
+      t = rest;
+    }
   }
   return dedupeTail(t).trim();
 }
@@ -88,11 +108,39 @@ function selfTest() {
     ['弱量词保护(短数字)', '3天速成语文阅读理解', '3天速成语文阅读理解'],
     ['相似但不重复', '今天讲语文课的重点 今天讲数学课的难点', '今天讲语文课的重点 今天讲数学课的难点'],
     ['空白归一', '  多余的   空白   ', '多余的 空白'],
+    // —— 下面这些是实测踩到的：数字是标题的一部分，不能当播放量剥掉 ——
+    [
+      '数字+亿(标题的一部分)',
+      '4000亿家电一哥，如何转型？ #原来家还可以这样',
+      '4000亿家电一哥，如何转型？ #原来家还可以这样',
+      '4000亿家电一哥，如何转型？ #原来家还可以这样',   // content 也以 4000 开头
+    ],
+    [
+      '年份+车圈(标题的一部分)',
+      '2025车圈快速洗牌，老牌豪车如何接招~ #沃尔沃全新XC90',
+      '2025车圈快速洗牌，老牌豪车如何接招~ #沃尔沃全新XC90',
+      '2025车圈快速洗牌，老牌豪车如何接招~ #沃尔沃全新XC90',
+    ],
+    [
+      '播放量前缀(正文没有该数字)',
+      '1.8万日本资产泡沫，哪哪都是泡泡~ #财经 #日本经济',
+      '日本资产泡沫，哪哪都是泡泡~ #财经 #日本经济',
+      '日本资产泡沫，哪哪都是泡泡~ #财经 #日本经济',
+    ],
+    [
+      '正文带集数前缀仍算同一数字',
+      '667大家能对出下联吗？ @赵镭老师 #语文',
+      '大家能对出下联吗？ @赵镭老师 #语文',
+      '大家能对出下联吗？ @赵镭老师 #语文',
+    ],
   ];
 
   let failed = 0;
-  for (const [name, input, expected] of cases) {
-    const actual = cleanTitle(input);
+  for (const caseData of cases) {
+    const [name, input, expected] = caseData;
+    // 用例格式：[名, 输入, 期望, content?] —— content 在索引 3（可选）
+    const content = caseData.length > 3 ? caseData[3] : '';
+    const actual = cleanTitle(input, content);
     if (actual !== expected) {
       failed += 1;
       console.error(`✗ ${name}\n  期望: ${expected}\n  实际: ${actual}`);
@@ -122,7 +170,7 @@ function main() {
   for (const p of posts) {
     if ((p.platform ?? '') !== 'douyin') continue;
     const oldTitle = p.title ?? '';
-    const next = cleanTitle(oldTitle);
+    const next = cleanTitle(oldTitle, p.content ?? '');
     if (next && next !== oldTitle) {
       p.title = next;
       changed += 1;
@@ -165,4 +213,10 @@ function main() {
   console.log(`\n已写入；备份: ${backup}`);
 }
 
-main();
+// 仅在**直接执行**时跑 main —— 被 import 时（做单测 / 复用 cleanTitle）
+// 不能触发写盘，否则一次 `import` 就会把 store 改掉。
+const isDirectRun = process.argv[1]
+  && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isDirectRun) {
+  main();
+}
