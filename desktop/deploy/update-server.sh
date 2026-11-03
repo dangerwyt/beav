@@ -57,6 +57,18 @@ http_code() {
   [ -n "$out" ] && echo "$out" || echo "000"
 }
 
+# 轮询等到 200 或超时（秒）。刚 bootstrap 的桌面端要初始化 store / 拉起 Chrome，
+# 比 kickstart 慢，固定 sleep 3 会把「还没起来」误判成「起不来」。
+wait_http() {
+  local url="$1" timeout="$2" deadline=$(( $(date +%s) + timeout )) code="000"
+  while :; do
+    code="$(http_code "$url" 5)"
+    [ "$code" = "200" ] && { echo 200; return 0; }
+    [ "$(date +%s)" -ge "$deadline" ] && { echo "$code"; return 1; }
+    sleep 2
+  done
+}
+
 # 文件最后修改时间（unix 秒）；不存在返回 0
 # GNU stat 用 -c %Y，BSD(macOS) 用 -f %m —— 两者语法不同且**都会成功返回**，
 # 所以不能靠退出码判断，必须校验输出是不是纯数字。
@@ -318,14 +330,31 @@ for label in "$LABEL_DESKTOP" "$LABEL_WEB"; do
     log "重启 $label …"
     launchctl kickstart -k "gui/$UID_NUM/$label" || warn "$label 重启失败"
   else
-    warn "$label 未加载（首次部署请执行：bash deploy/install-macos-services.sh）"
+    # 未加载最常见的原因不是「没装过」，而是改 store 前 `launchctl bootout` 停过、
+    # 之后忘了 bootstrap —— 只提示「去跑 install」会让人以为是首次部署，白折腾。
+    # plist 在就直接装回来（bootstrap 会按 RunAtLoad 立即启动）。
+    plist="$HOME/Library/LaunchAgents/$label.plist"
+    if [ -f "$plist" ]; then
+      log "$label 未加载，按 $plist 重新 bootstrap …"
+      if ! launchctl bootstrap "gui/$UID_NUM" "$plist"; then
+        # macOS 上残留的服务条目会让 bootstrap 报 `5: Input/output error`，
+        # 先 bootout 清干净再装一次。
+        warn "$label bootstrap 失败，清理残留后重试 …"
+        launchctl bootout "gui/$UID_NUM/$label" >/dev/null 2>&1 || true
+        sleep 1
+        launchctl bootstrap "gui/$UID_NUM" "$plist" || warn "$label 仍然 bootstrap 失败，请手动检查 $plist"
+      fi
+    else
+      warn "$label 未加载且找不到 $plist（首次部署请执行：bash deploy/install-macos-services.sh）"
+    fi
   fi
 done
 
 # ---------- 5. 健康检查 ----------
-sleep 3
-daemon_code="$(http_code http://127.0.0.1:31937/api/ipc/health 8)"
-web_code="$(http_code http://127.0.0.1:8090/login 8)"
+sleep 2
+log "等待 daemon / web 就绪（最多 40s）…"
+daemon_code="$(wait_http http://127.0.0.1:31937/api/ipc/health 40)"
+web_code="$(wait_http http://127.0.0.1:8090/login 40)"
 
 if [ "$daemon_code" = "200" ] && [ "$web_code" = "200" ]; then
   log "更新完成 ✅ daemon=$daemon_code web=$web_code"
