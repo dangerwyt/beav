@@ -21,17 +21,14 @@ import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
-const DEFAULT_STORE =
-  process.platform === 'win32'
-    ? join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'Beav', 'beav-state.json')
-    : join(homedir(), 'Library', 'Application Support', 'Beav', 'beav-state.json');
+import { resolveStorePath, describeStorePath } from './_store-path.mjs';
 
 function arg(name, fallback = null) {
   const i = process.argv.indexOf(`--${name}`);
   return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 }
 
-const storePath = arg('store', DEFAULT_STORE);
+const storePath = resolveStorePath(arg('store', '')).file;
 const dryRun = process.argv.includes('--dry-run');
 
 const STRONG_UNIT = /^[个种条步招篇次位项]/;

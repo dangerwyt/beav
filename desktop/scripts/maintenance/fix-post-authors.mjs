@@ -16,17 +16,13 @@
  * 判定规则：帖子有 watch_id 且该 watch 仍存在 → 作者应为 watch.name（列表抓取阶段写入的权威值）。
  */
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-
-const DEFAULT_STORE = process.platform === 'win32'
-  ? path.join(process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming'), 'Beav', 'beav-state.json')
-  : path.join(os.homedir(), 'Library', 'Application Support', 'Beav', 'beav-state.json');
+import { resolveStorePath } from './_store-path.mjs';
 
 const MARKER = '.beav-post-id';
 
 function parseArgs(argv) {
-  const out = { apply: false, dryRun: false, mergeDirs: false, store: DEFAULT_STORE, exportRoot: '' };
+  const out = { apply: false, dryRun: false, mergeDirs: false, store: '', exportRoot: '' };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--apply') out.apply = true;
@@ -43,14 +39,22 @@ if (!args.apply && !args.dryRun) {
   console.error('用法: node scripts/maintenance/fix-post-authors.mjs --dry-run | --apply [--merge-dirs]');
   process.exit(1);
 }
+
+const resolved = resolveStorePath(args.store);
+args.store = resolved.file;
 if (!fs.existsSync(args.store)) {
-  console.error(`store 不存在: ${args.store}`);
+  console.error(`store 不存在: ${args.store}（来源: ${resolved.from}）`);
+  console.error('若数据在别处，用 --store <路径> 指定，或设置 BEAV_STORE_DIR。');
   process.exit(1);
 }
+const stat = fs.statSync(args.store);
+console.log(`store: ${args.store}`);
+console.log(`      来源=${resolved.from} · ${(stat.size / 1024 / 1024).toFixed(2)} MB · 修改于 ${stat.mtime.toISOString()}`);
+console.log('');
 
 const store = JSON.parse(fs.readFileSync(args.store, 'utf8'));
-const posts = Array.isArray(store.monitored_posts) ? store.monitored_posts : [];
-const watches = Array.isArray(store.competitor_watchlist) ? store.competitor_watchlist : [];
+const posts = Array.isArray(store.monitoredPosts) ? store.monitoredPosts : [];
+const watches = Array.isArray(store.competitorWatchlist) ? store.competitorWatchlist : [];
 const watchById = new Map(watches.map((w) => [w.id, w]));
 
 console.log(`帖子 ${posts.length} 条 · 监控项 ${watches.length} 个`);
@@ -60,7 +64,7 @@ const candidates = [];
 const skipped = { noWatchField: 0, watchGone: 0, emptyWatchName: 0 };
 
 for (const post of posts) {
-  const watchId = String(post.watch_id ?? '').trim();
+  const watchId = String(post.watchId ?? '').trim();
   if (!watchId) { skipped.noWatchField += 1; continue; }
   const watch = watchById.get(watchId);
   if (!watch) { skipped.watchGone += 1; continue; }
@@ -70,7 +74,7 @@ for (const post of posts) {
   if (current === target) continue;
   candidates.push({
     postId: post.id,
-    postUrl: post.post_url,
+    postUrl: post.postUrl,
     platform: post.platform,
     from: current || '(空)',
     to: target,
@@ -101,17 +105,37 @@ if (candidates.length) {
 
 /* ---------- 2. 合并裂开的导出目录 ---------- */
 let moves = [];
-let exportRoot = args.exportRoot.trim();
-if (!exportRoot) exportRoot = String(store.monitor_export_root ?? '').trim();
-if (!exportRoot) exportRoot = String(process.env.BEAV_EXPORT_ROOT ?? '').trim();
+
+/**
+ * 导出根解析，顺序对齐 Rust 的 `resolve_export_target`：
+ * `--export-root` → `BEAV_EXPORT_ROOT` → `settings.monitor_export_root` → `settings.workspace_dir`。
+ * 最后那条是兜底工作区（未单独设置导出根时，产物就落在工作区里）。
+ */
+function resolveExportRoot() {
+  const explicit = String(args.exportRoot ?? '').trim();
+  if (explicit) return { dir: explicit, from: '--export-root' };
+  const envRoot = String(process.env.BEAV_EXPORT_ROOT ?? '').trim();
+  if (envRoot) return { dir: envRoot, from: 'BEAV_EXPORT_ROOT' };
+  const settings = store.settings ?? {};
+  const configured = String(store.monitorExportRoot ?? '').trim();
+  if (configured) return { dir: configured, from: 'store.monitorExportRoot' };
+  const workspace = String(settings.workspace_dir ?? '').trim();
+  if (workspace) return { dir: workspace, from: 'settings.workspace_dir' };
+  return { dir: '', from: '' };
+}
+
+const exportResolved = resolveExportRoot();
+let exportRoot = exportResolved.dir;
 
 if (args.mergeDirs) {
   if (!exportRoot) {
-    console.log('\n[merge-dirs] 未提供导出根（--export-root / store.monitor_export_root / BEAV_EXPORT_ROOT 都为空），跳过目录合并');
+    console.log('\n[merge-dirs] 未找到导出根，跳过目录合并');
+    console.log('  候选都为空：--export-root / BEAV_EXPORT_ROOT / store.monitorExportRoot / settings.workspace_dir');
+    console.log('  可到应用「设置 → 通用」看当前工作目录，再用 --export-root 指定。');
   } else if (!fs.existsSync(exportRoot)) {
-    console.log(`\n[merge-dirs] 导出根不存在，跳过: ${exportRoot}`);
+    console.log(`\n[merge-dirs] 导出根不存在（来源: ${exportResolved.from}），跳过: ${exportRoot}`);
   } else {
-    console.log(`\n=== 扫描导出目录 ===\n根: ${exportRoot}`);
+    console.log(`\n=== 扫描导出目录 ===\n根: ${exportRoot}（来源: ${exportResolved.from}）`);
     // 用 postId → 目标作者 建立映射，避免依赖平台中文名 / 日期格式
     const todoByPostId = new Map(candidates.map((c) => [c.postId, c]));
     const markers = [];

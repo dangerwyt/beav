@@ -12,10 +12,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-
-const DEFAULT_STORE = process.platform === 'win32'
-  ? path.join(process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming'), 'Beav', 'beav-state.json')
-  : path.join(os.homedir(), 'Library', 'Application Support', 'Beav', 'beav-state.json');
+import { resolveStorePath } from './_store-path.mjs';
 
 /** scope -> [目标模型, 理由] */
 const TARGETS = {
@@ -47,7 +44,7 @@ const SKIP = {
 };
 
 function parseArgs(argv) {
-  const out = { apply: false, dryRun: false, store: DEFAULT_STORE };
+  const out = { apply: false, dryRun: false, store: '' };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--apply') out.apply = true;
@@ -62,10 +59,14 @@ if (!args.apply && !args.dryRun) {
   console.error('用法: node scripts/maintenance/switch-routes-to-relayrouter.mjs --dry-run | --apply');
   process.exit(1);
 }
+const storeResolved = resolveStorePath(args.store);
+args.store = storeResolved.file;
 if (!fs.existsSync(args.store)) {
-  console.error(`store 不存在: ${args.store}`);
+  console.error(`store 不存在: ${args.store}（来源: ${storeResolved.from}）`);
+  console.error('若数据在别处，用 --store <路径> 指定，或设置 BEAV_STORE_DIR。');
   process.exit(1);
 }
+console.log(`store: ${args.store}（来源: ${storeResolved.from}）`);
 
 const store = JSON.parse(fs.readFileSync(args.store, 'utf8'));
 store.settings = store.settings ?? {};

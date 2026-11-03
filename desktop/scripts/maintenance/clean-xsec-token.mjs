@@ -28,10 +28,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-const DEFAULT_STORE =
-  process.platform === 'win32'
-    ? join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'Beav', 'beav-state.json')
-    : join(homedir(), 'Library', 'Application Support', 'Beav', 'beav-state.json');
+import { resolveStorePath, describeStorePath } from './_store-path.mjs';
 
 const STRIP_PARAMS = new Set(['xsec_token', 'xsec_source', 'modal_id']);
 
@@ -54,7 +51,7 @@ function stripSessionParams(url) {
   return kept.length ? `${base}?${kept.join('&')}` : base;
 }
 
-const storePath = arg('store', DEFAULT_STORE);
+const storePath = resolveStorePath(arg('store', '')).file;
 const dryRun = process.argv.includes('--dry-run');
 
 function main() {

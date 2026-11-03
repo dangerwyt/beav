@@ -25,10 +25,7 @@ import { spawnSync } from 'node:child_process';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-const DEFAULT_STORE =
-  process.platform === 'win32'
-    ? join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'Beav', 'beav-state.json')
-    : join(homedir(), 'Library', 'Application Support', 'Beav', 'beav-state.json');
+import { resolveStorePath, describeStorePath } from './_store-path.mjs';
 
 const SUFFIX = process.platform === 'win32' ? '.exe' : '';
 const TRIPLE =
@@ -44,7 +41,7 @@ function arg(name, fallback = null) {
   return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 }
 
-const storePath = arg('store', DEFAULT_STORE);
+const storePath = resolveStorePath(arg('store', '')).file;
 const ffprobe = arg('ffprobe', DEFAULT_FFPROBE);
 const dryRun = process.argv.includes('--dry-run');
 

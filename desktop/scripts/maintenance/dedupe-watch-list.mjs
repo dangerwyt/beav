@@ -25,17 +25,14 @@ import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-const DEFAULT_STORE =
-  process.platform === 'win32'
-    ? join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'Beav', 'beav-state.json')
-    : join(homedir(), 'Library', 'Application Support', 'Beav', 'beav-state.json');
+import { resolveStorePath, describeStorePath } from './_store-path.mjs';
 
 function arg(name, fallback = null) {
   const i = process.argv.indexOf(`--${name}`);
   return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 }
 
-const storePath = arg('store', DEFAULT_STORE);
+const storePath = resolveStorePath(arg('store', '')).file;
 const dryRun = !process.argv.includes('--merge');
 
 /** 与 Rust 侧 `watch_dedupe_key` 保持一致：owner + 平台 + 归一化主页 URL。 */
