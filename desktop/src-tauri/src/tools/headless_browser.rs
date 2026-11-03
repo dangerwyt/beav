@@ -3119,7 +3119,14 @@ async fn scrape_post_detail_once(
                     date = txt('[data-e2e="detail-video-publish-time"]')
                         || txt('[data-e2e="video-publish-time"]') || txt('.video-publish-time')
                         || txt('[data-e2e="video-create-time"]') || txt('.create-time');
-                    if (date) dateSrc = 'dom';
+                    if (date) {
+                        // 该 span 的 textContent 是「发布时间：2025-09-19 17:30」这种带前缀的整串，
+                        // 只保留日期(可选时分)。匹配不到就置空 —— 宁可不填，也不能把
+                        // 「发布时间：」这种噪音写进 published_at（会污染前端展示与年份解析）。
+                        const dm = String(date).match(/(20\d{2}-\d{2}-\d{2})(?:\s+\d{1,2}:\d{2})?/);
+                        date = dm ? dm[0] : '';
+                        if (date) dateSrc = 'dom';
+                    }
                     // 互动数：旧 `.count` / `.digg-count` 选择器在现版抖音 DOM 已失效（常全为 0）。
                     // 三道兜底：① 动作按钮包裹节点文本（图标是 svg，text≈计数）；
                     // ② 更宽的 data-e2e 候选（feed-* 命名）；③ __INITIAL_STATE__ / _ROUTER_DATA。

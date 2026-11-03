@@ -214,6 +214,36 @@ const PROBE = String.raw`(() => {
   const bodyYmd = (document.body.innerText.match(/(?:^|[^\d])(20\d{2}-\d{2}-\d{2})(?![\d])/) || [])[1] || '';
   const bodyMd = (document.body.innerText.match(/(?:^|[^\d])(\d{1,2}-\d{1,2})(?![\d])/) || [])[1] || '';
 
+  // 顺带定位正文：抖音的 data-e2e="video-desc" 同样失效了（正文只剩标题那么长），
+  // 这里找含 #话题 的文本节点，看文案现在挂在哪个容器上。
+  const descHits = [];
+  try {
+    const walker2 = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let n2;
+    let budget2 = 30000;
+    while ((n2 = walker2.nextNode()) && budget2-- > 0) {
+      const t = (n2.nodeValue || '').trim();
+      if (t.length < 12 || !/#/.test(t)) continue;
+      const el = n2.parentElement;
+      if (!el) continue;
+      const chain2 = [];
+      let c2 = el;
+      for (let i = 0; i < 4 && c2; i += 1) {
+        chain2.push(c2.tagName.toLowerCase() + (c2.className ? '.' + String(c2.className).split(/\s+/).slice(0, 2).join('.') : ''));
+        c2 = c2.parentElement;
+      }
+      descHits.push({
+        len: t.length,
+        head: t.slice(0, 50),
+        tag: el.tagName.toLowerCase(),
+        cls: String(el.className || '').slice(0, 100),
+        dataE2e: (el.getAttribute && el.getAttribute('data-e2e')) || '',
+        chain: chain2,
+      });
+      if (descHits.length >= 6) break;
+    }
+  } catch (e) { descHits.push({ error: String(e) }); }
+
   return JSON.stringify({
     url: location.href,
     vid,
@@ -234,6 +264,7 @@ const PROBE = String.raw`(() => {
     },
     areaTextSample: areaText,
     dateHits,
+    descHits,
     bodyHasYmd: bodyYmd,
     bodyHasMd: bodyMd,
     looksLikeLoginWall: /扫码登录|登录后查看|验证|安全验证/.test(document.body.innerText.slice(0, 800)),
