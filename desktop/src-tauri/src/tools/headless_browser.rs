@@ -3035,15 +3035,25 @@ async fn scrape_post_detail_once(
                     } catch (e) {}
                 } else {
                     mediaType = 'video'; // 抖音详情页是视频平台
-                    // 文案容器：新版 `[data-e2e="video-desc"]` 已失效，改用
-                    // **`[data-e2e="detail-video-info"]`**（实测能拿到完整文案，
-                    // 比 h1 标题完整得多）。它的 textContent 前面带折叠按钮的
-                    // 「展开」二字，需要剥掉。
-                    // 不能靠「页面里含 # 的最长文本块」兜底：推荐位的视频文案
-                    // 同样是一大段 hashtag，会抓成别人的内容。
-                    const descRaw = txt('[data-e2e="video-desc"]')
-                        || txt('[data-e2e="detail-video-info"]')
-                        || txt('.video-info-detail');
+                    // 文案：新版 `[data-e2e="video-desc"]` 已失效，可用的是
+                    // **`[data-e2e="detail-video-info"]`** —— 但它是「整个信息区」，
+                    // 直接取 textContent 会把互动数与时间一起抓进来：
+                    //   "… #德国7.0万20492712969举报发布时间：2025-09-19 17:30"
+                    // 它的子元素里，文案节点不含「举报 / 发布时间」字样，且是最长的那个；
+                    // 文案本身前面还带折叠按钮的「展开」二字，要剥掉。
+                    // 不能用「全页含 # 的最长文本块」兜底：推荐位的视频文案同样是
+                    // 一大段 hashtag，会抓成别人的内容。
+                    const infoEl = document.querySelector('[data-e2e="detail-video-info"]');
+                    let descRaw = txt('[data-e2e="video-desc"]');
+                    if (!descRaw && infoEl) {
+                        const kids = Array.from(infoEl.children).filter((k) => {
+                            const t = (k.textContent || '').trim();
+                            return t && !/举报|发布时间/.test(t);
+                        });
+                        kids.sort((a, b) => (b.textContent || '').length - (a.textContent || '').length);
+                        descRaw = kids.length ? (kids[0].textContent || '').trim() : '';
+                    }
+                    if (!descRaw) descRaw = txt('.video-info-detail');
                     const desc = descRaw.replace(/^展开\s*/, '').trim();
                     title = desc || txt('h1');
                     content = title;

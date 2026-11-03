@@ -261,6 +261,41 @@ const PROBE = String.raw`(() => {
   } catch (e) { e2eMap.__error = { len: 0, head: String(e) }; }
   const e2eValues = Object.keys(e2eMap).sort();
 
+  // detail-video-info 是「整个信息区」（文案 + 播放量 + 举报 + 发布时间），
+  // 直接取 textContent 会掺进一堆噪音。把它往下两层的结构打出来，
+  // 好定位「只含文案」的那个子节点。
+  const infoTree = (() => {
+    const root = document.querySelector('[data-e2e="detail-video-info"]');
+    if (!root) return null;
+    const dump = (el, depth) => Array.from(el.children).map((c) => ({
+      d: depth,
+      tag: c.tagName.toLowerCase(),
+      cls: String(c.className || '').slice(0, 70),
+      e2e: (c.getAttribute && c.getAttribute('data-e2e')) || '',
+      len: (c.textContent || '').trim().length,
+      head: (c.textContent || '').trim().slice(0, 45),
+      kids: depth < 2 ? dump(c, depth + 1) : [],
+    }));
+    return dump(root, 1);
+  })();
+
+  // 复刻「新提取逻辑」的结果，确认能拿到干净文案：
+  // detail-video-info 的子元素里，文案节点不含「举报 / 发布时间」字样。
+  const appContent = (() => {
+    const infoEl = document.querySelector('[data-e2e="detail-video-info"]');
+    let raw = txt('[data-e2e="video-desc"]');
+    if (!raw && infoEl) {
+      const kids = Array.from(infoEl.children).filter((k) => {
+        const t = (k.textContent || '').trim();
+        return t && !/举报|发布时间/.test(t);
+      });
+      kids.sort((a, b) => (b.textContent || '').length - (a.textContent || '').length);
+      raw = kids.length ? (kids[0].textContent || '').trim() : '';
+    }
+    if (!raw) raw = txt('.video-info-detail');
+    return raw.replace(/^展开\s*/, '').trim();
+  })();
+
   return JSON.stringify({
     url: location.href,
     vid,
@@ -282,6 +317,9 @@ const PROBE = String.raw`(() => {
     areaTextSample: areaText,
     dateHits,
     descHits,
+    appContentLen: appContent.length,
+    appContent,
+    infoTree,
     e2eValues,
     e2eMap,
     bodyHasYmd: bodyYmd,
