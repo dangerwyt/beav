@@ -244,6 +244,23 @@ const PROBE = String.raw`(() => {
     }
   } catch (e) { descHits.push({ error: String(e) }); }
 
+  // 列出页面上所有 data-e2e 值 —— 抖音改版常只是换个前缀（发布时间就是从
+  // video-publish-time 变成 detail-video-publish-time），把现有钩子全列出来
+  // 比猜名字快得多。
+  const e2eMap = {};
+  try {
+    document.querySelectorAll('[data-e2e]').forEach((el) => {
+      const k = el.getAttribute('data-e2e');
+      if (!k) return;
+      const t = (el.textContent || '').trim();
+      const prev = e2eMap[k];
+      if (!prev || t.length > prev.len) {
+        e2eMap[k] = { len: t.length, head: t.slice(0, 40) };
+      }
+    });
+  } catch (e) { e2eMap.__error = { len: 0, head: String(e) }; }
+  const e2eValues = Object.keys(e2eMap).sort();
+
   return JSON.stringify({
     url: location.href,
     vid,
@@ -265,6 +282,8 @@ const PROBE = String.raw`(() => {
     areaTextSample: areaText,
     dateHits,
     descHits,
+    e2eValues,
+    e2eMap,
     bodyHasYmd: bodyYmd,
     bodyHasMd: bodyMd,
     looksLikeLoginWall: /扫码登录|登录后查看|验证|安全验证/.test(document.body.innerText.slice(0, 800)),

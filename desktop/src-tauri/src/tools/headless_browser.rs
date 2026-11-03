@@ -3035,7 +3035,17 @@ async fn scrape_post_detail_once(
                     } catch (e) {}
                 } else {
                     mediaType = 'video'; // 抖音详情页是视频平台
-                    title = txt('[data-e2e="video-desc"]') || txt('.video-info-detail') || txt('h1');
+                    // 文案容器：新版 `[data-e2e="video-desc"]` 已失效，改用
+                    // **`[data-e2e="detail-video-info"]`**（实测能拿到完整文案，
+                    // 比 h1 标题完整得多）。它的 textContent 前面带折叠按钮的
+                    // 「展开」二字，需要剥掉。
+                    // 不能靠「页面里含 # 的最长文本块」兜底：推荐位的视频文案
+                    // 同样是一大段 hashtag，会抓成别人的内容。
+                    const descRaw = txt('[data-e2e="video-desc"]')
+                        || txt('[data-e2e="detail-video-info"]')
+                        || txt('.video-info-detail');
+                    const desc = descRaw.replace(/^展开\s*/, '').trim();
+                    title = desc || txt('h1');
                     content = title;
                     // 作者昵称：**优先级** SSR(author.nickname) → 详情页限定作用域的 DOM → 裸选择器。
                     // 之前把 `a[href*="/user/"] span` 放进裸候选，会命中外层导航「我的」，导致作者变成「我的」。
