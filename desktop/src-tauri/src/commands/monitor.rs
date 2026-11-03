@@ -1046,8 +1046,18 @@ fn post_detail(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
                     return Err("动态不存在".to_string());
                 };
                 if fetched {
-                    item.content = content.clone();
-                    item.excerpt = Some(content.chars().take(80).collect::<String>());
+                    // **只在「新抓到的正文不比旧的短」时才覆盖**。
+                    //
+                    // 平台改版后提取器可能只拿得到标题级文本（抖音的
+                    // `[data-e2e="video-desc"]` 已失效，正文会退化成标题，几十个字符）。
+                    // 若无条件覆盖，任何一次「重新抓正文」/批量补字段都会把已经存好的
+                    // 完整正文冲成标题 —— 而拆解、摘要都依赖全文，等于静默毁数据。
+                    //
+                    // 用字符数比较：抓不到更全的就保留旧的（宁可内容旧，不可内容空）。
+                    if content.chars().count() >= item.content.chars().count() {
+                        item.content = content.clone();
+                        item.excerpt = Some(content.chars().take(80).collect::<String>());
+                    }
                 }
                 if let Some(mt) = detail
                     .get("mediaType")
