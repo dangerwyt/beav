@@ -325,28 +325,33 @@ if [ "$NO_RESTART" = "1" ]; then
   exit 0
 fi
 
+# 重启 = bootout + bootstrap，**不用 `kickstart -k`**。
+# `kickstart -k` 发 SIGTERM 后不等旧进程真正退出就拉新实例，node 还没释放监听端口就会
+# `EADDRINUSE 0.0.0.0:8090` → 新进程立刻崩 → KeepAlive 5s 后又重启 → 日志被刷满，
+# 表面看是「更新完没起来」。bootout 是同步卸载，能确保端口已释放再装回。
 for label in "$LABEL_DESKTOP" "$LABEL_WEB"; do
+  plist="$HOME/Library/LaunchAgents/$label.plist"
+  if [ ! -f "$plist" ]; then
+    warn "$label 找不到 $plist（首次部署请执行：bash deploy/install-macos-services.sh）"
+    continue
+  fi
+
   if service_loaded "$label"; then
-    log "重启 $label …"
-    launchctl kickstart -k "gui/$UID_NUM/$label" || warn "$label 重启失败"
+    log "重启 $label（bootout → bootstrap）…"
+    launchctl bootout "gui/$UID_NUM/$label" >/dev/null 2>&1 || true
+    # bootout 同步返回，但 TCP 监听释放仍有毫秒级延迟；web 的 8090 最容易撞
+    sleep 1
   else
-    # 未加载最常见的原因不是「没装过」，而是改 store 前 `launchctl bootout` 停过、
-    # 之后忘了 bootstrap —— 只提示「去跑 install」会让人以为是首次部署，白折腾。
-    # plist 在就直接装回来（bootstrap 会按 RunAtLoad 立即启动）。
-    plist="$HOME/Library/LaunchAgents/$label.plist"
-    if [ -f "$plist" ]; then
-      log "$label 未加载，按 $plist 重新 bootstrap …"
-      if ! launchctl bootstrap "gui/$UID_NUM" "$plist"; then
-        # macOS 上残留的服务条目会让 bootstrap 报 `5: Input/output error`，
-        # 先 bootout 清干净再装一次。
-        warn "$label bootstrap 失败，清理残留后重试 …"
-        launchctl bootout "gui/$UID_NUM/$label" >/dev/null 2>&1 || true
-        sleep 1
-        launchctl bootstrap "gui/$UID_NUM" "$plist" || warn "$label 仍然 bootstrap 失败，请手动检查 $plist"
-      fi
-    else
-      warn "$label 未加载且找不到 $plist（首次部署请执行：bash deploy/install-macos-services.sh）"
-    fi
+    # 未加载最常见的原因不是「没装过」，而是改 store 前 bootout 停过、之后忘了装回来。
+    log "$label 未加载，直接 bootstrap …"
+  fi
+
+  if ! launchctl bootstrap "gui/$UID_NUM" "$plist"; then
+    # macOS 上残留的服务条目会让 bootstrap 报 `5: Input/output error`
+    warn "$label bootstrap 失败，清理残留后重试 …"
+    launchctl bootout "gui/$UID_NUM/$label" >/dev/null 2>&1 || true
+    sleep 1
+    launchctl bootstrap "gui/$UID_NUM" "$plist" || warn "$label 仍然 bootstrap 失败，请手动检查 $plist"
   fi
 done
 
