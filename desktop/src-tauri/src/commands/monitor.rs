@@ -1053,12 +1053,15 @@ fn post_detail(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
                     // 若无条件覆盖，任何一次「重新抓正文」/批量补字段都会把已经存好的
                     // 完整正文冲成标题 —— 而拆解、摘要都依赖全文，等于静默毁数据。
                     //
-                    // 用字符数比较：抓不到更全的就保留旧的（宁可内容旧，不可内容空）。
-                    if content.chars().count() >= item.content.chars().count() {
+                    // 例外：旧内容是**脏数据**时必须允许用更短的新内容覆盖。
+                    // 抖音那版坏提取抓出来的是「…3.6万举报发布时间：2025-09-19 17:30」，
+                    // 比干净文案还长（71 vs 48），光比长度会把垃圾一直锁在库里。
+                    // 旧的更脏就让位（哪怕更短），否则要求新内容不短于旧的。
+                    // 判据见 should_replace_content 的注释。
+                    if should_replace_content(&item.content, &content) {
                         item.content = content.clone();
                         item.excerpt = Some(content.chars().take(80).collect::<String>());
-                    }
-                }
+                    }                }
                 if let Some(mt) = detail
                     .get("mediaType")
                     .and_then(Value::as_str)
@@ -3793,6 +3796,17 @@ fn frames_are_reusable(
         Some(secs) => downloaded_at_secs == 0 || secs >= downloaded_at_secs,
         None => false,
     }
+}
+
+/// 新抓到的正文能否覆盖旧正文。
+///
+/// - 旧内容是**脏数据**（含「举报发布时间」这类界面噪音）→ 无条件覆盖，
+///   哪怕新内容更短。否则垃圾因为"更长"会一直锁在库里（71 字噪音 vs 48 字干净文案）。
+/// - 否则要求新内容不短于旧内容：平台改版后提取器可能只拿得到标题级文本，
+///   无条件覆盖会把已存好的完整正文冲成标题，而拆解/摘要依赖全文。
+fn should_replace_content(old: &str, new: &str) -> bool {
+    let old_is_noisy = old.contains("举报发布时间") || old.contains("举报\n发布时间");
+    old_is_noisy || new.chars().count() >= old.chars().count()
 }
 
 fn analyze_video(app: &AppHandle, state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
@@ -6558,5 +6572,25 @@ mod tests {
         assert!(super::frames_are_reusable(true, Some(1), 0));
         // 拿不到帧的 mtime → 不敢复用
         assert!(!super::frames_are_reusable(true, None, 1_000));
+    }
+
+    /// 回归守卫：正文覆盖要按「脏/净」而不只是长度。
+    ///
+    /// 实测事故：抖音坏提取抓出的噪音版 71 字比干净文案 48 字长，
+    /// 只比长度会让垃圾永久锁在库里，重新抓多少次都不生效。
+    #[test]
+    fn content_replace_prefers_clean_over_longer_noisy() {
+        let noisy = "在慕尼黑宫殿参加了一场闭门会议... #德国7.0万20492712969举报发布时间：2025-09-19 17:30";
+        let clean = "世界500强CFO纯干货分享 零基础看懂财报——利润表#财务 #会计 #财务报表 #职场 #财报";
+        // 旧的脏 → 允许用更短的干净版覆盖（核心回归）
+        assert!(super::should_replace_content(noisy, clean));
+        // 旧的干净、旧更长 → 不覆盖（防止被标题级内容冲掉）
+        assert!(!super::should_replace_content(clean, "世界500强CFO"));
+        // 旧的干净、新不短 → 覆盖
+        assert!(super::should_replace_content(clean, &format!("{clean}补充")));
+        // 等长 → 覆盖（视为刷新）
+        assert!(super::should_replace_content(clean, clean));
+        // 旧为空 → 覆盖
+        assert!(super::should_replace_content("", "任意内容"));
     }
 }
