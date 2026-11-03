@@ -23,7 +23,8 @@ import { resolveStorePath } from './_store-path.mjs';
  * 复刻 Rust `sanitize_fs_name()` + 导出时的 32 字符截断，用来和磁盘上的作者目录名比对。
  * 不这么做的话，作者名里含非法字符或被截断时永远对不上，会反复计划移动同一个目录。
  */
-function sanitizeAuthorDir(name) {
+/** 复刻 Rust `sanitize_fs_name()`：非法字符/控制字符换 `_`，压缩连续下划线，trim 首尾下划线。不截断。 */
+function sanitizeFsName(name) {
   const ILLEGAL = new Set(['\\', '/', ':', '*', '?', '"', '<', '>', '|']);
   let out = Array.from(String(name ?? ''))
     .map((c) => {
@@ -32,8 +33,32 @@ function sanitizeAuthorDir(name) {
     })
     .join('');
   while (out.includes('__')) out = out.split('__').join('_');
-  out = out.trim().replace(/^_+|_+$/g, '');
-  return Array.from(out).slice(0, 32).join('');
+  return out.trim().replace(/^_+|_+$/g, '');
+}
+
+function sanitizeAuthorDir(name) {
+  // 导出侧的作者目录名会截断到 32 字符（见 monitor.rs 的导出路径构造）
+  return Array.from(sanitizeFsName(name)).slice(0, 32).join('');
+}
+
+/** 文件夹重命名取标题前多少个字符：中文 3 字节/字，40 字约 120 字节，远低于单段 255 字节上限。 */
+const RENAME_TITLE_MAX = 40;
+
+/** 从产物目录里的 `帖子信息.json` 读完整标题（导出时写的，含原始 title，不截断）。 */
+function readExportedTitle(titleDir) {
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(titleDir, '帖子信息.json'), 'utf8'));
+    return String(meta?.title ?? '').trim();
+  } catch {
+    return '';
+  }
+}
+
+/** 由标题算新的目录名；空标题回退「未命名」。 */
+function dirNameFromTitle(title) {
+  const safe = sanitizeFsName(title);
+  if (!safe) return '未命名';
+  return Array.from(safe).slice(0, RENAME_TITLE_MAX).join('');
 }
 
 /** 在 dir 的直接子目录里找「`.beav-post-id` 等于 postId」的那个目录。 */
@@ -73,6 +98,27 @@ function uniqueDestDir(targetDir, baseName, postId) {
 }
 
 /**
+ * 同级目录内的唯一名字（用于重命名，**不按 postId 找已有目录**）。
+ *
+ * 不能复用 uniqueDestDir：它优先返回「已存在且属于同一 postId 的目录」，
+ * 而重命名场景里那个目录正是源目录自己，会算成「改到原名」这种空操作。
+ *
+ * 大小写按小写比较：macOS/Windows 默认大小写不敏感，只差大小写也算重名。
+ */
+function uniqueNameInDir(parent, want, currentName) {
+  if (want === currentName) return path.join(parent, currentName);
+  let entries = [];
+  try { entries = fs.readdirSync(parent); } catch { /* 目录不可读时按不冲突处理 */ }
+  const taken = new Set(entries.map((n) => n.toLowerCase()));
+  if (!taken.has(want.toLowerCase())) return path.join(parent, want);
+  for (let n = 2; n < 1000; n += 1) {
+    const candidate = `${want}_${n}`;
+    if (!taken.has(candidate.toLowerCase())) return path.join(parent, candidate);
+  }
+  return path.join(parent, `${want}_${Date.now()}`);
+}
+
+/**
  * 强制加 `_{postId}` 后缀的唯一落点（忽略原标题名能否直接用）。
  * 用于 rename 报 ENOTEMPTY/EEXIST 后的重试。
  */
@@ -88,12 +134,13 @@ function forcedUniqueDir(targetDir, baseName, postId) {
 const MARKER = '.beav-post-id';
 
 function parseArgs(argv) {
-  const out = { apply: false, dryRun: false, mergeDirs: false, store: '', exportRoot: '' };
+  const out = { apply: false, dryRun: false, mergeDirs: false, renameDirs: false, store: '', exportRoot: '' };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--apply') out.apply = true;
     else if (a === '--dry-run') out.dryRun = true;
     else if (a === '--merge-dirs') out.mergeDirs = true;
+    else if (a === '--rename-dirs') out.renameDirs = true;
     else if (a === '--store') out.store = argv[++i];
     else if (a === '--export-root') out.exportRoot = argv[++i];
   }
@@ -102,7 +149,9 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2));
 if (!args.apply && !args.dryRun) {
-  console.error('用法: node scripts/maintenance/fix-post-authors.mjs --dry-run | --apply [--merge-dirs]');
+  console.error(
+    '用法: node scripts/maintenance/fix-post-authors.mjs --dry-run|--apply [--merge-dirs] [--rename-dirs]',
+  );
   process.exit(1);
 }
 
@@ -270,13 +319,68 @@ if (args.mergeDirs) {
   }
 }
 
+/* ---------- 2.5 按 帖子信息.json 的 title 重命名产物目录（计划）---------- */
+let renames = [];
+const vaultRoot = String(store.monitorObsidianVault ?? '').trim();
+const vaultUsable = Boolean(vaultRoot) && fs.existsSync(vaultRoot);
+
+if (args.renameDirs) {
+  if (!exportRoot || !fs.existsSync(exportRoot)) {
+    console.log('\n[rename-dirs] 未找到导出根，跳过重命名');
+  } else {
+    console.log(`\n=== 扫描待重命名目录 ===\n根: ${exportRoot}`);
+    if (vaultUsable) {
+      console.log(`Obsidian 库: ${vaultRoot} —— hub 笔记会同步改名并替换路径`);
+    } else {
+      console.log('未配置有效 Obsidian 库，只重命名产物目录（knowledge.md 用的是裸文件名，不受影响）');
+    }
+
+    const renameTargets = [];
+    const walkRename = (dir, depth) => {
+      if (depth > 6) return;
+      let entries;
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      for (const ent of entries) {
+        const full = path.join(dir, ent.name);
+        if (ent.isFile() && ent.name === MARKER) renameTargets.push(dir);
+        else if (ent.isDirectory()) walkRename(full, depth + 1);
+      }
+    };
+    walkRename(exportRoot, 0);
+
+    let noMeta = 0;
+    let alreadySame = 0;
+    for (const dir of renameTargets) {
+      const title = readExportedTitle(dir);
+      if (!title) { noMeta += 1; continue; }
+      const want = dirNameFromTitle(title);
+      const cur = path.basename(dir);
+      if (want === cur) { alreadySame += 1; continue; }
+      let postId = '';
+      try { postId = fs.readFileSync(path.join(dir, MARKER), 'utf8').trim(); } catch { /* 忽略 */ }
+      const parent = path.dirname(dir);
+      const dest = uniqueNameInDir(parent, want, cur);
+      renames.push({ titleDir: dir, dest, parent, want, cur, postId });
+    }
+
+    if (noMeta) console.log(`  跳过 ${noMeta} 个没有 帖子信息.json 的目录`);
+    if (alreadySame) console.log(`  已经是目标名 ${alreadySame} 个`);
+    console.log(`\n需要重命名 ${renames.length} 个目录`);
+    for (const r of renames.slice(0, 20)) {
+      console.log(`  ${r.cur}`);
+      console.log(`    → ${path.basename(r.dest)}`);
+    }
+    if (renames.length > 20) console.log(`  … 其余 ${renames.length - 20} 个省略`);
+  }
+}
+
 /* ---------- 3. 写入 ---------- */
 if (args.dryRun) {
   console.log('\n[dry-run] 未写入任何文件');
   process.exit(0);
 }
 
-if (!candidates.length && !moves.length) {
+if (!candidates.length && !moves.length && !renames.length) {
   console.log('\n无需改动');
   process.exit(0);
 }
@@ -355,6 +459,48 @@ if (args.mergeDirs && moves.length) {
     } catch { /* 忽略 */ }
   }
   console.log(`\n移动结果：成功 ${movedOk} · 重复副本 ${movedSkip} · 失败 ${movedFail} · 清理空目录 ${removed}`);
+}
+
+/* ---------- 4.5 执行重命名 ---------- */
+if (args.renameDirs && renames.length) {
+  let renamedOk = 0;
+  let renamedFail = 0;
+  for (const r of renames) {
+    try {
+      // 同样在执行时重算落点：同批次可能有两条帖子的 title 完全一致
+      const dest = uniqueNameInDir(r.parent, r.want, r.cur);
+      fs.renameSync(r.titleDir, dest);
+      renamedOk += 1;
+      console.log(`  ✔ ${r.cur} → ${path.basename(dest)}`);
+
+      // Obsidian hub 同步：hub 目录名含标题，笔记里的 ![[...]] 又是库内完整路径，两者都要跟着改
+      if (vaultUsable) {
+        const rel = path.relative(exportRoot, r.titleDir);
+        const newRel = path.join(path.dirname(rel), path.basename(dest));
+        const oldHub = path.join(vaultRoot, 'Beav导出', rel);
+        const newHub = path.join(vaultRoot, 'Beav导出', newRel);
+        if (fs.existsSync(oldHub)) {
+          try {
+            fs.mkdirSync(path.dirname(newHub), { recursive: true });
+            if (!fs.existsSync(newHub)) fs.renameSync(oldHub, newHub);
+            const note = path.join(newHub, 'knowledge.md');
+            if (fs.existsSync(note)) {
+              const before = fs.readFileSync(note, 'utf8');
+              const after = before.split(`/${r.cur}/`).join(`/${path.basename(dest)}/`);
+              if (after !== before) fs.writeFileSync(note, after, 'utf8');
+            }
+          } catch (hubError) {
+            console.log(`     ⚠ hub 同步失败（产物目录已改名）: ${hubError.message}`);
+          }
+        }
+      }
+    } catch (e) {
+      renamedFail += 1;
+      console.log(`  ✘ 重命名失败 ${r.titleDir}`);
+      console.log(`     原因: ${e.message}`);
+    }
+  }
+  console.log(`\n重命名结果：成功 ${renamedOk} · 失败 ${renamedFail}`);
 }
 
 /* ---------- 5. 移动后重新扫一遍，确认真的归位 ---------- */
