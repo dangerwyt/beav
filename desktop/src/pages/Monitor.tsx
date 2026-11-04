@@ -6,7 +6,6 @@ import { clsx } from 'clsx';
 import type { MonitorChromeStatus, MonitorChromeLaunchResult, MonitorChromeTestResult } from '../bridge/domains/monitorBridge';
 import { resolveAssetUrl } from '../utils/pathManager';
 import { appConfirm } from '../utils/appDialogs';
-import { normalizePostBody } from '../utils/postBody';
 import { CDP_PLATFORMS, PLATFORM_HOME, PLATFORMS, type CdpPlatform } from '../constants/platforms';
 import { APP_BRAND } from '../config/brand';
 
@@ -2901,17 +2900,14 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 </div>
               )}
 
-              {detailPost.content ? (
-                <p className="text-sm text-text-secondary whitespace-pre-line leading-relaxed">
-                  {normalizePostBody(detailPost.content)}
+              {/* 详情弹窗不再展示正文：长文案（尤其抖音那种硬换行）在这里只是噪音，
+                  拆解 / 转写 / 分析都直接读 store 里的 content，不依赖这段展示。
+                  仅在没抓到正文时给一句提示，避免用户以为「点进来什么都没有」。 */}
+              {!detailPost.content && !detailLoading && (
+                <p className="text-xs text-text-tertiary">
+                  暂无本地正文
+                  {detailPost.excerpt ? `：${detailPost.excerpt}` : '（点「重新抓正文」可补）'}
                 </p>
-              ) : (
-                !detailLoading && (
-                  <p className="text-xs text-text-tertiary">
-                    暂无本地正文
-                    {detailPost.excerpt ? `：${detailPost.excerpt}` : ''}
-                  </p>
-                )
               )}
 
               {detailImages.length > 0 && (

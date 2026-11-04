@@ -53,20 +53,21 @@ const SKIP = {
 };
 
 function parseArgs(argv) {
-  const out = { apply: false, dryRun: false, ensureSource: false, store: '' };
+  const out = { apply: false, dryRun: false, ensureSource: false, status: false, store: '' };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--apply') out.apply = true;
     else if (a === '--dry-run') out.dryRun = true;
     else if (a === '--ensure-source') out.ensureSource = true;
+    else if (a === '--status') out.status = true;
     else if (a === '--store') out.store = argv[++i];
   }
   return out;
 }
 
 const args = parseArgs(process.argv.slice(2));
-if (!args.apply && !args.dryRun) {
-  console.error('用法: node scripts/maintenance/switch-routes-to-relayrouter.mjs --dry-run | --apply [--ensure-source] [--store <路径>]');
+if (!args.apply && !args.dryRun && !args.status) {
+  console.error('用法: node scripts/maintenance/switch-routes-to-relayrouter.mjs --status | --dry-run | --apply [--ensure-source] [--store <路径>]');
   console.error('  首次配置：RELAYROUTER_API_KEY=<key> ... --apply --ensure-source');
   process.exit(1);
 }
@@ -86,6 +87,45 @@ const settings = store.settings;
 const parseJson = (value) => (typeof value === 'string' ? JSON.parse(value) : value);
 const routes = parseJson(settings.ai_model_routes_json) ?? {};
 const sources = parseJson(settings.ai_sources_json) ?? [];
+
+/**
+ * `--status`：只读体检——把每个 scope 实际会打的「源 / 地址 / 模型 / key 是否配了」打出来。
+ *
+ * 为什么需要：拆解、聊天、知识库报 `HTTP 401 Authentication required` 时，第一嫌疑是
+ * 该 scope 的路由还挂在 official（服务器带 BEAV_SKIP_OFFICIAL_LOGIN=1 启动，官方源没有
+ * token → 必然 401），第二嫌疑是源在但 key 空。这两种在界面上都不容易看出来。
+ */
+if (args.status) {
+  console.log(`\n源（${sources.length} 个）：`);
+  for (const s of sources) {
+    const key = String(s?.apiKey ?? '').trim();
+    console.log(
+      `  - ${String(s?.id ?? '?').padEnd(18)} ${String(s?.name ?? '').padEnd(14)} ` +
+        `${String(s?.baseURL ?? '').padEnd(34)} model=${String(s?.model ?? '-').padEnd(26)} ` +
+        `key=${key ? `已配置(${key.length}位, …${key.slice(-4)})` : '❌ 缺失'}`,
+    );
+  }
+
+  const scopes = [...Object.keys(TARGETS), ...Object.keys(SKIP), 'transcription', 'video'];
+  console.log('\n路由：');
+  for (const scope of scopes) {
+    const r = routes[scope] ?? {};
+    const src = sources.find((s) => String(s?.id ?? '') === String(r.sourceId ?? ''));
+    const key = String(src?.apiKey ?? '').trim();
+    let flag = '';
+    if (!r.mode) flag = '（未设置 → 跟随默认源）';
+    else if (r.mode !== 'custom') flag = '⚠ 非 custom（official 源在跳过登录时会 401）';
+    else if (!src) flag = '⚠ sourceId 指向的源不存在';
+    else if (!key) flag = '⚠ 源缺少 API Key';
+    console.log(
+      `  ${scope.padEnd(15)} mode=${String(r.mode ?? '-').padEnd(9)} ` +
+        `model=${String(r.model ?? '-').padEnd(26)} source=${src ? src.name : String(r.sourceId ?? '-')} ${flag}`,
+    );
+  }
+  console.log(`\ndefault_ai_source_id = ${settings.default_ai_source_id ?? '(空)'}`);
+  console.log('api_endpoint = ' + String(settings.api_endpoint ?? '(空)'));
+  process.exit(0);
+}
 
 /**
  * `--ensure-source`：没配过 RelayRouter 时顺手把源建出来（需要 RELAYROUTER_API_KEY）。
