@@ -252,6 +252,31 @@ const platformLabel = (code: string): string => {
 };
 
 /**
+ * 把正文里的「软换行」折叠掉，只保留空行分段。
+ *
+ * 抖音 / 小红书文案常按手机屏宽硬换行（每 20 字左右一个 \n），直接 `pre-wrap` 渲染
+ * 会在详情里出现锯齿状的短行（一列 20 字、忽长忽短）。但完全去掉 `pre-wrap` 又会把
+ * 分段一起吃光，整段糊成一坨。所以先按段落预处理：段内单换行合并（中文直接相连，
+ * 西文补一个空格），段间（连续空行）保留，再用普通折行渲染。
+ */
+const normalizePostBody = (text: string): string => {
+  const isCjk = (ch: string) => /[\u2e80-\u9fff\uff00-\uffef]/.test(ch);
+  return String(text || '')
+    .replace(/\r\n?/g, '\n')
+    .split(/\n{2,}/)
+    .map((para) => {
+      const lines = para.split('\n').map((line) => line.trim()).filter(Boolean);
+      return lines.reduce((acc, line) => {
+        if (!acc) return line;
+        const needSpace = !isCjk(acc.slice(-1)) && !isCjk(line[0]);
+        return acc + (needSpace ? ' ' : '') + line;
+      }, '');
+    })
+    .filter(Boolean)
+    .join('\n\n');
+};
+
+/**
  * 时间戳 → `YYYY-MM-DD HH:mm`。
  *
  * 全局统一这一种写法：左栏「上次抓取」、卡片「抓取」、视频「分析于 / 下载于」、
@@ -2901,8 +2926,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               )}
 
               {detailPost.content ? (
-                <p className="text-sm text-text-secondary whitespace-pre-wrap leading-relaxed">
-                  {detailPost.content}
+                <p className="text-sm text-text-secondary whitespace-pre-line leading-relaxed">
+                  {normalizePostBody(detailPost.content)}
                 </p>
               ) : (
                 !detailLoading && (
