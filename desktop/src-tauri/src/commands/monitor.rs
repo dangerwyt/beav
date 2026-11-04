@@ -4032,14 +4032,14 @@ fn transcribe_video_only(
 /// —— 帖子最终产物导出（5 级目录分类）——
 ///
 /// 把一篇帖子的「最终产物」按知识库根目录落盘为物理文件夹树：
-///   知识库根 / 平台(抖音) / 日期(YYYYMMDD) / 作者 / 标题前10字[+帖子ID] / 具体内容文件
+///   知识库根 / 平台(抖音) / 日期(YYYYMMDD) / 作者 / 标题前40字[+帖子ID] / 具体内容文件
 /// 触发：视频帖 `analyze_video` 完成后、转写补齐(`transcribe_video_only`)后、以及
 ///       图文/视频帖 `deconstruct` 完成后自动导出；也可经 `monitor:export-post` 手动触发
 ///       （便于导出未拆解的图文帖）。
 /// 内容为：原图(`images`)、抽帧图(`frames`)、正文、转写全文、转写时间轴(SRT)、
 ///         视频摘要、爆文拆解(六要素 JSON+MD)、帖子信息(JSON 溯源)。
-/// 设计为幂等：重复导出只覆盖/补齐，不会重复造目录；标题前 10 字撞名时追加帖子 ID
-/// （通过 `.beav-post-id` 标记文件识别「自己的」目录，避免重导出时产生孤儿目录）。
+/// 设计为幂等：重复导出只覆盖/补齐，不会重复造目录；标题前 40 字撞名时追加帖子 ID
+/// （通过 `.beav-post-id` 标记文件识别「自己的」目录，跨日期也能找回，避免重导出时产生重复目录）。
 
 /// 中文平台名（知识库一级目录用）。
 fn platform_label(platform: &str) -> String {
@@ -4091,18 +4091,23 @@ fn sanitize_fs_name(s: &str) -> String {
     out.trim().trim_matches('_').to_string()
 }
 
-/// 标题前 `n` 个字符（按 Unicode 字符计）作为四级目录名；空标题回退「未命名」。
-/// 导出四级目录取标题前多少个字符。
+/// 导出四级目录取标题前多少个字符（按 Unicode 字符计，空标题回退「未命名」）。
 ///
-/// 原来写死 10，在中文场景下明显不够：`【抖音独家】` 这类栏目前缀就占 6 个字符，
-/// 剩 4 个只能装下 `Open`，于是 `【抖音独家】OpenAI Images 2.5 重磅发布` 与
+/// 历史：最早写死 10 —— 中文场景下明显不够，`【抖音独家】` 这类栏目前缀就占 6 个字符，
+/// 剩 4 个只装得下 `Open`，于是 `【抖音独家】OpenAI Images 2.5 重磅发布` 与
 /// `【抖音独家】OpenAI 为何紧急暂停 Astra 测试？` 会撞成同一个目录名，
 /// 后者只能靠 `_{postId}` 后缀区分，目录树可读性很差。
-/// 20 个字符足以覆盖到真正的区分点，同时离文件系统单段 255 字节的上限还很远。
 ///
-/// 注意：只影响**此后首次导出**的帖子；已导出的目录靠 `.beav-post-id` 复用
-/// （见 `find_own_export_dir`），不会被改名，所以老数据不会出现新旧两份。
-const EXPORT_TITLE_PREFIX_LEN: usize = 20;
+/// 之后调到 20 缓解了碰撞，但实测仍然会切在词中间
+/// （`【抖音独家】别再被骗了！AI根本没有在思`），Finder / Spotlight 里都难辨认。
+/// 现在取 40：存量老数据本来就是 40 字上下的完整句式，新数据保持同一风格；
+/// 40 个汉字 = 120 字节，离文件系统单段 255 字节上限仍很远。
+/// 真撞了还有 `_{postId}` 后缀兜底（见 `try_export_post_product`）。
+///
+/// 注意：**会**影响已导出的目录 —— 复用旧目录时按当前前缀就地改名
+/// （`try_export_post_product` 的 rename 分支），调这个值等于一次惰性重命名：
+/// 只在该帖下次被自动导出时发生，不扫全库、不复制内容；目标名被占用则跳过改名。
+const EXPORT_TITLE_PREFIX_LEN: usize = 40;
 
 fn title_export_prefix(title: &str, n: usize) -> String {
     let trimmed = title.trim();
@@ -6808,7 +6813,7 @@ mod tests {
         assert!(watch_dedupe_key("alice", "xiaohongshu", Some("   ")).is_none());
     }
 
-    /// 回归守卫：导出目录名按标题前 20 个字符取，中文栏目前缀不该把标题「吃光」。
+    /// 回归守卫：导出目录名按标题前 40 个字符取，中文栏目前缀不该把标题「吃光」。
     ///
     /// 实测事故：`【抖音独家】` 占 6 个字符，取前 10 只剩 `Open`，
     /// 三条标题完全不同的帖子撞成同一个目录名，只能靠 `_{postId}` 后缀区分，
@@ -6829,8 +6834,11 @@ mod tests {
                 assert_ne!(a, b, "标题前缀不该相撞：{a}");
             }
         }
-        // 按 Unicode 字符切，不会把中文切坏；尾部空格被 sanitize_fs_name 的 trim 去掉
-        assert_eq!(prefixes[0], "【抖音独家】OpenAI Images");
+        // 按 Unicode 字符切，不会把中文切坏；40 字足够装下完整短标题（尾部空格被 trim 掉）
+        assert_eq!(prefixes[0], "【抖音独家】OpenAI Images 2.5 重磅发布");
+        // 长标题严格按 40 字截断（常量被调小时会在这里暴露）
+        let long = super::title_export_prefix(&"黄".repeat(60), super::EXPORT_TITLE_PREFIX_LEN);
+        assert_eq!(long.chars().count(), super::EXPORT_TITLE_PREFIX_LEN);
         // 空标题回退
         assert_eq!(
             super::title_export_prefix("   ", super::EXPORT_TITLE_PREFIX_LEN),

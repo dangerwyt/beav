@@ -2658,7 +2658,7 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
                                     监控导出目标
                                 </div>
                                 <div className="mt-0.5 text-[11px] font-medium text-text-tertiary/80">
-                                    所有平台的产物统一落到「导出根目录 / 平台 / 日期 / 作者 / 标题前10字」；未设置则跟随工作区根
+                                    所有平台的产物统一落到「导出根目录 / 平台 / 日期 / 作者 / 标题前40字」；未设置则跟随工作区根
                                 </div>
                             </div>
 

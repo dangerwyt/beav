@@ -523,7 +523,7 @@ pub(crate) struct AppStore {
     #[serde(default)]
     pub(crate) monitor_spike_threshold: f64,
     /// 对标监控「帖子最终产物」的**全局导出根目录**（与工作区解耦）。
-    /// 空 = 跟随工作区根；非空且目录存在 = 导出到 `<该目录>/<平台>/<日期>/<作者>/<标题前10字>`。
+    /// 空 = 跟随工作区根；非空且目录存在 = 导出到 `<该目录>/<平台>/<日期>/<作者>/<标题前40字>`。
     #[serde(default)]
     pub(crate) monitor_export_root: String,
     /// 可选「Obsidian 资料库路径」。非空且为现存目录时，导出帖子产物会额外在该库内
