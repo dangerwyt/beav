@@ -89,6 +89,25 @@ const routes = parseJson(settings.ai_model_routes_json) ?? {};
 const sources = parseJson(settings.ai_sources_json) ?? [];
 
 /**
+ * 投影文件 `model-config.json`（与 store 同目录）。
+ *
+ * 启动流程（src-tauri/src/startup/mod.rs）会先 `load_model_config_into_settings`：
+ * 把 model-config.json 里的 providers / routes **写回 settings**。也就是说这个文件
+ * 才是启动时的权威快照 —— 只改 beav-state.json 而不动它，下一次启动就会被它覆盖回去
+ * （表现：脚本写完 --status 是 custom，桌面端一启动又变回 official，连源都没了）。
+ */
+const projectionPath = path.join(path.dirname(args.store), 'model-config.json');
+
+const readProjection = () => {
+  if (!fs.existsSync(projectionPath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(projectionPath, 'utf8'));
+  } catch {
+    return null;
+  }
+};
+
+/**
  * `--status`：只读体检——把每个 scope 实际会打的「源 / 地址 / 模型 / key 是否配了」打出来。
  *
  * 为什么需要：拆解、聊天、知识库报 `HTTP 401 Authentication required` 时，第一嫌疑是
@@ -124,6 +143,30 @@ if (args.status) {
   }
   console.log(`\ndefault_ai_source_id = ${settings.default_ai_source_id ?? '(空)'}`);
   console.log('api_endpoint = ' + String(settings.api_endpoint ?? '(空)'));
+
+  const projection = readProjection();
+  if (!projection) {
+    console.log('\n投影文件 model-config.json：不存在 → 启动时按 store 重建，改动会保留');
+  } else {
+    const projectionProviderIds = (projection.providers ?? []).map((item) => item.id).join(', ') || '(空)';
+    const projectionChat = projection.routes?.chat ?? {};
+    const storeChat = routes.chat ?? {};
+    const sameProviders =
+      projectionProviderIds === sources.map((item) => item.id).join(', ');
+    const sameChat =
+      String(projectionChat.mode ?? '') === String(storeChat.mode ?? '') &&
+      String(projectionChat.model ?? '') === String(storeChat.model ?? '');
+    console.log(
+      `\n投影文件 model-config.json：providers=[${projectionProviderIds}] ` +
+        `chat=${projectionChat.mode ?? '-'}/${projectionChat.model ?? '-'}`,
+    );
+    if (!sameProviders || !sameChat) {
+      console.log('  ⚠ 与 store 不一致 —— 应用启动时会用这个文件覆盖 settings，脚本的改动会被吃掉');
+      console.log('    处理：退出应用后把它改名/删除再启动（--apply 默认会自动改名备份）');
+    } else {
+      console.log('  与 store 一致');
+    }
+  }
   process.exit(0);
 }
 
@@ -204,7 +247,7 @@ if (changed.length === 0 && !sourcesChanged) {
   process.exit(0);
 }
 
-const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
+const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
 const backup = `${args.store}.bak-${stamp}`;
 fs.copyFileSync(args.store, backup);
 console.log(`\n已备份 -> ${backup}`);
@@ -213,6 +256,16 @@ if (sourcesChanged) settings.ai_sources_json = JSON.stringify(sources);
 if (changed.length > 0) settings.ai_model_routes_json = JSON.stringify(routes);
 fs.writeFileSync(args.store, `${JSON.stringify(store, null, 2)}\n`, 'utf8');
 console.log(`已写入 ${args.store}`);
+
+// 关键一步：改名备份投影文件。
+// 启动时 load_model_config_into_settings 会把 model-config.json 的 providers/routes
+// 写回 settings —— 留着旧的（official）就等于下次启动自动回滚。
+if (fs.existsSync(projectionPath)) {
+  const projectionBackup = `${projectionPath}.bak-${stamp}`;
+  fs.renameSync(projectionPath, projectionBackup);
+  console.log(`已备份并移除投影文件 -> ${projectionBackup}`);
+  console.log('（启动时会按新的 settings 重建它；不删的话启动会把路由改回 official）');
+}
 
 console.log('\n=== 回读校验 ===');
 const back = JSON.parse(fs.readFileSync(args.store, 'utf8')).settings.ai_model_routes_json;
