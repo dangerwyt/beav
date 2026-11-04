@@ -1663,7 +1663,15 @@ export function Settings({
     // 这里按实际生效的地址给出内置列表。
     const endpoint = String(formData.transcription_endpoint || '').trim().toLowerCase();
     if (endpoint.includes('elevenlabs.io')) {
-      return ELEVENLABS_TRANSCRIPTION_MODELS.map((item) => ({ ...item }));
+      // 内置列表只有 id/label，但模型行渲染会读 capabilities / inputCapabilities：
+      // 缺这两个字段会让 buildModelCapabilityBadges 对 undefined 调 .map，
+      // 直接炸掉整个设置页（实测：配好 ElevenLabs 后点开「自定义供应商」即白屏，
+      // 报 "undefined is not an object (evaluating 'r.map')"）。这里补齐成完整描述符。
+      return ELEVENLABS_TRANSCRIPTION_MODELS.map((item): AiModelDescriptor => ({
+        id: item.id,
+        capabilities: ['transcription'],
+        inputCapabilities: ['audio'],
+      }));
     }
     return selectedTranscriptionSource ? filterAiModelsByCapability(getSourceModelList(selectedTranscriptionSource), 'transcription') : [];
   }, [getSourceModelList, selectedTranscriptionSource, formData.transcription_endpoint]);

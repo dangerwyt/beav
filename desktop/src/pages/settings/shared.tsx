@@ -401,10 +401,12 @@ const MODEL_CAPABILITY_BADGE_META: Record<ModelCapability, string> = {
   embedding: 'text-rose-700',
 };
 
-const normalizeModelInputCapabilities = (values: Array<ModelInputCapability | string | null | undefined>): ModelInputCapability[] => {
+const normalizeModelInputCapabilities = (
+  values: Array<ModelInputCapability | string | null | undefined> | null | undefined,
+): ModelInputCapability[] => {
   const allowed: ModelInputCapability[] = ['image', 'audio', 'video', 'file'];
   const normalized = new Set<ModelInputCapability>();
-  for (const value of values) {
+  for (const value of values || []) {
     const text = String(value || '').trim().toLowerCase();
     if (allowed.includes(text as ModelInputCapability)) {
       normalized.add(text as ModelInputCapability);
@@ -1585,16 +1587,20 @@ export const toAiModelDescriptor = (
 };
 
 export const filterAiModelsByCapability = (
-  models: AiModelDescriptor[],
+  models: AiModelDescriptor[] | null | undefined,
   capability: ModelCapability,
 ): AiModelDescriptor[] => {
-  return models.filter((item) => item.capabilities.includes(capability));
+  // 容错：调用方可能传入「只有 id/label 的模型选项」（如 ElevenLabs 内置列表），
+  // 直接 models.filter 会在拿到 undefined 时抛错并白屏。
+  return (models || []).filter((item) => (item.capabilities || []).includes(capability));
 };
 
 export const buildModelCapabilityBadges = (
-  capabilities: ModelCapability[],
+  capabilities: ModelCapability[] | null | undefined,
 ): Array<{ text: string; tone?: 'neutral'; className?: string }> => {
-  return capabilities.map((capability) => ({
+  // 必须容忍 undefined：模型描述符来自多处（供应商配置 / 内置列表 / 官方面板），
+  // 少一个字段就 throw 会让整页设置崩掉，代价远大于显示空徽章。
+  return (capabilities || []).map((capability) => ({
     text: MODEL_CAPABILITY_META[capability]?.shortLabel || capability,
     tone: 'neutral' as const,
     className: MODEL_CAPABILITY_BADGE_META[capability],
@@ -1602,9 +1608,9 @@ export const buildModelCapabilityBadges = (
 };
 
 export const buildModelInputIcons = (
-  inputCapabilities: ModelInputCapability[],
+  inputCapabilities: ModelInputCapability[] | null | undefined,
 ): Array<{ key: ModelInputCapability; label: string; icon: typeof FileText; className: string }> => {
-  return normalizeModelInputCapabilities(inputCapabilities)
+  return normalizeModelInputCapabilities(inputCapabilities || [])
     .map((capability) => {
       const meta = MODEL_INPUT_META[capability];
       return {
