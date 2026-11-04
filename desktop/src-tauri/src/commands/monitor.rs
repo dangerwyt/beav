@@ -54,6 +54,7 @@ fn guard_owned_target(
         "monitor:transcribe-video",
         "monitor:video-analysis",
         "monitor:deconstruct",
+        "monitor:remix-generate",
         "monitor:inject-topic",
         "monitor:export-post",
     ];
@@ -204,6 +205,8 @@ pub fn handle_monitor_channel(
             "monitor:get-spike-threshold" => get_spike_threshold(state),
             "monitor:deconstruct" => deconstruct(state, payload),
             "monitor:decon-list" => decon_list(state, payload),
+            "monitor:remix-generate" => remix_generate(state, payload),
+            "monitor:remix-list" => remix_list(state, payload),
             "monitor:export-post" => export_post_command(state, payload),
             "monitor:get-export-root" => get_export_root(state),
             "monitor:set-export-root" => set_export_root(state, payload),
@@ -3024,7 +3027,242 @@ fn decon_list(state: &State<'_, AppState>, payload: &Value) -> Result<Value, Str
     })
 }
 
-// —— 竞品视频抓取闭环（下载 + 内容分析）——
+// —— 二创产出：分镜脚本 / 多平台改写 ——
+
+/// 目标平台的写作规范（改写用）。集中一处，避免 prompt 里散落平台细节。
+fn remix_platform_guide(target: &str) -> (&'static str, &'static str) {
+    match target {
+        "xiaohongshu" => (
+            "小红书",
+            "标题 ≤20 字、口语化、可带 emoji 但不超过 2 个；正文分 3-5 段，每段 1-3 行；\
+             结尾一句互动引导；话题标签 5-8 个放最后一行。",
+        ),
+        "wechat" => (
+            "公众号",
+            "标题 ≤24 字、偏信息密度；开头 2 句必须给出结论；正文用小标题分段；\
+             结尾引导在看/转发，不写外链。",
+        ),
+        "bilibili" => (
+            "B站",
+            "标题 ≤30 字、可带技能点前缀；简介前 2 行是钩子；正文适合口播稿节奏；\
+             标签 5 个左右。",
+        ),
+        _ => (
+            "抖音",
+            "标题 ≤25 字、前 8 字必须抓人；正文口语化短句，一行一个意思；\
+             话题标签 3-5 个；结尾一句引导评论。",
+        ),
+    }
+}
+
+/// 生成二创产出（`kind = storyboard | rewrite`）。
+///
+/// 输入复用拆解那套：元信息 + 文案 + 口播大纲；若已拆解过，额外带上结构骨架与金句，
+/// 避免重复分析。产物落 `post_remixes`，导出时写进产物目录的 `二创/`。
+fn remix_generate(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
+    let post_id = str_field(payload, "postId")
+        .or_else(|| str_field(payload, "post_id"))
+        .ok_or_else(|| "缺少 postId".to_string())?;
+    let kind = str_field(payload, "kind").unwrap_or_else(|| "storyboard".to_string());
+    let target = str_field(payload, "target").unwrap_or_else(|| "douyin".to_string());
+    let target_seconds = payload
+        .get("targetSeconds")
+        .and_then(Value::as_i64)
+        .filter(|seconds| *seconds >= 15 && *seconds <= 900)
+        .unwrap_or(60);
+
+    let post = with_store(state, |store| {
+        Ok(store
+            .monitored_posts
+            .iter()
+            .find(|item| item.id == post_id)
+            .cloned())
+    })?
+    .ok_or_else(|| "未找到该动态，请先抓取".to_string())?;
+
+    let analysis = with_store(state, |store| {
+        Ok(store
+            .post_video_analyses
+            .iter()
+            .find(|item| item.post_id == post_id)
+            .cloned())
+    })?;
+    let transcript = analysis
+        .as_ref()
+        .map(|item| item.transcript.trim().to_string())
+        .unwrap_or_default();
+    let srt = analysis
+        .as_ref()
+        .map(|item| item.transcript_srt.clone())
+        .unwrap_or_default();
+    let decon = with_store(state, |store| {
+        Ok(store
+            .post_deconstructions
+            .iter()
+            .find(|item| item.post_id == post_id)
+            .cloned())
+    })?;
+
+    if post.content.trim().is_empty() && transcript.is_empty() {
+        return Err("这条既没有正文也没有转写，无法二创：请先抓正文或跑语音转写".to_string());
+    }
+
+    let settings = with_store(state, |store| Ok(store.settings.clone()))?;
+    let config = AiModelManager::resolve_chat_config(&settings, None)
+        .ok_or_else(|| "未配置可用的 AI 模型，请在设置中配置后重试".to_string())?;
+
+    let cues = srt_cues(&srt);
+    let outline = srt_outline(&cues, DECONSTRUCT_OUTLINE_STEP_SECS, DECONSTRUCT_OUTLINE_MAX);
+
+    let mut context = String::new();
+    context.push_str(&format!(
+        "【原素材】{} · {} · 《{}》\n",
+        platform_label(&post.platform),
+        post.author,
+        post.title
+    ));
+    context.push_str(&format!("【原帖】{}\n", post.post_url));
+    if !post.content.trim().is_empty() {
+        context.push_str(&format!(
+            "\n【原文案】\n{}\n",
+            clip_chars(&post.content, DECONSTRUCT_BODY_CLIP)
+        ));
+    }
+    if !outline.is_empty() {
+        context.push_str(&format!("\n【口播大纲（时间码取自真实字幕）】\n{}\n", outline));
+    } else if !transcript.is_empty() {
+        context.push_str(&format!(
+            "\n【口播全文（无时间码）】\n{}\n",
+            clip_chars(&transcript, DECONSTRUCT_TRANSCRIPT_CLIP)
+        ));
+    }
+    if let Some(decon) = &decon {
+        if !decon.hooks.is_empty() {
+            context.push_str(&format!(
+                "\n【原帖金句（仅供理解，不得照搬）】\n{}\n",
+                decon.hooks
+                    .iter()
+                    .take(6)
+                    .map(|hook| format!("- {hook}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+    }
+
+    let (system_prompt, user_prompt) = if kind == "rewrite" {
+        let (name, guide) = remix_platform_guide(&target);
+        (
+            format!(
+                "你是资深自媒体内容编辑，负责把一条已验证的爆款内容改写成适合{}的版本。\
+硬性要求：1) 禁止连续 20 字以上与原口播/原文重合，必须换视角、换结构与表达；\
+2) 保留原观点的价值，但补充原文没有的增量（例子、数字、类比）；\
+3) 结尾标注一句「观点参考：{{原作者}} · {{平台}} · {{原帖链接}}」；\
+4) 只输出 Markdown 正文，不要解释你的思路。\
+平台规范：{}",
+                name, guide
+            ),
+            format!(
+                "{context}\n\n请输出 Markdown：\n## 标题候选\n（5 条，逐条一行）\n\n## 正文\n（按平台规范分段）\n\n## 话题标签\n（一行）\n"
+            ),
+        )
+    } else {
+        (
+            format!(
+                "你是短视频分镜导演。基于给定素材，写一份可直接执行的分镜脚本，目标时长约 {target_seconds} 秒。\
+硬性要求：1) 时间码只能沿用给定大纲里的真实时间码，不得编造；\
+2) 画面描述必须来自素材，看不清就写「画面信息不足，需回看原视频」，不要臆想镜头；\
+3) 台词可改写，但不得整段照搬原口播；4) 只输出 Markdown 表格，不要解释。"
+            ),
+            format!(
+                "{context}\n\n请输出一张分镜表，列为：镜号 | 时间码 | 景别/画面 | 口播台词 | 屏幕字幕 | 备注。\n总时长控制在 {target_seconds} 秒左右，镜头数按 3-8 秒一个估算。\n"
+            ),
+        )
+    };
+
+    let raw = invoke_structured_chat_by_protocol(
+        &config.protocol,
+        &config.base_url,
+        config.api_key.as_deref(),
+        &config.model_name,
+        &system_prompt,
+        &user_prompt,
+        false,
+    )?;
+    let content = raw.trim().to_string();
+    if content.is_empty() {
+        return Err("模型返回了空内容，请稍后重试".to_string());
+    }
+
+    let basis = if !cues.is_empty() {
+        format!("含口播时间轴 {} 段", cues.len())
+    } else if !transcript.is_empty() {
+        format!("含口播全文 {} 字", transcript.chars().count())
+    } else {
+        "仅文案".to_string()
+    };
+    let source_evidence = format!(
+        "对标监控 · {} · {}（{}）",
+        platform_label(&post.platform),
+        post.author,
+        basis
+    );
+
+    let now = now_i64();
+    let mut record = crate::PostRemixRecord {
+        id: make_id("remix"),
+        post_id: post.id.clone(),
+        platform: post.platform.clone(),
+        author: post.author.clone(),
+        post_title: post.title.clone(),
+        kind: kind.clone(),
+        target: if kind == "rewrite" { target.clone() } else { String::new() },
+        content,
+        source_evidence,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let saved = with_store_mut(state, |store| {
+        // 同一帖同一类型（改写按平台区分）只留最新一份，避免越生成越多
+        if let Some(pos) = store.post_remixes.iter().position(|item| {
+            item.post_id == record.post_id && item.kind == record.kind && item.target == record.target
+        }) {
+            record.id = store.post_remixes[pos].id.clone();
+            record.created_at = store.post_remixes[pos].created_at;
+            store.post_remixes[pos] = record.clone();
+        } else {
+            store.post_remixes.push(record.clone());
+        }
+        Ok(serde_json::to_value(&record).unwrap_or_else(|_| json!({})))
+    })?;
+
+    export_post_product(state, &post.id);
+
+    Ok(json!({ "success": true, "remix": saved }))
+}
+
+/// 列出某帖（或全部）的二创产出。
+fn remix_list(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
+    let post_id = str_field(payload, "postId")
+        .or_else(|| str_field(payload, "post_id"))
+        .unwrap_or_default();
+    with_store(state, |store| {
+        let mut items: Vec<Value> = store
+            .post_remixes
+            .iter()
+            .filter(|item| post_id.is_empty() || item.post_id == post_id)
+            .map(|item| serde_json::to_value(item).unwrap_or_else(|_| json!({})))
+            .collect();
+        items.sort_by(|a, b| {
+            let at = b.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+            let bt = a.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+            at.cmp(&bt)
+        });
+        Ok(json!({ "success": true, "items": items }))
+    })
+}
+
 // 下载目录：应用数据根下的 monitor-videos/（视频文件与抽帧都落这里）。
 fn monitor_videos_dir(state: &State<'_, AppState>) -> Result<PathBuf, String> {
     let base = workspace_root(state)?;
@@ -5115,6 +5353,41 @@ fn try_export_post_product(
             d.raw_content
         );
         let _ = std::fs::write(l4.join("爆文拆解.md"), md);
+    }
+
+    // 二创产出（分镜脚本 / 各平台改写）：落到「二创/」子目录，和拆解并列
+    let remixes: Vec<crate::PostRemixRecord> = with_store(state, |store| {
+        Ok(store
+            .post_remixes
+            .iter()
+            .filter(|item| item.post_id == post_id)
+            .cloned()
+            .collect())
+    })?;
+    if !remixes.is_empty() {
+        let remix_dir = l4.join("二创");
+        if std::fs::create_dir_all(&remix_dir).is_ok() {
+            for item in &remixes {
+                let file_name = if item.kind == "rewrite" {
+                    format!(
+                        "改写-{}.md",
+                        if item.target.trim().is_empty() {
+                            "default"
+                        } else {
+                            item.target.trim()
+                        }
+                    )
+                } else {
+                    "分镜脚本.md".to_string()
+                };
+                let label = if item.kind == "rewrite" { "多平台改写" } else { "分镜脚本" };
+                let body = format!(
+                    "# {label} · {}\n\n> 生成依据：{}\n\n{}\n",
+                    item.post_title, item.source_evidence, item.content
+                );
+                let _ = std::fs::write(remix_dir.join(file_name), body);
+            }
+        }
     }
 
     // 帖子信息（溯源）

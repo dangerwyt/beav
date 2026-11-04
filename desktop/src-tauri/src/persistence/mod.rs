@@ -1016,6 +1016,7 @@ pub fn default_store() -> AppStore {
         monitor_obsidian_vault: String::new(),
         post_deconstructions: Vec::new(),
         post_video_analyses: Vec::new(),
+        post_remixes: Vec::new(),
     }
 }
 

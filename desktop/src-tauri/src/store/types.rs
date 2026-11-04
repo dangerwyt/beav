@@ -537,6 +537,33 @@ pub(crate) struct AppStore {
     /// 竞品视频分析库：每篇被下载并分析的对标视频，沉淀字幕 + 抽帧 + 摘要（与拆解库并列）。
     #[serde(default)]
     pub(crate) post_video_analyses: Vec<PostVideoAnalysisRecord>,
+    /// 二创产出库：基于对标素材生成的分镜脚本 / 多平台改写文案。
+    ///
+    /// 与 `post_deconstructions`（解剖别人）互补——这里是「照着自己写一份」。
+    /// 导出时落到帖子产物目录的 `二创/` 子目录。
+    #[serde(default)]
+    pub(crate) post_remixes: Vec<PostRemixRecord>,
+}
+
+/// 二创产出：`kind = storyboard`（分镜脚本）/ `rewrite`（多平台改写）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct PostRemixRecord {
+    pub(crate) id: String,
+    pub(crate) post_id: String,
+    pub(crate) platform: String,
+    pub(crate) author: String,
+    pub(crate) post_title: String,
+    /// storyboard / rewrite
+    pub(crate) kind: String,
+    /// rewrite 的目标平台（douyin / xiaohongshu / wechat / bilibili）；storyboard 为空
+    pub(crate) target: String,
+    /// 生成结果的 Markdown 正文（可直接落盘 / 复制）
+    pub(crate) content: String,
+    /// 生成依据（用了哪些输入，便于复盘）
+    pub(crate) source_evidence: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

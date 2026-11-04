@@ -940,6 +940,11 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [deconLoading, setDeconLoading] = useState(false);
   const [deconError, setDeconError] = useState<string | null>(null);
 
+  // —— 二创（详情弹窗内）：分镜脚本 / 多平台改写 ——
+  const [remixBusy, setRemixBusy] = useState<'' | 'storyboard' | 'rewrite'>('');
+  const [remixPreview, setRemixPreview] = useState<{ kind: string; target: string; content: string } | null>(null);
+  const [remixTarget, setRemixTarget] = useState('douyin');
+
   // —— 方法论库（已沉淀的爆文拆解列表，模态浏览）——
   const [methodsOpen, setMethodsOpen] = useState(false);
   const [methodsItems, setMethodsItems] = useState<PostDeconstruction[]>([]);
@@ -1783,11 +1788,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const runDeconstruct = useCallback(async (post: MonitoredPost) => {
     // 列表已投影（不含正文），这里只在「明确已知无正文」时提前拦截；
     // 有正文的情况下直接把 id 交给后端，由后端做最终校验。
-    const hasBody = post.hasContent ?? Boolean(post.content?.trim());
-    if (!hasBody) {
-      setDeconError('该帖本地暂无正文，请先在详情里「重新抓正文」后再拆解');
-      return;
-    }
+    // 正文可能为空但有口播转写（视频帖常态），是否可拆交给后端判断，
+    // 它能在两者都缺时给出准确原因，前端不要提前拦截。
     setDeconLoading(true);
     setDeconError(null);
     try {
@@ -1813,6 +1815,34 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
       setDeconLoading(false);
     }
   }, [normalizeDecon]);
+
+  // 二创：基于同一条素材生成分镜脚本 / 指定平台改写。
+  const runRemix = useCallback(async (post: MonitoredPost, kind: 'storyboard' | 'rewrite') => {
+    setRemixBusy(kind);
+    setRemixPreview(null);
+    try {
+      const result = (await window.ipcRenderer.monitor.remixGenerate({
+        postId: post.id,
+        kind,
+        target: kind === 'rewrite' ? remixTarget : undefined,
+      })) as { success?: boolean; remix?: Record<string, unknown>; error?: string };
+      if (!result?.success || !result.remix) {
+        showToast('err', result?.error || (kind === 'rewrite' ? '改写失败' : '分镜生成失败'));
+        return;
+      }
+      const record = result.remix;
+      setRemixPreview({
+        kind: String(record.kind ?? kind),
+        target: String(record.target ?? ''),
+        content: String(record.content ?? ''),
+      });
+      showToast('ok', kind === 'rewrite' ? '改写已生成，并写入产物目录「二创/」' : '分镜脚本已生成，并写入产物目录「二创/」');
+    } catch (e) {
+      showToast('err', e instanceof Error ? e.message : '生成失败');
+    } finally {
+      setRemixBusy('');
+    }
+  }, [remixTarget, showToast]);
 
   // 方法论库：加载已沉淀的爆文拆解列表（可按作者 / 平台过滤）。
   const loadMethods = useCallback(async () => {
@@ -3044,6 +3074,29 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               {deconResult && deconResult.postId === detailPost.id && (
                 <DeconFields decon={deconResult} />
               )}
+              {remixPreview && (
+                <div className="rounded-lg border border-border bg-surface-secondary/40 p-3 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-[12px] font-semibold text-text-primary">
+                      {remixPreview.kind === 'rewrite'
+                        ? `多平台改写 · ${remixPreview.target || '默认'}`
+                        : '分镜脚本'}
+                    </div>
+                    <button
+                      onClick={() => {
+                        void navigator.clipboard?.writeText(remixPreview.content).catch(() => {});
+                      }}
+                      className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-md border border-border text-text-tertiary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                      title="复制全文"
+                    >
+                      <Copy className="w-3 h-3" />复制
+                    </button>
+                  </div>
+                  <pre className="max-h-80 overflow-auto whitespace-pre-wrap text-[12px] leading-relaxed text-text-secondary font-sans">
+                    {remixPreview.content}
+                  </pre>
+                </div>
+              )}
             </div>
 
             <div className="px-6 py-3 border-t border-border flex flex-wrap items-center justify-between gap-3 shrink-0">
@@ -3105,6 +3158,35 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   <FlaskConical className={clsx('w-3 h-3', deconLoading && 'animate-spin')} />
                   {deconResult && deconResult.postId === detailPost.id ? '重新拆解' : '拆解'}
                 </button>
+                <button
+                  onClick={() => void runRemix(detailPost, 'storyboard')}
+                  disabled={Boolean(remixBusy)}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                  title="按口播大纲生成可执行的分镜表，落到产物目录「二创/分镜脚本.md」"
+                >
+                  {remixBusy === 'storyboard' ? '生成中…' : '分镜'}
+                </button>
+                <span className="inline-flex items-center gap-1">
+                  <select
+                    value={remixTarget}
+                    onChange={(event) => setRemixTarget(event.target.value)}
+                    className="h-[30px] rounded-md border border-border bg-surface-secondary px-1.5 text-xs text-text-secondary"
+                    title="改写目标平台"
+                  >
+                    <option value="douyin">抖音</option>
+                    <option value="xiaohongshu">小红书</option>
+                    <option value="wechat">公众号</option>
+                    <option value="bilibili">B站</option>
+                  </select>
+                  <button
+                    onClick={() => void runRemix(detailPost, 'rewrite')}
+                    disabled={Boolean(remixBusy)}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
+                    title="按目标平台规范改写，落到产物目录「二创/改写-平台.md」"
+                  >
+                    {remixBusy === 'rewrite' ? '生成中…' : '改写'}
+                  </button>
+                </span>
                 {deconResult && deconResult.postId === detailPost.id && (
                   <button
                     onClick={() => void handleInject(detailPost)}

@@ -353,6 +353,26 @@ export function createMonitorBridge(core: BridgeCore) {
           timeoutMs: READ_TIMEOUT_MS,
           fallback: () => ({ success: false, items: [], authors: [] }) as unknown as T,
         }),
+      // 二创：基于对标素材生成分镜脚本 / 多平台改写（走 chat 模型，几十秒量级）
+      remixGenerate: <T = { success: boolean; remix?: Record<string, unknown>; note?: string }>(
+        payload: {
+          postId: string;
+          kind: 'storyboard' | 'rewrite';
+          target?: string;
+          targetSeconds?: number;
+        },
+      ) =>
+        core.invokeChannelGuarded<T>('monitor:remix-generate', payload, {
+          timeoutMs: 180_000,
+          fallback: () => ({ success: false }) as unknown as T,
+        }),
+      remixList: <T = { success: boolean; items: Record<string, unknown>[] }>(payload?: {
+        postId?: string;
+      }) =>
+        core.invokeChannelGuarded<T>('monitor:remix-list', payload ?? {}, {
+          timeoutMs: READ_TIMEOUT_MS,
+          fallback: () => ({ success: false, items: [] }) as unknown as T,
+        }),
       // 下载视频：CDP 抽真实流地址 → ffmpeg 直落盘（需已登录的小红书/抖音 Chrome），耗时较长。
       // 下载流程内部会自动探测音轨：抖音 DASH 只给视频轨时会补下音频轨再合并，
       // 所以「重新下载」既刷新清晰度也补齐声音（无需单独的「补音轨」入口）。
