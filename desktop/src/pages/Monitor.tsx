@@ -6,6 +6,7 @@ import { clsx } from 'clsx';
 import type { MonitorChromeStatus, MonitorChromeLaunchResult, MonitorChromeTestResult } from '../bridge/domains/monitorBridge';
 import { resolveAssetUrl } from '../utils/pathManager';
 import { appConfirm } from '../utils/appDialogs';
+import { normalizePostBody } from '../utils/postBody';
 import { CDP_PLATFORMS, PLATFORM_HOME, PLATFORMS, type CdpPlatform } from '../constants/platforms';
 import { APP_BRAND } from '../config/brand';
 
@@ -640,8 +641,8 @@ function VideoAnalysisPanel({ analysis }: { analysis: PostVideoAnalysis }) {
             </ol>
           ) : (
             <>
-              <p className="text-sm text-text-secondary whitespace-pre-wrap leading-relaxed">
-                {showAll || !longTranscript ? transcript : `${transcript.slice(0, 600)}…`}
+              <p className="text-sm text-text-secondary whitespace-pre-line leading-relaxed">
+                {normalizePostBody(showAll || !longTranscript ? transcript : `${transcript.slice(0, 600)}…`)}
               </p>
               {longTranscript && (
                 <button
@@ -2986,7 +2987,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   )}
                   {detailPost.videoStatus !== 'done' && detailPost.videoStatus !== 'downloading' && (
                     <p className="text-xs text-text-tertiary">
-                      尚未下载视频本体 —— 点底部「下载视频」用登录态 Chrome 抓下来后，这里可直接播放并做转写分析；否则请点「原文」跳转平台。
+                      尚未下载视频本体 —— 点底部「下载视频」用登录态 Chrome 抓下来后，这里可直接播放并做转写分析；否则请先下载视频再处理。
                     </p>
                   )}
                   {detailPost.videoSize ? (
@@ -3211,12 +3212,6 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 >
                   <RefreshCw className={clsx('w-3 h-3', detailLoading && 'animate-spin')} />
                   重新抓正文
-                </button>
-                <button
-                  onClick={() => void openExternal(detailPost.postUrl)}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors whitespace-nowrap"
-                >
-                  <ExternalLink className="w-3 h-3" />原文
                 </button>
               </div>
             </div>

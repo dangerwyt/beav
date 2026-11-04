@@ -3055,6 +3055,66 @@ fn remix_platform_guide(target: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// 把模型给的镜头数组渲染成 Markdown 分镜表：时间码由后端按时长累加。
+///
+/// 为什么不让模型给时间码：它只能在「90 秒一行」的口播大纲里挑，会把同一条拆成
+/// 多个镜头、写出重复或跳跃的时间码，还可能把「新片时间线」和「原片定位」混为一谈。
+/// 后端累加后时间码天然自洽，原片定位另用抽帧/视频对照。
+fn render_storyboard_markdown(raw: &str, target_seconds: i64) -> String {
+    let Some(parsed) = extract_json_object(raw) else {
+        return raw.trim().to_string(); // 模型没给 JSON：原样返回，至少内容不丢
+    };
+    let shots = parsed
+        .get("shots")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if shots.is_empty() {
+        return raw.trim().to_string();
+    }
+    let title = str_field(&parsed, "title").unwrap_or_default();
+    let mut total = 0i64;
+    let mut table = String::from(
+        "| 镜号 | 时间码 | 时长 | 画面设计 | 口播台词 | 屏幕字幕 | 备注 |\n| --- | --- | --- | --- | --- | --- | --- |\n",
+    );
+    for (index, shot) in shots.iter().enumerate() {
+        let duration = shot
+            .get("duration")
+            .and_then(Value::as_i64)
+            .unwrap_or(6)
+            .clamp(1, 20);
+        let start = total;
+        total += duration;
+        let cell = |key: &str| -> String {
+            str_field(shot, key)
+                .unwrap_or_default()
+                .replace('|', "/")
+                .replace('\n', " ")
+        };
+        table.push_str(&format!(
+            "| {} | {} | {}s | {} | {} | {} | {} |\n",
+            index + 1,
+            format_hms(start),
+            duration,
+            cell("framing"),
+            cell("line"),
+            cell("caption"),
+            cell("note")
+        ));
+    }
+    let mut out = format!(
+        "> 目标成片约 {target_seconds} 秒 · 实排 {total} 秒 · {n} 个镜头\n> 时间码是**新片时间线**（按镜头时长累加），不是原片定位；原片画面请对照同目录的 `抽帧_*.jpg` 与 `视频.mp4`。\n\n",
+        target_seconds = target_seconds,
+        total = total,
+        n = shots.len()
+    );
+    if !title.trim().is_empty() {
+        out.push_str(&format!("**{}**\n\n", title.trim()));
+    }
+    out.push_str(&table);
+    out
+}
+
 /// 生成二创产出（`kind = storyboard | rewrite`）。
 ///
 /// 输入复用拆解那套：元信息 + 文案 + 口播大纲；若已拆解过，额外带上结构骨架与金句，
@@ -3170,12 +3230,12 @@ fn remix_generate(state: &State<'_, AppState>, payload: &Value) -> Result<Value,
         (
             format!(
                 "你是短视频分镜导演。基于给定素材，写一份可直接执行的分镜脚本，目标时长约 {target_seconds} 秒。\
-硬性要求：1) 时间码只能沿用给定大纲里的真实时间码，不得编造；\
-2) 画面描述必须来自素材，看不清就写「画面信息不足，需回看原视频」，不要臆想镜头；\
-3) 台词可改写，但不得整段照搬原口播；4) 只输出 Markdown 表格，不要解释。"
+硬性要求：1) 你排的是**新片**的时间线，时间码由系统按镜头时长累加生成，你不要输出时间码，只给每镜时长（秒）；\
+2) 画面列写**设计建议**（景别、拍什么、怎么剪），不是对原片的描述——你没有看到画面，禁止声称画面内容；\
+3) 台词可改写，但不得整段照搬原口播；4) 只输出 JSON，不要解释。"
             ),
             format!(
-                "{context}\n\n请输出一张分镜表，列为：镜号 | 时间码 | 景别/画面 | 口播台词 | 屏幕字幕 | 备注。\n总时长控制在 {target_seconds} 秒左右，镜头数按 3-8 秒一个估算。\n"
+                "{context}\n\n输出 JSON：{{\"title\": 一句话片名, \"shots\": [{{\"duration\": 7, \"framing\": \"画面设计（景别+拍什么）\", \"line\": \"口播台词\", \"caption\": \"屏幕字幕（可空）\", \"note\": \"拍摄/剪辑备注（可空）\"}}]}}。\n镜头总时长控制在 {target_seconds} 秒左右，单镜 3-8 秒。\n"
             ),
         )
     };
@@ -3187,9 +3247,13 @@ fn remix_generate(state: &State<'_, AppState>, payload: &Value) -> Result<Value,
         &config.model_name,
         &system_prompt,
         &user_prompt,
-        false,
+        kind == "storyboard",
     )?;
-    let content = raw.trim().to_string();
+    let content = if kind == "storyboard" {
+        render_storyboard_markdown(&raw, target_seconds)
+    } else {
+        raw.trim().to_string()
+    };
     if content.is_empty() {
         return Err("模型返回了空内容，请稍后重试".to_string());
     }
