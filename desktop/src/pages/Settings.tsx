@@ -1934,6 +1934,56 @@ export function Settings({
     return chatRouteSource?.id || aiModelRoutes.chat.sourceId || firstCustomAiSource?.id || '';
   }, [aiModelRoutes.chat.mode, aiModelRoutes.chat.sourceId, chatRouteSource?.id, firstCustomAiSource?.id]);
 
+  // —— 非聊天能力行也统一读路由 ——
+  //
+  // 这些行原先读的是旧的 per-能力字段（embedding_source_id / image_endpoint / voice_tts_model…），
+  // 于是出现「路由已经是 RelayRouter，界面还显示官方 + 请先登录官方账号」的错位；
+  // 更糟的是保存时会把旧字段（多为官方地址 + 空 key）写回 settings，覆盖掉路由配置。
+  // 这里改成和「聊天」行同一套来源：显示值/可选模型都从 aiModelRoutes 推出来。
+  const routeScopeSource = useCallback((scope: AiModelRouteScope) => {
+    const route = aiModelRoutes[scope];
+    if (!route) return null;
+    if (route.mode === 'official') return officialAiSource;
+    if (route.mode === 'custom') return getAiSourceById(route.sourceId || '') || null;
+    return null;
+  }, [aiModelRoutes, getAiSourceById, officialAiSource]);
+
+  const routeScopeSourceModels = useCallback((scope: AiModelRouteScope): AiModelDescriptor[] => {
+    const source = routeScopeSource(scope);
+    if (!source) return [];
+    if (isOfficialManagedSource(source) && !officialAuthLoggedIn) return [];
+    const models = getSourceModelList(source);
+    switch (scope) {
+      case 'embedding':
+        return filterAiModelsByCapability(models, 'embedding');
+      case 'image':
+        return filterAiModelsByCapability(models, 'image');
+      case 'voiceTts':
+        return filterAiModelsByCapability(models, 'tts');
+      case 'visualIndex':
+        return filterVisualIndexModels(models);
+      case 'videoAnalysis':
+        return filterVideoAnalysisModels(models);
+      default:
+        return models;
+    }
+  }, [
+    filterAiModelsByCapability,
+    filterVideoAnalysisModels,
+    filterVisualIndexModels,
+    getSourceModelList,
+    isOfficialManagedSource,
+    officialAuthLoggedIn,
+    routeScopeSource,
+  ]);
+
+  const routeScopeSourceValue = useCallback((scope: AiModelRouteScope) => {
+    const route = aiModelRoutes[scope];
+    if (route?.mode === 'official') return OFFICIAL_AUTO_SOURCE_ID;
+    return routeScopeSource(scope)?.id || route?.sourceId || '';
+  }, [aiModelRoutes, routeScopeSource]);
+
+
   const getLocalGuideForSource = useCallback((source?: AiSourceConfig | null): LocalAiGuide | null => {
     if (!source) return null;
     switch (source.presetId) {
@@ -2405,6 +2455,38 @@ export function Settings({
   const updateAiModelRoute = useCallback((scope: AiModelRouteScope, patch: Partial<AiModelRouteConfig>) => {
     applyAiModelRoutePatch(scope, patch);
   }, [applyAiModelRoutePatch]);
+
+  /**
+   * 切换某能力行的供应商：同时写路由与旧字段。
+   *
+   * 旧字段（*_endpoint / *_key / *_model）仍要同步一份 —— media_transcribe、image_endpoint
+   * 这些链路读的是它，不同步会出现「路由对了、实际请求打到旧地址」。
+   */
+  const handleRouteScopeSourceChange = useCallback((
+    scope: AiModelRouteScope,
+    feature: 'transcription' | 'embedding' | 'visual' | 'videoAnalysis' | 'image' | 'voice' | 'video',
+    nextSourceId: string,
+    capability: ModelCapability,
+  ) => {
+    handleLinkedSourceChange(feature, nextSourceId);
+    const source = getAiSourceById(nextSourceId)
+      || (isOfficialAutoSourceId(nextSourceId) ? officialAiSource : null);
+    if (!source) return;
+    const isOfficialSource = isOfficialManagedSource(source);
+    updateAiModelRoute(scope, {
+      mode: isOfficialSource ? 'official' : 'custom',
+      sourceId: isOfficialSource ? OFFICIAL_AUTO_SOURCE_ID : source.id,
+      model: pickBestModelForSource(source, aiModelRoutes[scope]?.model || '', capability),
+    });
+  }, [
+    aiModelRoutes,
+    getAiSourceById,
+    handleLinkedSourceChange,
+    isOfficialManagedSource,
+    officialAiSource,
+    pickBestModelForSource,
+    updateAiModelRoute,
+  ]);
 
   const handleChatSourceChange = useCallback((nextSourceId: string) => {
     const normalizedSourceId = canonicalizeOfficialAutoSourceId(nextSourceId);
@@ -7182,86 +7264,94 @@ export function Settings({
 	                        })()}
 	                        {renderModelSettingsTableRow({
 	                          label: 'Embedding',
-	                          sourceValue: embeddingSourceId,
-	                          sources: aiSources,
-	                          onSourceChange: (nextSourceId) => handleLinkedSourceChange('embedding', nextSourceId),
-	                          modelValue: formData.embedding_model,
-	                          onModelChange: (modelId) => setAiModelFormField('embedding_model', modelId),
-	                          modelOptions: embeddingSourceModels.map((model) => ({
-	                            id: model.id,
-	                            label: model.id,
-	                            badges: buildModelCapabilityBadges(model.capabilities),
-	                            inputIcons: buildModelInputIcons(model.inputCapabilities),
-	                          })),
-	                          modelDisabled: !embeddingSourceModels.length,
-	                          modelPlaceholder: '请先在该供应商中添加模型',
-	                        })}
-	                        {renderModelSettingsTableRow({
-	                          label: '生图',
-	                          sourceValue: imageSourceId,
+	                          sourceValue: routeScopeSourceValue('embedding'),
 	                          sources: displayedAiSources,
-	                          onSourceChange: (nextSourceId) => handleLinkedSourceChange('image', nextSourceId),
-	                          modelValue: formData.image_model,
-	                          onModelChange: (modelId) => setAiModelFormField('image_model', modelId),
-	                          modelOptions: isDashscopeImageTemplate
-	                            ? [{ id: DASHSCOPE_LOCKED_IMAGE_MODEL, label: DASHSCOPE_LOCKED_IMAGE_MODEL }]
-	                            : imageSourceModels.map((model) => ({
-	                              id: model.id,
-	                              label: model.id,
-	                              badges: buildModelCapabilityBadges(model.capabilities),
-	                              inputIcons: buildModelInputIcons(model.inputCapabilities),
-	                            })),
-	                          modelDisabled: isDashscopeImageTemplate || !imageSourceModels.length,
-	                          modelPlaceholder: isDashscopeImageTemplate ? DASHSCOPE_LOCKED_IMAGE_MODEL : '请先在该源中添加模型',
-	                        })}
-	                        {renderModelSettingsTableRow({
-	                          label: 'TTS',
-	                          sourceValue: voiceSourceId,
-	                          sources: displayedAiSources,
-	                          onSourceChange: (nextSourceId) => handleLinkedSourceChange('voice', nextSourceId),
-	                          modelValue: formData.voice_tts_model,
-	                          onModelChange: (modelId) => applyRouteModel('voiceTts', modelId),
-	                          modelOptions: voiceTtsSourceModels.map((model) => ({
-	                            id: model.id,
-	                            label: model.id,
-	                            badges: buildModelCapabilityBadges(model.capabilities),
-	                            inputIcons: buildModelInputIcons(model.inputCapabilities),
-	                          })),
-	                          modelDisabled: !voiceTtsSourceModels.length,
-	                          modelPlaceholder: '请先在该供应商中添加 TTS 模型',
-	                        })}
-	                        {renderModelSettingsTableRow({
-	                          label: '视觉索引',
-	                          sourceValue: visualIndexSourceId,
-	                          sources: aiSources,
-	                          onSourceChange: (nextSourceId) => handleLinkedSourceChange('visual', nextSourceId),
-	                          modelValue: formData.visual_index_model,
-	                          onModelChange: (modelId) => setAiModelFormField('visual_index_model', modelId),
-	                          modelOptions: visualIndexSourceModels.map((model) => ({
-	                            id: model.id,
-	                            label: model.id,
-	                            badges: buildModelCapabilityBadges(model.capabilities),
-	                            inputIcons: buildModelInputIcons(model.inputCapabilities),
-	                          })),
-	                          modelDisabled: !visualIndexSourceModels.length,
-	                          modelPlaceholder: '请先在该供应商中添加支持图片输入的模型',
-	                        })}
-	                        {renderModelSettingsTableRow({
-	                          label: '视频分析',
-	                          sourceValue: videoAnalysisSourceId,
-	                          sources: aiSources,
-	                          onSourceChange: (nextSourceId) => handleLinkedSourceChange('videoAnalysis', nextSourceId),
-	                          modelValue: formData.video_analysis_model,
-	                          onModelChange: (modelId) => setAiModelFormField('video_analysis_model', modelId),
-	                          modelOptions: routeModelSelectOptions(videoAnalysisSourceModels, formData.video_analysis_model).map((model) => {
-	                            const descriptor = videoAnalysisSourceModels.find((item) => item.id === model.id);
+	                          onSourceChange: (nextSourceId) => handleRouteScopeSourceChange('embedding', 'embedding', nextSourceId, 'embedding'),
+	                          modelValue: effectiveRouteModelValue('embedding'),
+	                          onModelChange: (modelId) => applyRouteModel('embedding', modelId),
+	                          modelOptions: routeModelSelectOptions(routeScopeSourceModels('embedding'), effectiveRouteModelValue('embedding')).map((model) => {
+	                            const descriptor = routeScopeSourceModels('embedding').find((item) => item.id === model.id);
 	                            return {
 	                              ...model,
 	                              badges: descriptor ? buildModelCapabilityBadges(descriptor.capabilities) : undefined,
 	                              inputIcons: descriptor ? buildModelInputIcons(descriptor.inputCapabilities) : undefined,
 	                            };
 	                          }),
-	                          modelDisabled: !videoAnalysisSourceModels.length && !String(formData.video_analysis_model || '').trim(),
+	                          modelDisabled: !routeScopeSource('embedding') || routeScopeSourceModels('embedding').length === 0,
+	                          modelPlaceholder: '请先在该供应商中添加模型',
+	                        })}
+	                        {renderModelSettingsTableRow({
+	                          label: '生图',
+	                          sourceValue: routeScopeSourceValue('image'),
+	                          sources: displayedAiSources,
+	                          onSourceChange: (nextSourceId) => handleRouteScopeSourceChange('image', 'image', nextSourceId, 'image'),
+	                          modelValue: effectiveRouteModelValue('image'),
+	                          onModelChange: (modelId) => applyRouteModel('image', modelId),
+	                          modelOptions: isDashscopeImageTemplate
+	                            ? [{ id: DASHSCOPE_LOCKED_IMAGE_MODEL, label: DASHSCOPE_LOCKED_IMAGE_MODEL }]
+	                            : routeModelSelectOptions(routeScopeSourceModels('image'), effectiveRouteModelValue('image')).map((model) => {
+	                                const descriptor = routeScopeSourceModels('image').find((item) => item.id === model.id);
+	                                return {
+	                                  ...model,
+	                                  badges: descriptor ? buildModelCapabilityBadges(descriptor.capabilities) : undefined,
+	                                  inputIcons: descriptor ? buildModelInputIcons(descriptor.inputCapabilities) : undefined,
+	                                };
+	                              }),
+	                          modelDisabled: isDashscopeImageTemplate || !routeScopeSource('image') || routeScopeSourceModels('image').length === 0,
+	                          modelPlaceholder: isDashscopeImageTemplate ? DASHSCOPE_LOCKED_IMAGE_MODEL : '请先在该源中添加模型',
+	                        })}
+	                        {renderModelSettingsTableRow({
+	                          label: 'TTS',
+	                          sourceValue: routeScopeSourceValue('voiceTts'),
+	                          sources: displayedAiSources,
+	                          onSourceChange: (nextSourceId) => handleRouteScopeSourceChange('voiceTts', 'voice', nextSourceId, 'tts'),
+	                          modelValue: effectiveRouteModelValue('voiceTts'),
+	                          onModelChange: (modelId) => applyRouteModel('voiceTts', modelId),
+	                          modelOptions: routeModelSelectOptions(routeScopeSourceModels('voiceTts'), effectiveRouteModelValue('voiceTts')).map((model) => {
+	                            const descriptor = routeScopeSourceModels('voiceTts').find((item) => item.id === model.id);
+	                            return {
+	                              ...model,
+	                              badges: descriptor ? buildModelCapabilityBadges(descriptor.capabilities) : undefined,
+	                              inputIcons: descriptor ? buildModelInputIcons(descriptor.inputCapabilities) : undefined,
+	                            };
+	                          }),
+	                          modelDisabled: !routeScopeSource('voiceTts') || routeScopeSourceModels('voiceTts').length === 0,
+	                          modelPlaceholder: '请先在该供应商中添加 TTS 模型',
+	                        })}
+	                        {renderModelSettingsTableRow({
+	                          label: '视觉索引',
+	                          sourceValue: routeScopeSourceValue('visualIndex'),
+	                          sources: displayedAiSources,
+	                          onSourceChange: (nextSourceId) => handleRouteScopeSourceChange('visualIndex', 'visual', nextSourceId, 'chat'),
+	                          modelValue: effectiveRouteModelValue('visualIndex'),
+	                          onModelChange: (modelId) => applyRouteModel('visualIndex', modelId),
+	                          modelOptions: routeModelSelectOptions(routeScopeSourceModels('visualIndex'), effectiveRouteModelValue('visualIndex')).map((model) => {
+	                            const descriptor = routeScopeSourceModels('visualIndex').find((item) => item.id === model.id);
+	                            return {
+	                              ...model,
+	                              badges: descriptor ? buildModelCapabilityBadges(descriptor.capabilities) : undefined,
+	                              inputIcons: descriptor ? buildModelInputIcons(descriptor.inputCapabilities) : undefined,
+	                            };
+	                          }),
+	                          modelDisabled: !routeScopeSource('visualIndex') || routeScopeSourceModels('visualIndex').length === 0,
+	                          modelPlaceholder: '请先在该供应商中添加支持图片输入的模型',
+	                        })}
+	                        {renderModelSettingsTableRow({
+	                          label: '视频分析',
+	                          sourceValue: routeScopeSourceValue('videoAnalysis'),
+	                          sources: displayedAiSources,
+	                          onSourceChange: (nextSourceId) => handleRouteScopeSourceChange('videoAnalysis', 'videoAnalysis', nextSourceId, 'chat'),
+	                          modelValue: effectiveRouteModelValue('videoAnalysis'),
+	                          onModelChange: (modelId) => applyRouteModel('videoAnalysis', modelId),
+	                          modelOptions: routeModelSelectOptions(routeScopeSourceModels('videoAnalysis'), effectiveRouteModelValue('videoAnalysis')).map((model) => {
+	                            const descriptor = routeScopeSourceModels('videoAnalysis').find((item) => item.id === model.id);
+	                            return {
+	                              ...model,
+	                              badges: descriptor ? buildModelCapabilityBadges(descriptor.capabilities) : undefined,
+	                              inputIcons: descriptor ? buildModelInputIcons(descriptor.inputCapabilities) : undefined,
+	                            };
+	                          }),
+	                          modelDisabled: !routeScopeSource('videoAnalysis') || routeScopeSourceModels('videoAnalysis').length === 0,
 	                          modelPlaceholder: '请先在该供应商中添加支持视频输入的模型',
 	                        })}
 	                      </div>
