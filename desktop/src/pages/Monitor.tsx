@@ -213,10 +213,24 @@ interface PostDeconstruction {
   titlePatterns: string[];
   hooks: string[];
   reusableTakeaway: string;
+  /** 结构骨架：段落功能 + 真实时间码，供写稿时照着走（无转写的图文帖为空） */
+  structure: DeconSegment[];
   rawContent?: string;
   sourceEvidence?: string;
   createdAt: number;
   updatedAt: number;
+}
+
+/** 拆解出的一段结构（对应后端 DeconstructionSegment）。 */
+interface DeconSegment {
+  /** 段落功能：hook / context / argument / turn / climax / cta，或模型给的中文同义说法 */
+  role: string;
+  /** 起始时间码 `HH:MM:SS`，取自真实 SRT；图文帖为空串 */
+  start: string;
+  /** 占全长百分比（模型估计） */
+  weight: number | null;
+  /** 这一段做了什么 */
+  gist: string;
 }
 
 /** 视频本体分析沉淀：ASR 字幕 + 抽帧 + LLM 摘要（对应后端 PostVideoAnalysisRecord）。 */
@@ -271,18 +285,47 @@ const formatTs = (ts: string | null | undefined): string => {
 
 /** 把一篇拆解沉淀格式化成可复制的纯文本（用于「复制方法论」）。 */
 const formatDeconText = (d: PostDeconstruction): string => {
-  const lines: string[] = [];
-  lines.push(`【爆文拆解】${d.postTitle || '(无标题)'}`);
-  lines.push(`博主：${d.author} · ${platformLabel(d.platform)}`);
-  lines.push('');
-  lines.push(`一、选题角度：${d.topicAngle || '—'}`);
-  lines.push(`二、文案结构：${d.copyStructure || '—'}`);
-  lines.push(`三、开场白：${d.opening || '—'}`);
-  lines.push(`四、标题句式：`);
+  const NUMERALS = '一二三四五六七八九十'.split('');
+  const lines: string[] = [
+    `【爆文拆解】${d.postTitle || '(无标题)'}`,
+    `博主：${d.author} · ${platformLabel(d.platform)}`,
+    '',
+  ];
+  let index = 0;
+  const heading = (title: string) => `${NUMERALS[index++] ?? String(index)}、${title}`;
+
+  lines.push(`${heading('选题角度')}：${d.topicAngle || '—'}`);
+  lines.push(`${heading('文案结构')}：${d.copyStructure || '—'}`);
+  if (d.structure.length) {
+    lines.push(`${heading('结构骨架')}：`);
+    d.structure.forEach((seg) => {
+      const weight = seg.weight != null ? ` ${seg.weight}%` : '';
+      lines.push(`  [${seg.start || '—'}] ${seg.role}${weight}｜${seg.gist}`);
+    });
+  }
+  lines.push(`${heading('开场白')}：${d.opening || '—'}`);
+  lines.push(`${heading('标题句式')}：`);
   (d.titlePatterns.length ? d.titlePatterns : ['—']).forEach((t, i) => lines.push(`  ${i + 1}. ${t}`));
-  lines.push(`五、钩子 / 悬念点：`);
+  lines.push(`${heading('钩子 / 悬念点')}：`);
   (d.hooks.length ? d.hooks : ['—']).forEach((h, i) => lines.push(`  ${i + 1}. ${h}`));
-  lines.push(`六、可复用方法论：${d.reusableTakeaway || '—'}`);
+  lines.push(`${heading('可复用方法论')}：${d.reusableTakeaway || '—'}`);
+  return lines.join('\n');
+};
+
+/** 只导出结构骨架，供写稿时当参照（贴进写作对话比整篇拆解更省上下文）。 */
+const formatDeconSkeleton = (d: PostDeconstruction): string => {
+  const lines: string[] = [
+    `【结构骨架】${d.postTitle || '(无标题)'}（${d.author} · ${platformLabel(d.platform)}）`,
+  ];
+  d.structure.forEach((seg) => {
+    const weight = seg.weight != null ? `（占 ${seg.weight}%）` : '';
+    lines.push(`${seg.start || '—'}｜${seg.role}${weight}｜${seg.gist}`);
+  });
+  if (d.hooks.length) {
+    lines.push('');
+    lines.push('可借用金句结构：');
+    d.hooks.forEach((hook) => lines.push(`- ${hook}`));
+  }
   return lines.join('\n');
 };
 
@@ -313,6 +356,18 @@ function normalizeDecon(raw: Record<string, unknown> | null | undefined): PostDe
     titlePatterns: arr('titlePatterns').length ? arr('titlePatterns') : arr('title_patterns'),
     hooks: arr('hooks'),
     reusableTakeaway: String(raw.reusableTakeaway ?? raw.reusable_takeaway ?? ''),
+    structure: (Array.isArray(raw.structure) ? raw.structure : [])
+      .map((item) => {
+        const seg = (item ?? {}) as Record<string, unknown>;
+        const weight = Number(seg.weight);
+        return {
+          role: String(seg.role ?? ''),
+          start: String(seg.start ?? ''),
+          weight: Number.isFinite(weight) ? weight : null,
+          gist: String(seg.gist ?? ''),
+        };
+      })
+      .filter((seg) => seg.role || seg.gist),
     rawContent: raw.rawContent != null ? String(raw.rawContent) : undefined,
     sourceEvidence: raw.sourceEvidence != null ? String(raw.sourceEvidence) : undefined,
     createdAt: num('createdAt') || num('created_at'),
@@ -345,10 +400,44 @@ function DeconFields({ decon }: { decon: PostDeconstruction }) {
         >
           <Copy className="w-3 h-3" />复制
         </button>
+        {decon.structure.length > 0 && (
+          <button
+            onClick={() => {
+              void navigator.clipboard?.writeText(formatDeconSkeleton(decon)).catch(() => {});
+            }}
+            className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-md border border-accent-primary/40 text-accent-primary hover:bg-accent-primary/10 transition-colors"
+            title="只复制结构骨架，贴进写作对话当参照"
+          >
+            <Copy className="w-3 h-3" />复制骨架
+          </button>
+        )}
       </div>
 
       <Field label="选题角度（为什么火）">{decon.topicAngle || '—'}</Field>
       <Field label="文案结构（怎么铺）">{decon.copyStructure || '—'}</Field>
+
+      {/* 结构骨架：时间码来自真实字幕，写稿时照着这个节奏走 */}
+      {decon.structure.length > 0 && (
+        <Field label={`结构骨架（${decon.structure.length} 段，时间码取自字幕）`}>
+          <div className="space-y-1">
+            {decon.structure.map((seg, i) => (
+              <div key={`${seg.start}-${i}`} className="flex items-start gap-2">
+                <span className="shrink-0 font-mono text-[11px] text-text-tertiary pt-0.5">
+                  {seg.start || '—'}
+                </span>
+                <span className="shrink-0 rounded bg-accent-primary/10 px-1.5 text-[10px] font-medium text-accent-primary">
+                  {seg.role || '—'}
+                </span>
+                {seg.weight != null && (
+                  <span className="shrink-0 text-[10px] text-text-tertiary pt-0.5">{seg.weight}%</span>
+                )}
+                <span className="min-w-0 flex-1">{seg.gist}</span>
+              </div>
+            ))}
+          </div>
+        </Field>
+      )}
+
       <Field label="开场白（前 3 秒）">{decon.opening || '—'}</Field>
 
       <Field label="标题句式">
