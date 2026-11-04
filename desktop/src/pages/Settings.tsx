@@ -15,6 +15,7 @@ import {
   isOfficialAutoSourceId
 } from '../config/aiSources';
 import { appAlert, appConfirm } from '../utils/appDialogs';
+import { isTauriRuntime } from '../bridge/browserHost';
 import { AdvisorModal, AdvisorSettingsPanel, type Advisor } from './Advisors';
 import { subscribeSettingsUpdated } from '../bridge/appEvents';
 import { hasRenderableAssetUrl, resolveAssetUrl } from '../utils/pathManager';
@@ -883,6 +884,14 @@ export function Settings({
 }) {
   const { t } = useI18n();
   const [activeTab, setActiveTab] = useState<SettingsTab>('ai');
+  /**
+   * 是否管理员（桌面端恒 true；web 普通用户 false）。
+   *
+   * 「AI 模型」是服务器级配置：改它影响所有 web 用户，且普通用户在官方源未登录时
+   * 无论怎么点都只会看到「请先登录官方账号」。所以这个 tab 只对管理员开放。
+   * 失败时按桌面端处理（fail-open），避免一过性错误把桌面端的设置页阉了。
+   */
+  const [isAdminUser, setIsAdminUser] = useState(true);
   const [teamAdvisors, setTeamAdvisors] = useState<Advisor[]>([]);
   const [isTeamAdvisorsLoading, setIsTeamAdvisorsLoading] = useState(false);
   const [teamAdvisorBusyId, setTeamAdvisorBusyId] = useState<string | null>(null);
@@ -1781,21 +1790,41 @@ export function Settings({
   const { snapshot: officialAuthState, bootstrapped: officialAuthBootstrapped } = useOfficialAuthState();
 
   useEffect(() => {
+    // 桌面端没有 web 身份，恒为管理员，跳过这次探测
+    if (isTauriRuntime()) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const flags = await window.ipcRenderer.runtimeFlags();
+        if (!cancelled) setIsAdminUser(flags?.isAdmin !== false);
+      } catch {
+        if (!cancelled) setIsAdminUser(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!navigationTarget) return;
-    if (navigationTarget.tab) {
+    // 普通用户没有「AI 模型」这一页：外部跳转（如侧栏「配置模型」）落到它时忽略
+    const wantsAiTab = navigationTarget.tab === 'ai';
+    if (navigationTarget.tab && !(wantsAiTab && !isAdminUser)) {
       setActiveTab(navigationTarget.tab);
     }
-    if (navigationTarget.tab === 'ai' && navigationTarget.aiModelSubTab === 'custom') {
+    if (!isAdminUser) return;
+    if (wantsAiTab && navigationTarget.aiModelSubTab === 'custom') {
       setShowAiModelSettings(true);
     }
-    if (navigationTarget.tab === 'ai' && navigationTarget.aiModelSubTab === 'login') {
+    if (wantsAiTab && navigationTarget.aiModelSubTab === 'login') {
       setShowAiModelSettings(false);
       pendingOfficialAiPanelScrollRef.current = true;
       window.setTimeout(() => {
         officialAiPanelRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' });
       }, 80);
     }
-  }, [navigationTarget]);
+  }, [navigationTarget, isAdminUser]);
 
   useEffect(() => {
     if (activeTab !== 'ai' || !officialAiPanelEnabled || !pendingOfficialAiPanelScrollRef.current) return;
@@ -6664,10 +6693,19 @@ export function Settings({
 
   const tabs = useMemo(() => {
     const visibleTabs = new Set(APP_BRAND.visibleSettingsTabs);
-    if (visibleTabs.size === 0) return allTabs;
-    const filteredTabs = allTabs.filter((tab) => visibleTabs.has(tab.id));
+    let filteredTabs = visibleTabs.size === 0
+      ? allTabs
+      : allTabs.filter((tab) => visibleTabs.has(tab.id));
+    // 「AI 模型」只对管理员开放：它是服务器级路由配置，普通用户改不了也用不了
+    // （官方源未登录时整页只会显示「请先登录官方账号」）。
+    if (!isAdminUser) {
+      filteredTabs = filteredTabs.filter((tab) => tab.id !== 'ai');
+    }
+    if (filteredTabs.length === 0) {
+      filteredTabs = allTabs.filter((tab) => isAdminUser || tab.id !== 'ai');
+    }
     return filteredTabs.length > 0 ? filteredTabs : allTabs;
-  }, [allTabs]);
+  }, [allTabs, isAdminUser]);
 
   useEffect(() => {
     if (tabs.some((tab) => tab.id === activeTab)) return;
@@ -6793,8 +6831,8 @@ export function Settings({
               />
             )}
 
-            {/* AI Tab */}
-            {activeTab === 'ai' && (
+            {/* AI Tab（仅管理员：服务器级模型路由配置） */}
+            {activeTab === 'ai' && isAdminUser && (
               <div className="space-y-10">
                 {/* LLM Connection Config */}
                 <section className="space-y-6">
