@@ -407,6 +407,8 @@ export function createMonitorBridge(core: BridgeCore) {
           videosDownloaded: number;
           videosTranscribed: number;
           failed: number;
+          /** 自动拉起 Chrome 失败的平台（该平台整轮抓不到东西，需人工到「登录管理」处理） */
+          chromeMissing?: string[];
           ranAt: number;
         },
       >() =>

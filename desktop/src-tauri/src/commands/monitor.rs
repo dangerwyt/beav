@@ -4200,6 +4200,37 @@ fn find_own_export_dir(l3: &Path, post_id: &str) -> Option<PathBuf> {
     None
 }
 
+/// 跨日期 / 跨作者名，在「平台」一级目录下找这篇帖子已经导出过的目录。
+///
+/// 为什么需要它：导出目录里的日期是**导出当天**，同一篇帖子在不同日子被再次自动导出
+/// （转写重试成功、重新下载、重新抽帧、重新分析都会触发 `export_post_product`）时会落到
+/// 另一个 `日期/作者` 分支，`find_own_export_dir(l3)` 按定义找不到，于是又建一份 ——
+/// 素材库里就出现同一篇帖子的两个目录（内容各写一半，谁也删不掉谁）。
+/// 作者名被清洗过（老数据 `@抖音科技` → 正确昵称）也会换作者目录，所以这里不按作者名
+/// 定位，而是把每个日期目录下的作者目录都翻一遍，只认 `.beav-post-id`。
+fn find_export_dir_for_post(l1: &Path, post_id: &str) -> Option<PathBuf> {
+    let dates = std::fs::read_dir(l1).ok()?;
+    for date_entry in dates.flatten() {
+        let date_dir = date_entry.path();
+        if !date_dir.is_dir() {
+            continue;
+        }
+        let Ok(authors) = std::fs::read_dir(&date_dir) else {
+            continue;
+        };
+        for author_entry in authors.flatten() {
+            let author_dir = author_entry.path();
+            if !author_dir.is_dir() {
+                continue;
+            }
+            if let Some(found) = find_own_export_dir(&author_dir, post_id) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 /// 仅在目标缺失或大小变化时才拷贝，避免重复导出时反复复制大文件。返回是否真的复制了。
 fn copy_if_changed(src: &Path, dst: &Path) -> bool {
     if let (Ok(sm), Ok(dm)) = (std::fs::metadata(src), std::fs::metadata(dst)) {
@@ -4710,7 +4741,12 @@ fn try_export_post_product(
             .cloned())
     })?;
 
-    // 导出根 → 平台 → 日期 → 作者 → 标题前10字
+    // 导出根 → 平台 → 日期 → 作者 → 标题前 20 字
+    //
+    // 注意 `date` 取的是**导出当天**（不是发布时间），所以同一篇帖子在不同日子被
+    // 自动导出（转写重试成功、重新下载、重新抽帧都会触发）会算出一组全新的 l3。
+    // 只用 `find_own_export_dir(l3)` 去重的话跨天必然找不到 → 再建一份同名素材。
+    // 所以这里按 `.beav-post-id` 在**整个平台目录**下横向找一遍，先复用再说。
     let root = resolve_export_target(state)?;
     let date = export_date_yyyymmdd(&post);
     let author = {
@@ -4726,8 +4762,23 @@ fn try_export_post_product(
     let l3 = l2.join(&author);
 
     let title_prefix = title_export_prefix(&post.title, EXPORT_TITLE_PREFIX_LEN);
-    let l4 = match find_own_export_dir(&l3, post_id) {
-        Some(d) => d,
+    // 先看当天当天作者（快路径），再横向扫平台目录下的历史日期 / 历史作者名。
+    let l4 = match find_own_export_dir(&l3, post_id)
+        .or_else(|| find_export_dir_for_post(&l1, post_id))
+    {        Some(existing) => {
+            // 复用旧目录时标题可能已被清洗/纠正：沿用旧名会让素材库一直顶着脏标题，
+            // 所以在同一个作者目录内就地改名。目标名已被占用（别的帖子同名前缀）时保持不动，
+            // 宁可留旧名也不覆盖别人的目录。
+            let renamed = match existing.file_name().and_then(|name| name.to_str()) {
+                Some(current) if current != title_prefix => existing
+                    .parent()
+                    .map(|parent| parent.join(&title_prefix))
+                    .filter(|target| !target.exists())
+                    .and_then(|target| std::fs::rename(&existing, &target).ok().map(|_| target)),
+                _ => None,
+            };
+            renamed.unwrap_or(existing)
+        }
         None => {
             let candidate = l3.join(&title_prefix);
             if candidate.exists() {
@@ -4739,6 +4790,7 @@ fn try_export_post_product(
     };
     std::fs::create_dir_all(&l4).map_err(|e| format!("创建产物目录失败：{e}"))?;
     let _ = std::fs::write(l4.join(".beav-post-id"), post_id);
+
 
     // 原图
     for (idx, img) in post.images.iter().enumerate() {
@@ -5254,6 +5306,86 @@ pub fn run_daily_prefetch(app: AppHandle) -> Result<Value, String> {
             .collect())
     })?;
 
+    // —— 每日任务前置：按平台自动拉起 Chrome ——
+    // 平台账号是共享的，cookie 存在各自 profile 里，凌晨不需要人扫码；但「用户前一天
+    // 把 Chrome 关掉」才是常态。不主动拉起的话整轮会是：列表抓不到 → newPosts=0 →
+    // 正文/视频全 0，界面上只看到一堆 0，真相只留在一条 warn 日志里（2026-11-03 那轮
+    // 就是这么静默失败的）。这里先补齐，拉不起来的平台记进 summary.chromeMissing。
+    let mut chrome_missing: Vec<String> = Vec::new();
+    {
+        // 只处理需要 CDP 的平台（小红书 / 抖音 / B 站），并按平台去重。
+        // 注意不能让某个博主缺少 platform 字段就整批跳过，回退到从主页 URL 推断。
+        let mut platforms: Vec<String> = Vec::new();
+        for watch in &watches {
+            let platform = if watch.platform.trim().is_empty() {
+                watch
+                    .profile_url
+                    .as_deref()
+                    .map(platform_of)
+                    .unwrap_or_default()
+            } else {
+                watch.platform.clone()
+            };
+            let is_cdp = Platform::parse(&platform)
+                .map(|parsed| parsed.is_cdp())
+                .unwrap_or(false);
+            if is_cdp && !platforms.iter().any(|known| known == &platform) {
+                platforms.push(platform);
+            }
+        }
+        for platform in platforms {
+            // 会话还活着就直接复用（launch 内部也会复用，这里先判掉省掉 8s 等待）。
+            if headless_browser::chrome_session_alive(&platform) {
+                continue;
+            }
+            let Some(chrome_path) = headless_browser::detect_chrome_path() else {
+                chrome_missing.push(platform);
+                continue;
+            };
+            // 用 home_url 而不是 login_url：绝大多数时候 profile 里的登录态还在，
+            // 直接开首页就能抓；真掉登录才需要人去「登录管理」重新扫码。
+            let landing = headless_browser::qr_platform_spec(&platform)
+                .map(|spec| spec.home_url)
+                .unwrap_or("about:blank");
+            let launched = headless_browser::profile_dir_for(&app, &platform).and_then(|profile| {
+                headless_browser::launch_chrome_for_login(
+                    &chrome_path,
+                    &profile,
+                    &platform,
+                    landing,
+                )
+            });
+            match launched {
+                Ok(port) => {
+                    println!("[monitor daily] auto-launched chrome for {platform} on port {port}");
+                    crate::logging::emit_legacy_line(
+                        crate::logging::event::LogSource::Host,
+                        crate::logging::event::LogLevel::Info,
+                        "monitor",
+                        "monitor.daily.chrome_launched",
+                        format!("[monitor daily] auto-launched chrome for {platform}: port {port}"),
+                        json!({ "platform": platform, "port": port }),
+                        None,
+                    );
+                }
+                Err(error) => {
+                    chrome_missing.push(platform.clone());
+                    crate::logging::emit_legacy_line(
+                        crate::logging::event::LogSource::Host,
+                        crate::logging::event::LogLevel::Warn,
+                        "monitor",
+                        "monitor.daily.chrome_launch_failed",
+                        format!(
+                            "[monitor daily] auto-launch chrome for {platform} failed: {error}"
+                        ),
+                        json!({ "platform": platform, "error": error }),
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
     // 每日增量窗口：取「用户设置的单次抓取条数」与下限的较大者
     let daily_limit = resolve_scan_limit(&state, &json!({})).max(DAILY_PREFETCH_MIN_LIMIT);
 
@@ -5426,6 +5558,9 @@ pub fn run_daily_prefetch(app: AppHandle) -> Result<Value, String> {
         "videosDownloaded": stats.videos,
         "videosTranscribed": stats.transcribed,
         "failed": stats.failed,
+        // 自动拉起失败的平台（拉不起来 → 该平台整轮抓不到东西，界面要显式提示，
+        // 否则用户只看到一排 0，以为「今天没更新」）。
+        "chromeMissing": chrome_missing,
         "ranAt": now,
     });
     println!("[monitor daily] prefetch summary: {}", summary);
@@ -5496,18 +5631,48 @@ fn run_videos_two_phase(app: &AppHandle, video_ids: Vec<String>) -> (i64, i64, i
                         .pop_front();
                     let Some(id) = next else { break };
 
-                    if let Err(error) = download_video(&app, &state, &json!({ "id": id.clone() })) {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        crate::logging::emit_legacy_line(
-                            crate::logging::event::LogSource::Host,
-                            crate::logging::event::LogLevel::Warn,
-                            "monitor",
-                            "monitor.daily.download_failed",
-                            format!("[monitor daily] video download for {id} failed: {error}"),
-                            json!({ "postId": id, "error": error }),
-                            None,
-                        );
-                        continue;
+                    match download_video(&app, &state, &json!({ "id": id.clone() })) {
+                        // `download_video` 在「平台不支持 / Chrome 未连接」这类前置条件下
+                        // 返回的是 `Ok({success:false, note})` 而不是 Err —— 那种情况并没有
+                        // 落盘。以前只判 Err 就 `downloaded.fetch_add`，会让 videosDownloaded
+                        // 虚高，而 videoLocalPath 仍是空、阶段二逐条失败。这里判 success 字段。
+                        Ok(value) => {
+                            let ok = value
+                                .get("success")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true);
+                            if !ok {
+                                let note = value
+                                    .get("note")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("未知原因")
+                                    .to_string();
+                                failed.fetch_add(1, Ordering::Relaxed);
+                                crate::logging::emit_legacy_line(
+                                    crate::logging::event::LogSource::Host,
+                                    crate::logging::event::LogLevel::Warn,
+                                    "monitor",
+                                    "monitor.daily.download_skipped",
+                                    format!("[monitor daily] video download for {id} skipped: {note}"),
+                                    json!({ "postId": id, "note": note }),
+                                    None,
+                                );
+                                continue;
+                            }
+                        }
+                        Err(error) => {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            crate::logging::emit_legacy_line(
+                                crate::logging::event::LogSource::Host,
+                                crate::logging::event::LogLevel::Warn,
+                                "monitor",
+                                "monitor.daily.download_failed",
+                                format!("[monitor daily] video download for {id} failed: {error}"),
+                                json!({ "postId": id, "error": error }),
+                                None,
+                            );
+                            continue;
+                        }
                     }
                     downloaded.fetch_add(1, Ordering::Relaxed);
 

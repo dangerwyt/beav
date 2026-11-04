@@ -1095,6 +1095,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
         skipNote?: string | null;
         backfilled?: number;
         recoveredDownloading?: number;
+        chromeMissing?: string[];
       };
       const parts: string[] = [];
       if ((p.newPosts ?? 0) > 0) parts.push(`新增 ${p.newPosts} 篇`);
@@ -1107,6 +1108,14 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
         showToast(
           'err',
           `有 ${p.detailSkipped} 篇未抓到正文${p.skipNote ? `：${p.skipNote}` : ''}`,
+        );
+      }
+      // 自动拉起 Chrome 失败的平台：这一平台整轮等于没跑（列表、正文、视频全为空），
+      // 不单独提示的话用户只会看到一排 0，误判成「今天没更新」。
+      if ((p.chromeMissing ?? []).length > 0) {
+        showToast(
+          'err',
+          `${(p.chromeMissing ?? []).map(platformLabel).join(' / ')} 的 Chrome 未能自动启动，该平台本轮未抓取，请到「登录管理」手动打开`,
         );
       }
     };
