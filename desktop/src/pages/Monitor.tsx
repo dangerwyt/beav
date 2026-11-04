@@ -6,6 +6,7 @@ import { clsx } from 'clsx';
 import type { MonitorChromeStatus, MonitorChromeLaunchResult, MonitorChromeTestResult } from '../bridge/domains/monitorBridge';
 import { resolveAssetUrl } from '../utils/pathManager';
 import { appConfirm } from '../utils/appDialogs';
+import { normalizePostBody } from '../utils/postBody';
 import { CDP_PLATFORMS, PLATFORM_HOME, PLATFORMS, type CdpPlatform } from '../constants/platforms';
 import { APP_BRAND } from '../config/brand';
 
@@ -249,31 +250,6 @@ const PLATFORM_OPTIONS = PLATFORMS;
 const platformLabel = (code: string): string => {
   const found = PLATFORM_OPTIONS.find((opt) => opt.value === code);
   return found ? found.label : (code || '网页');
-};
-
-/**
- * 把正文里的「软换行」折叠掉，只保留空行分段。
- *
- * 抖音 / 小红书文案常按手机屏宽硬换行（每 20 字左右一个 \n），直接 `pre-wrap` 渲染
- * 会在详情里出现锯齿状的短行（一列 20 字、忽长忽短）。但完全去掉 `pre-wrap` 又会把
- * 分段一起吃光，整段糊成一坨。所以先按段落预处理：段内单换行合并（中文直接相连，
- * 西文补一个空格），段间（连续空行）保留，再用普通折行渲染。
- */
-const normalizePostBody = (text: string): string => {
-  const isCjk = (ch: string) => /[\u2e80-\u9fff\uff00-\uffef]/.test(ch);
-  return String(text || '')
-    .replace(/\r\n?/g, '\n')
-    .split(/\n{2,}/)
-    .map((para) => {
-      const lines = para.split('\n').map((line) => line.trim()).filter(Boolean);
-      return lines.reduce((acc, line) => {
-        if (!acc) return line;
-        const needSpace = !isCjk(acc.slice(-1)) && !isCjk(line[0]);
-        return acc + (needSpace ? ' ' : '') + line;
-      }, '');
-    })
-    .filter(Boolean)
-    .join('\n\n');
 };
 
 /**

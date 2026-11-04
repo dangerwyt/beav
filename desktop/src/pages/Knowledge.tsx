@@ -10,6 +10,7 @@ import { SAFE_REMARK_PLUGINS } from '../utils/markdownRemarkPlugins';
 import { buildRedClawAuthoringMessage } from '../utils/redclawAuthoring';
 import { appAlert, appConfirm } from '../utils/appDialogs';
 import { formatTimestampDateTime } from '../utils/time';
+import { normalizePostBody } from '../utils/postBody';
 import { SelectMenu } from '../components/ui/SelectMenu';
 import { APP_BRAND } from '../config/brand';
 import {
@@ -1654,8 +1655,8 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
 
         return (
             <div className="bg-surface-secondary/50 rounded-lg border border-border p-4">
-                <pre className="text-sm text-text-primary whitespace-pre-wrap font-sans leading-relaxed">
-                    {note.content}
+                <pre className="text-sm text-text-primary whitespace-pre-line font-sans leading-relaxed">
+                    {normalizePostBody(note.content)}
                 </pre>
             </div>
         );
@@ -1954,7 +1955,7 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
                         <div className="min-h-0 flex-1 overflow-y-auto custom-scrollbar">
                             <div className="space-y-4 px-5 py-5">
                                 <h1 className="text-[19px] font-extrabold leading-snug tracking-tight text-text-primary">{note.title}</h1>
-                                <div className="whitespace-pre-wrap text-[15px] leading-[1.72] text-text-primary">{note.content}</div>
+                                <div className="whitespace-pre-line text-[15px] leading-[1.72] text-text-primary">{normalizePostBody(note.content)}</div>
                                 {tags.length > 0 && (
                                     <div className="flex flex-wrap gap-2 pt-1">
                                         {tags.map((tag) => <span key={tag} className="text-[14px] font-semibold text-[#24599a]">#{tag}</span>)}
@@ -2367,8 +2368,8 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
                    );
                 })()}
 
-                <div className="whitespace-pre-wrap text-sm text-text-secondary font-sans leading-relaxed mb-4">
-                    {selectedNote.content}
+                <div className="whitespace-pre-line text-sm text-text-secondary font-sans leading-relaxed mb-4">
+                    {normalizePostBody(selectedNote.content)}
                 </div>
 
                 {renderKnowledgeExtractionFoldout(selectedNote)}
