@@ -972,11 +972,30 @@ pub(crate) struct PostDeconstructionRecord {
     pub(crate) hooks: Vec<String>,
     /// 可复用的方法论点。
     pub(crate) reusable_takeaway: String,
+    /// 结构骨架：按段落切分的功能序列（钩子/立论/论证/转折/收尾），带真实时间码。
+    ///
+    /// 与 `copy_structure`（给人读的长文本）互补：这里是**机器可用**的结构，
+    /// 供「结构模板库」按钩子类型/骨架检索，写稿时当参照。无转写的图文帖为空。
+    pub(crate) structure: Vec<DeconstructionSegment>,
     /// 拆解所用的原文（落库备查）。
     pub(crate) raw_content: String,
     pub(crate) source_evidence: String,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
+}
+
+/// 拆解出的一段结构：这一段在整条内容里承担什么功能、从哪一刻开始、占多大比重。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct DeconstructionSegment {
+    /// 段落功能：hook / context / argument / turn / climax / cta（模型可给同义中文，前端按文本展示）。
+    pub(crate) role: String,
+    /// 起始时间码（`HH:MM:SS`，取自真实 SRT；图文帖或无法定位时为空串）。
+    pub(crate) start: String,
+    /// 该段占全长比重（0~100，模型估计值，用于判断"钩子占几秒"这类节奏问题）。
+    pub(crate) weight: Option<f64>,
+    /// 这一段具体做了什么（一句话，可带原文短句）。
+    pub(crate) gist: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

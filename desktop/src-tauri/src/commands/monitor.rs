@@ -9,7 +9,7 @@ use crate::ffmpeg_program;
 use crate::ffprobe_program;
 use crate::workspace_root;
 use crate::platform::Platform;
-use crate::store::types::{MonitoredPostRecord, PostVideoAnalysisRecord};
+use crate::store::types::{DeconstructionSegment, MonitoredPostRecord, PostVideoAnalysisRecord};
 use crate::commands::media_transcribe::execute_media_transcribe;
 use std::path::Path;
 use std::path::PathBuf;
@@ -2682,6 +2682,94 @@ fn string_array_field(value: &Value, key: &str) -> Option<Vec<String>> {
 ///
 /// 复用 `ai_model_manager` 解析 AI 配置（用户自配或官方）+ `official_support` 的同步结构化调用
 /// （按 provider 自动分发 OpenAI/Anthropic/Gemini）。前端已抓取的全文在 `content` 字段，无需再抽文案。
+/// 拆解输入的字符预算（按 Unicode 字符计，不是字节）。
+const DECONSTRUCT_BODY_CLIP: usize = 1500;
+const DECONSTRUCT_TRANSCRIPT_CLIP: usize = 2000;
+/// 口播大纲的抽段步长与上限：一小时视频的 SRT 有几万字，必须压成能塞进上下文的骨架。
+const DECONSTRUCT_OUTLINE_STEP_SECS: i64 = 90;
+const DECONSTRUCT_OUTLINE_MAX: usize = 20;
+
+fn clip_chars(text: &str, max: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+fn format_hms(total: i64) -> String {
+    let secs = total.max(0);
+    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+}
+
+/// 解析 SRT 成 `(起始秒, 文本)`。脏行直接跳过——拆解不该因为字幕格式问题整条失败。
+fn srt_cues(srt: &str) -> Vec<(i64, String)> {
+    let mut cues = Vec::new();
+    for block in srt.split("\n\n") {
+        let lines: Vec<&str> = block.lines().filter(|line| !line.trim().is_empty()).collect();
+        if lines.is_empty() {
+            continue;
+        }
+        let Some(timing_index) = lines.iter().position(|line| line.contains("-->")) else {
+            continue;
+        };
+        let start_raw = lines[timing_index].split("-->").next().unwrap_or("").trim();
+        let start = start_raw
+            .split(':')
+            .collect::<Vec<_>>();
+        let start_secs = if start.len() == 3 {
+            let secs_part = start[2].split(',').next().unwrap_or("0");
+            let h = start[0].trim().parse::<i64>().unwrap_or(0);
+            let m = start[1].trim().parse::<i64>().unwrap_or(0);
+            let s = secs_part.trim().parse::<i64>().unwrap_or(0);
+            h * 3600 + m * 60 + s
+        } else {
+            continue;
+        };
+        let text = lines[timing_index + 1..].join(" ").trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        cues.push((start_secs, text));
+    }
+    cues
+}
+
+/// 把字幕压成「每约 step 秒一行」的大纲，时间码保留真实值。
+fn srt_outline(cues: &[(i64, String)], step_secs: i64, max_lines: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut next_from = 0i64;
+    for (start, text) in cues {
+        if lines.len() >= max_lines {
+            break;
+        }
+        if *start < next_from {
+            continue;
+        }
+        lines.push(format!("【{}】{}", format_hms(*start), clip_chars(text, 60)));
+        next_from = *start + step_secs.max(1);
+    }
+    lines.join("\n")
+}
+
+/// 拆解用的系统提示：五层框架（钩子—结构—论证—情绪—转化），输出字段与旧版保持一致，
+/// 额外给一个结构化 `structure`，供「结构模板库」检索。
+const DECONSTRUCT_SYSTEM_PROMPT: &str = "你是资深内容拆解专家，负责把已验证的爆款内容拆成可复用的方法论。\
+按五层分析，只输出 JSON，不要任何解释性文字：\
+1) 钩子：开头用什么把人留住（反常识 / 利益承诺 / 身份代入 / 悬念 / 冲突 / 故事切入），并摘出原句；\
+2) 结构：按段落标出各自功能（钩住 → 立论 → 论证 → 转折 → 升华 → 转化），给出每段起始时间码与大致占比；\
+3) 论证：用了什么材料（故事 / 数据 / 类比 / 权威），哪里证据偏薄；\
+4) 情绪：情绪如何推进，金句出现在什么位置、为什么能被记住；\
+5) 转化：结尾做了哪种引导（关注 / 收藏 / 评论 / 私域），是否自然。\
+硬性约束：时间码**只能**取自用户给出的大纲里的时间码，禁止编造；大纲没给时间码就留空字符串。\
+画面/镜头细节没有依据就不要写。数字未经核实不得写成结论。\
+输出字段：topicAngle（选题角度，1-2 句）、copyStructure（结构说明，需带时间码）、\
+opening（开场钩子，注明钩子类型）、titlePatterns（标题句式数组）、hooks（可脱离上下文传播的金句数组）、\
+reusableTakeaway（可复用的方法论点，1-2 句）、\
+structure（数组，每项 {role, start, weight, gist}：role 为段落功能，start 为时间码，weight 为占全长百分比，gist 为该段做了什么）。";
+
 fn deconstruct(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
     let post_id = str_field(payload, "postId")
         .or_else(|| str_field(payload, "post_id"))
@@ -2696,8 +2784,31 @@ fn deconstruct(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
             .cloned())
     })?;
     let post = post.ok_or_else(|| "未找到该动态，请先抓取".to_string())?;
-    if post.content.trim().is_empty() {
-        return Err("该动态暂无正文，请先点开详情抓取正文后再拆解".to_string());
+
+    // 转写与字幕：视频帖的「正文」通常只有一句标题，真正的内容在口播里。
+    // 只喂正文会让拆解凭空发挥（旧实现的根本问题）。
+    let analysis = with_store(state, |store| {
+        Ok(store
+            .post_video_analyses
+            .iter()
+            .find(|item| item.post_id == post_id)
+            .cloned())
+    })?;
+    let transcript = analysis
+        .as_ref()
+        .map(|item| item.transcript.trim().to_string())
+        .unwrap_or_default();
+    let srt = analysis
+        .as_ref()
+        .map(|item| item.transcript_srt.clone())
+        .unwrap_or_default();
+    let duration_secs = analysis.as_ref().and_then(|item| item.duration_secs);
+
+    if post.content.trim().is_empty() && transcript.is_empty() {
+        return Err(
+            "这条既没有正文也没有转写：请先「重新抓正文」，或对视频跑一次「语音转写」后再拆解"
+                .to_string(),
+        );
     }
 
     // 解析 AI 配置（用户自配或官方）
@@ -2705,19 +2816,60 @@ fn deconstruct(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
     let config = AiModelManager::resolve_chat_config(&settings, None)
         .ok_or_else(|| "未配置可用的 AI 模型，请在设置中配置后重试".to_string())?;
 
-    // 构建 prompt：系统负责角色与 schema，用户携带原文
-    let system_prompt = "你是资深内容拆解专家，擅长把爆款文案拆成可复用的方法论要素。\
-        只输出 JSON，不要任何解释性文字。JSON 字段：\
-        topicAngle（选题角度：为什么值得写，1-2 句）、\
-        copyStructure（文案结构：开头如何钩人、中间如何递进、结尾如何转化）、\
-        opening（开场白 / 前 3 秒钩子，可引用原文或改写）、\
-        titlePatterns（标题句式数组，可多条）、\
-        hooks（金句 / 钩子数组，可多条）、\
-        reusableTakeaway（可复用的方法论点，1-2 句）。";
-    let user_prompt = format!(
-        "请拆解以下爆款文案：\n标题：{}\n作者：{}\n正文：\n{}\n",
-        post.title, post.author, post.content
-    );
+    // 拼输入：元信息 + 文案（截断）+ 口播大纲（有 SRT 用大纲，否则退全文）
+    let cues = srt_cues(&srt);
+    let outline = srt_outline(&cues, DECONSTRUCT_OUTLINE_STEP_SECS, DECONSTRUCT_OUTLINE_MAX);
+    let engagement = {
+        let mut parts: Vec<String> = Vec::new();
+        if post.likes > 0 {
+            parts.push(format!("赞 {}", post.likes));
+        }
+        if post.comments > 0 {
+            parts.push(format!("评 {}", post.comments));
+        }
+        if post.collects > 0 {
+            parts.push(format!("藏 {}", post.collects));
+        }
+        if post.likes > 0 && post.collects > 0 {
+            parts.push(format!("赞藏比 1:{:.1}", post.collects as f64 / post.likes as f64));
+        }
+        parts.join(" · ")
+    };
+
+    let mut user_prompt = String::new();
+    user_prompt.push_str(&format!(
+        "【平台】{}\n【作者】{}\n",
+        platform_label(&post.platform),
+        post.author
+    ));
+    if let Some(duration) = duration_secs {
+        user_prompt.push_str(&format!("【时长】{}\n", format_hms(duration as i64)));
+    }
+    if !engagement.is_empty() {
+        user_prompt.push_str(&format!("【互动】{}\n", engagement));
+    }
+    if !post.title.trim().is_empty() {
+        user_prompt.push_str(&format!("【标题】{}\n", post.title));
+    }
+    if !post.content.trim().is_empty() {
+        user_prompt.push_str(&format!(
+            "\n【文案（可能被截断）】\n{}\n",
+            clip_chars(&post.content, DECONSTRUCT_BODY_CLIP)
+        ));
+    }
+    if !outline.is_empty() {
+        user_prompt.push_str(&format!(
+            "\n【口播分段大纲（时间码取自真实字幕，只能引用这里出现的时间码）】\n{}\n",
+            outline
+        ));
+    } else if !transcript.is_empty() {
+        user_prompt.push_str(&format!(
+            "\n【口播全文（无时间码，不要编造时间码）】\n{}\n",
+            clip_chars(&transcript, DECONSTRUCT_TRANSCRIPT_CLIP)
+        ));
+    }
+
+    let system_prompt = DECONSTRUCT_SYSTEM_PROMPT;
 
     let raw = invoke_structured_chat_by_protocol(
         &config.protocol,
@@ -2747,6 +2899,49 @@ fn deconstruct(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
         .or_else(|| str_field(&parsed, "reusable_takeaway"))
         .unwrap_or_default();
 
+    // 结构骨架：模型可给可不给（图文帖通常没有），给多少收多少，不因缺字段失败。
+    let structure: Vec<DeconstructionSegment> = parsed
+        .get("structure")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let role = str_field(item, "role").unwrap_or_default();
+                    let gist = str_field(item, "gist").unwrap_or_default();
+                    if role.trim().is_empty() && gist.trim().is_empty() {
+                        return None;
+                    }
+                    Some(DeconstructionSegment {
+                        role,
+                        start: str_field(item, "start").unwrap_or_default(),
+                        weight: item.get("weight").and_then(Value::as_f64),
+                        gist,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 拆解依据：写清楚用了哪些输入，日后复盘才能区分「基于口播」与「只看了文案」。
+    let basis = if !cues.is_empty() {
+        format!(
+            "含口播时间轴 {} 段 / 大纲 {} 行",
+            cues.len(),
+            outline.lines().count()
+        )
+    } else if !transcript.is_empty() {
+        format!("含口播全文 {} 字（无时间码）", transcript.chars().count())
+    } else {
+        "仅文案，未含口播".to_string()
+    };
+    let source_evidence = format!(
+        "对标监控 · {} · {}（{}）",
+        platform_label(&post.platform),
+        post.author,
+        basis
+    );
+
     let now = now_i64();
     let mut record = crate::PostDeconstructionRecord {
         id: make_id("decon"),
@@ -2761,8 +2956,9 @@ fn deconstruct(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
         title_patterns,
         hooks,
         reusable_takeaway,
+        structure,
         raw_content: post.content.clone(),
-        source_evidence: format!("对标监控 · {} · {}", post.platform, post.author),
+        source_evidence,
         created_at: now,
         updated_at: now,
     };
@@ -4864,27 +5060,57 @@ fn try_export_post_product(
         }
     }
 
-    // 爆文拆解（六要素）
+    // 爆文拆解（六要素 + 结构骨架）
     if let Some(d) = &decon {
         let json = serde_json::to_string_pretty(d).unwrap_or_default();
         let _ = std::fs::write(l4.join("爆文拆解.json"), json);
+        let bullets = |items: &[String]| -> String {
+            if items.is_empty() {
+                "（无）".to_string()
+            } else {
+                items
+                    .iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        };
+        // 结构骨架单独成表：时间码是拆解里最有用、也最容易被编造的字段，
+        // 摆在明面上才能一眼看出模型有没有照着真实字幕走。
+        let structure_md = if d.structure.is_empty() {
+            "（本条没有可用的时间轴结构）".to_string()
+        } else {
+            let mut table =
+                String::from("| 时间码 | 段落功能 | 占比 | 这一段做了什么 |\n| --- | --- | --- | --- |\n");
+            for segment in &d.structure {
+                table.push_str(&format!(
+                    "| {} | {} | {} | {} |\n",
+                    if segment.start.trim().is_empty() {
+                        "—"
+                    } else {
+                        segment.start.trim()
+                    },
+                    segment.role,
+                    segment
+                        .weight
+                        .map(|weight| format!("{weight:.0}%"))
+                        .unwrap_or_else(|| "—".to_string()),
+                    segment.gist
+                ));
+            }
+            table
+        };
         let md = format!(
-            "# 爆文拆解 · {}\n\n作者：{}\n\n## 选题角度\n{}\n\n## 文案结构\n{}\n\n## 开场白 / 前3秒钩子\n{}\n\n## 标题句式\n{}\n\n## 金句 / 钩子\n{}\n\n## 可复用方法论\n{}\n\n---\n\n### 拆解所用原文\n{}\n",
+            "# 爆文拆解 · {}\n\n作者：{}\n\n> 拆解依据：{}\n\n## 选题角度\n{}\n\n## 文案结构\n{}\n\n## 结构骨架\n{}\n\n## 开场白 / 前3秒钩子\n{}\n\n## 标题句式\n{}\n\n## 金句 / 钩子\n{}\n\n## 可复用方法论\n{}\n\n---\n\n### 拆解所用原文\n{}\n",
             d.post_title,
             d.author,
+            d.source_evidence,
             d.topic_angle,
             d.copy_structure,
+            structure_md,
             d.opening,
-            d.title_patterns
-                .iter()
-                .map(|s| format!("- {s}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            d.hooks
-                .iter()
-                .map(|s| format!("- {s}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
+            bullets(&d.title_patterns),
+            bullets(&d.hooks),
             d.reusable_takeaway,
             d.raw_content
         );
@@ -6673,9 +6899,36 @@ pub fn start_monitor_scheduler(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        detail_author_may_override, extract_four_digit_year, published_before_cutoff,
-        resolve_watch_id, watch_dedupe_key,
+        clip_chars, detail_author_may_override, extract_four_digit_year, format_hms,
+        published_before_cutoff, resolve_watch_id, srt_cues, srt_outline, watch_dedupe_key,
     };
+
+    /// 拆解输入：SRT 必须能解析出真实时间码，大纲按步长抽样且不越界。
+    #[test]
+    fn srt_outline_keeps_real_timecodes() {
+        let srt = "1\n00:00:00,000 --> 00:00:03,000\n开场先说结论：这条视频会颠覆你的认知\n\n\
+                   2\n00:00:03,500 --> 00:00:07,000\n因为它讲的东西和常识相反\n\n\
+                   3\n00:02:00,000 --> 00:02:04,000\n两分钟处是转折点\n";
+        let cues = srt_cues(srt);
+        assert_eq!(cues.len(), 3);
+        assert_eq!(cues[0].0, 0);
+        assert_eq!(cues[2].0, 120);
+
+        // 步长 90s：0s 与 120s 各抽一条，3.5s 那条被步长跳过
+        let outline = srt_outline(&cues, 90, 20);
+        let lines: Vec<&str> = outline.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("【00:00:00】"));
+        assert!(lines[1].starts_with("【00:02:00】"));
+    }
+
+    /// 截断按 Unicode 字符，不能按字节（否则中文会被切成乱码）。
+    #[test]
+    fn clip_chars_is_char_based() {
+        assert_eq!(clip_chars("一二三四五", 3), "一二三…");
+        assert_eq!(clip_chars("  短句  ", 10), "短句");
+        assert_eq!(format_hms(3725), "01:02:05");
+    }
 
     /// 回归守卫：有监控归属的帖子，详情页作者不得覆盖 watch.name。
     ///
