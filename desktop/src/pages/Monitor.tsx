@@ -3158,6 +3158,31 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                     </button>
                   </>
                 )}
+                {deconResult && deconResult.postId === detailPost.id && (
+                  <button
+                    onClick={() => void handleInject(detailPost)}
+                    disabled={detailPost.topicInjected}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md bg-accent-primary text-white hover:bg-accent-primary/90 transition-colors disabled:opacity-50"
+                  >
+                    <Sparkles className="w-3 h-3" />
+                    {detailPost.topicInjected ? '已入选题' : '加入选题'}
+                  </button>
+                )}
+                <button
+                  onClick={async () => {
+                    await openDetail(detailPost, true);
+                    // 视频帖若还没下载完成（含卡在「下载中」/ 失败），重抓正文时一并触发视频下载，
+                    // 避免用户点「重新抓正文」后视频仍不下载的困惑。
+                    if (detailPost.mediaType === 'video' && detailPost.videoStatus !== 'done') {
+                      void runDownloadVideo(detailPost);
+                    }
+                  }}
+                  disabled={detailLoading}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors whitespace-nowrap disabled:opacity-50"
+                >
+                  <RefreshCw className={clsx('w-3 h-3', detailLoading && 'animate-spin')} />
+                  重新抓正文
+                </button>
                 <div className="relative">
                   <button
                     type="button"
@@ -3203,31 +3228,6 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                     </>
                   )}
                 </div>
-                {deconResult && deconResult.postId === detailPost.id && (
-                  <button
-                    onClick={() => void handleInject(detailPost)}
-                    disabled={detailPost.topicInjected}
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md bg-accent-primary text-white hover:bg-accent-primary/90 transition-colors disabled:opacity-50"
-                  >
-                    <Sparkles className="w-3 h-3" />
-                    {detailPost.topicInjected ? '已入选题' : '加入选题'}
-                  </button>
-                )}
-                <button
-                  onClick={async () => {
-                    await openDetail(detailPost, true);
-                    // 视频帖若还没下载完成（含卡在「下载中」/ 失败），重抓正文时一并触发视频下载，
-                    // 避免用户点「重新抓正文」后视频仍不下载的困惑。
-                    if (detailPost.mediaType === 'video' && detailPost.videoStatus !== 'done') {
-                      void runDownloadVideo(detailPost);
-                    }
-                  }}
-                  disabled={detailLoading}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors whitespace-nowrap disabled:opacity-50"
-                >
-                  <RefreshCw className={clsx('w-3 h-3', detailLoading && 'animate-spin')} />
-                  重新抓正文
-                </button>
               </div>
             </div>
           </div>
