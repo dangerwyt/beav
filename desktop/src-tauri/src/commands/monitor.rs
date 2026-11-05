@@ -207,6 +207,7 @@ pub fn handle_monitor_channel(
             "monitor:decon-list" => decon_list(state, payload),
             "monitor:remix-generate" => remix_generate(state, payload),
             "monitor:remix-list" => remix_list(state, payload),
+            "monitor:material-files" => material_files(state, payload),
             "monitor:export-post" => export_post_command(state, payload),
             "monitor:get-export-root" => get_export_root(state),
             "monitor:set-export-root" => set_export_root(state, payload),
@@ -3330,6 +3331,53 @@ fn remix_generate(state: &State<'_, AppState>, payload: &Value) -> Result<Value,
     export_post_product(state, &post.id);
 
     Ok(json!({ "success": true, "remix": saved }))
+}
+
+/// 导出素材包：确保产物已落盘，返回文件清单（打包交给前端调 file:save-zip）。
+///
+/// 只负责打包，不管对方怎么用：清单里的 name 保留「平台/日期/作者/标题/文件」
+/// 相对路径，解压后就是一份完整的素材目录。
+fn material_files(state: &State<'_, AppState>, payload: &Value) -> Result<Value, String> {
+    let ids: Vec<String> = payload
+        .get("ids")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return Err("缺少 ids".to_string());
+    }
+    let root = resolve_export_target(state)?;
+    let mut files: Vec<Value> = Vec::new();
+    for id in ids {
+        export_post_product(state, &id); // 幂等：已有产物只是补齐
+        let post = with_store(state, |store| {
+            Ok(store.monitored_posts.iter().find(|p| p.id == id).cloned())
+        })?;
+        let Some(post) = post else { continue };
+        let l1 = root.join(platform_label(&post.platform));
+        let Some(dir) = find_export_dir_for_post(&l1, &id) else { continue };
+        collect_bundle_files(&dir, &root, &mut files);
+    }
+    Ok(json!({ "success": true, "count": files.len(), "files": files }))
+}
+
+/// 递归收集产物文件（产物目录只有「二创/」一层子目录，深度给 3 足够）。
+fn collect_bundle_files(dir: &Path, root: &Path, out: &mut Vec<Value>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if out.len() < 5000 {
+                collect_bundle_files(&path, root, out);
+            }
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(root) else { continue };
+        out.push(json!({
+            "source": path.display().to_string(),
+            "name": relative.to_string_lossy().replace('\\', "/"),
+        }));
+    }
 }
 
 /// 列出某帖（或全部）的二创产出。

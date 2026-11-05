@@ -3210,6 +3210,18 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                           { key: 'douyin', label: '抖音改写', run: () => { setRemixTarget('douyin'); void runRemix(detailPost, 'rewrite', 'douyin'); } },
                           { key: 'bilibili', label: 'B站改写', run: () => { setRemixTarget('bilibili'); void runRemix(detailPost, 'rewrite', 'bilibili'); } },
                           { key: 'xiaohongshu', label: '小红书改写', run: () => { setRemixTarget('xiaohongshu'); void runRemix(detailPost, 'rewrite', 'xiaohongshu'); } },
+                          { key: 'bundle', label: '导出素材包', run: () => { void (async () => {
+                            const result = await window.ipcRenderer.monitor.materialFiles([detailPost.id]) as { success?: boolean; files?: Array<{ source: string; name: string }>; error?: string };
+                            if (!result?.success || !result.files?.length) {
+                              showToast('err', result?.error || '没有可导出的素材');
+                              return;
+                            }
+                            const saved = await window.ipcRenderer.files.saveZip({
+                              files: result.files,
+                              defaultName: `${detailPost.author || '素材'}-${detailPost.id}.zip`,
+                            }) as { success?: boolean };
+                            showToast(saved?.success ? 'ok' : 'err', saved?.success ? '素材包已导出' : '导出已取消');
+                          })(); } },
                         ].map((item) => (
                           <button
                             key={item.key}
