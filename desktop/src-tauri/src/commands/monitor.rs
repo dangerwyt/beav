@@ -2291,7 +2291,12 @@ fn get_spike_threshold(state: &State<'_, AppState>) -> Result<Value, String> {
 ///
 /// 仍保留 `hasContent` 布尔：卡片据此决定「拆解」按钮是否可点，
 /// 否则前端为了一个真假值又得把整篇正文拿下来。
-fn project_post_for_list(item: &crate::MonitoredPostRecord, transcript_status: &str) -> Value {
+fn project_post_for_list(
+    item: &crate::MonitoredPostRecord,
+    transcript_status: &str,
+    // 选题中心里仍存在的来源 URL 集合（「已入选题」是派生状态，不能只看静态标记）
+    injected_urls: &std::collections::HashSet<String>,
+) -> Value {
     json!({
         "id": item.id,
         "owner": item.owner,
@@ -2317,7 +2322,9 @@ fn project_post_for_list(item: &crate::MonitoredPostRecord, transcript_status: &
         "spike": item.spike,
         "spikeRatio": item.spike_ratio,
         "capturedVia": item.captured_via,
-        "topicInjected": item.topic_injected,
+        // 「已入选题」是派生状态：选题中心里被删掉后，这里必须跟着消失。
+        // 只读静态标记会留下假徽标（实测：加入后去选题中心放弃，监控列表仍显示已加入）。
+        "topicInjected": item.topic_injected && injected_urls.contains(&item.post_url),
         "deconstructed": item.deconstructed,
         "videoStatus": item.video_status,
         "videoLocalPath": item.video_local_path,
@@ -2395,6 +2402,17 @@ fn post_list(state: &State<'_, AppState>, payload: &Value) -> Result<Value, Stri
                 )
             })
             .collect();
+        let injected_urls: std::collections::HashSet<String> = store
+            .topic_center
+            .iter()
+            .flat_map(|topic| topic.source_refs.iter())
+            .filter_map(|reference| {
+                reference
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
         // 列表走投影：正文/图片不随列表下发（详情弹窗单独经 post_detail 取）。
         // 截断之后再投影，所以 limit 生效时连投影开销都只付前 N 条。
         Ok(Value::Array(
@@ -2405,7 +2423,7 @@ fn post_list(state: &State<'_, AppState>, payload: &Value) -> Result<Value, Stri
                         .get(item.id.as_str())
                         .copied()
                         .unwrap_or("");
-                    project_post_for_list(item, status)
+                    project_post_for_list(item, status, &injected_urls)
                 })
                 .collect(),
         ))
