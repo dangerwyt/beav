@@ -2878,14 +2878,6 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                         </button>
                       )}
                       <button
-                        onClick={() => { void openDetail(post); if (post.hasContent) void runDeconstruct(post); }}
-                        disabled={!post.hasContent || deconLoading}
-                        className="inline-flex items-center gap-1 text-[11px] text-text-tertiary hover:text-accent-primary disabled:opacity-40"
-                        title={post.hasContent ? '拆解这篇爆文的方法论' : '需先抓到正文'}
-                      >
-                        <FlaskConical className="w-3 h-3" />拆解
-                      </button>
-                      <button
                         onClick={() => void openExternal(post.postUrl)}
                         className="inline-flex items-center gap-1 text-[11px] text-text-tertiary hover:text-accent-primary"
                         title="打开原文"
