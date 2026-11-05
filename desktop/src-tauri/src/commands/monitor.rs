@@ -2777,6 +2777,12 @@ fn srt_outline(cues: &[(i64, String)], step_secs: i64, max_lines: usize) -> Stri
 
 /// 拆解用的系统提示：五层框架（钩子—结构—论证—情绪—转化），输出字段与旧版保持一致，
 /// 额外给一个结构化 `structure`，供「结构模板库」检索。
+/// beav-content-remix 技能的方法论，原样内嵌：拆解/分镜/改写三条链路各自追加。
+/// 直接 include_str! 是为了让提示词可追溯（改口径 = 改这几个 md），不引入运行时读文件。
+const DECONSTRUCT_GUIDE: &str = include_str!("remix_prompts/deconstruction.md");
+const STORYBOARD_GUIDE: &str = include_str!("remix_prompts/storyboard.md");
+const REWRITE_GUIDE: &str = include_str!("remix_prompts/rewrite-playbook.md");
+
 const DECONSTRUCT_SYSTEM_PROMPT: &str = "你是资深内容拆解专家，负责把已验证的爆款内容拆成可复用的方法论。\
 按五层分析，只输出 JSON，不要任何解释性文字：\
 1) 钩子：开头用什么把人留住（反常识 / 利益承诺 / 身份代入 / 悬念 / 冲突 / 故事切入），并摘出原句；\
@@ -2890,14 +2896,16 @@ fn deconstruct(state: &State<'_, AppState>, payload: &Value) -> Result<Value, St
         ));
     }
 
-    let system_prompt = DECONSTRUCT_SYSTEM_PROMPT;
+    let system_prompt = format!(
+        "{DECONSTRUCT_SYSTEM_PROMPT}\n\n# 拆解方法论（必须遵守）\n{DECONSTRUCT_GUIDE}"
+    );
 
     let raw = invoke_structured_chat_by_protocol(
         &config.protocol,
         &config.base_url,
         config.api_key.as_deref(),
         &config.model_name,
-        system_prompt,
+        &system_prompt,
         &user_prompt,
         true,
     )?;
@@ -3237,7 +3245,7 @@ fn remix_generate(state: &State<'_, AppState>, payload: &Value) -> Result<Value,
 2) 保留原观点的价值，但补充原文没有的增量（例子、数字、类比）；\
 3) 结尾标注一句「观点参考：{{原作者}} · {{平台}} · {{原帖链接}}」；\
 4) 只输出 Markdown 正文，不要解释你的思路。\
-平台规范：{}",
+平台规范：{}\n\n# 改写方法论（必须遵守）\n{REWRITE_GUIDE}",
                 name, guide
             ),
             format!(
@@ -3250,7 +3258,7 @@ fn remix_generate(state: &State<'_, AppState>, payload: &Value) -> Result<Value,
                 "你是短视频分镜导演。基于给定素材，写一份可直接执行的分镜脚本，目标时长约 {target_seconds} 秒。\
 硬性要求：1) 你排的是**新片**的时间线，时间码由系统按镜头时长累加生成，你不要输出时间码，只给每镜时长（秒）；\
 2) 画面列写**设计建议**（景别、拍什么、怎么剪），不是对原片的描述——你没有看到画面，禁止声称画面内容；\
-3) 台词可改写，但不得整段照搬原口播；4) 只输出 JSON，不要解释。"
+3) 台词可改写，但不得整段照搬原口播；4) 只输出 JSON，不要解释。\n\n# 分镜方法论（必须遵守）\n{STORYBOARD_GUIDE}"
             ),
             format!(
                 "{context}\n\n输出 JSON：{{\"title\": 一句话片名, \"shots\": [{{\"duration\": 7, \"framing\": \"画面设计（景别+拍什么）\", \"line\": \"口播台词\", \"caption\": \"屏幕字幕（可空）\", \"note\": \"拍摄/剪辑备注（可空）\"}}]}}。\n镜头总时长控制在 {target_seconds} 秒左右，单镜 3-8 秒。\n"
