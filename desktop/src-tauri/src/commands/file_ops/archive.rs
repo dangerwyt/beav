@@ -78,8 +78,6 @@ pub(crate) fn write_zip_archive(
     let target_path = ensure_zip_extension(target_path);
     let file = fs::File::create(&target_path).map_err(|error| error.to_string())?;
     let mut zip = zip::ZipWriter::new(file);
-    let options =
-        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let mut used_names = HashSet::new();
     let mut written = 0usize;
     for (index, item) in files.iter().enumerate() {
@@ -105,6 +103,22 @@ pub(crate) fn write_zip_archive(
             &sanitize_zip_entry_name(requested_name, &fallback_name),
             &mut used_names,
         );
+        // 媒体文件已是压缩格式，再 Deflate 一遍几乎不减小，纯烧 CPU —— 实测 36MB 的
+        // 素材包打包要几十秒，改成 Stored 后基本等于磁盘读写。文本类仍压缩。
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_media = matches!(
+            extension.as_str(),
+            "mp4" | "mov" | "m4a" | "mp3" | "wav" | "jpg" | "jpeg" | "png" | "webp" | "zip"
+        );
+        let options = zip::write::FileOptions::default().compression_method(if is_media {
+            zip::CompressionMethod::Stored
+        } else {
+            zip::CompressionMethod::Deflated
+        });
         let bytes = fs::read(&path).map_err(|error| error.to_string())?;
         zip.start_file(entry_name, options)
             .map_err(|error| error.to_string())?;
