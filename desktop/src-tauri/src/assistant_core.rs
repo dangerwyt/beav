@@ -1291,10 +1291,14 @@ fn serve_local_file(
 ) -> Result<(), String> {
     let query = path.split_once('?').map(|(_, value)| value).unwrap_or("");
     let mut raw_path = None;
+    let mut download_name = None;
     for pair in query.split('&') {
         if let Some((key, value)) = pair.split_once('=') {
-            if key == "path" {
-                raw_path = Some(value.to_string());
+            match key {
+                "path" => raw_path = Some(value.to_string()),
+                // 带 name 即「下载」语义：加 Content-Disposition，浏览器才不会把它存成 "file"
+                "name" => download_name = Some(value.to_string()),
+                _ => {}
             }
         }
     }
@@ -1345,6 +1349,20 @@ fn serve_local_file(
     };
 
     let mut head = status_line;
+    if let Some(raw_name) = download_name {
+        let name = urlencoding::decode(&raw_name)
+            .map(|value| value.into_owned())
+            .unwrap_or(raw_name);
+        // filename 给 ASCII 兜底，filename* 给浏览器真实中文名
+        let ascii_fallback: String = name
+            .chars()
+            .map(|c| if c.is_ascii() && c != '"' && c != '\\' { c } else { '_' })
+            .collect();
+        head.push_str(&format!(
+            "Content-Disposition: attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{}\r\n",
+            urlencoding::encode(&name)
+        ));
+    }
     head.push_str(&format!("Content-Type: {mime}\r\n"));
     head.push_str(&format!("Content-Length: {content_length}\r\n"));
     // 让浏览器知道可以按段请求（视频拖动进度条依赖它）

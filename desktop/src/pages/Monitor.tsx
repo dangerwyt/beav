@@ -3218,7 +3218,10 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                                 showToast('err', bundled?.error || '打包失败');
                                 return;
                               }
-                              window.open(`/api/file?path=${encodeURIComponent(zipPath)}`, '_blank');
+                              window.open(
+                                `/api/file?path=${encodeURIComponent(zipPath)}&name=${encodeURIComponent(`${bundleName}.zip`)}`,
+                                '_blank',
+                              );
                               return;
                             }
                             const result = await window.ipcRenderer.monitor.materialFiles([detailPost.id]) as { success?: boolean; files?: Array<{ source: string; name: string }>; error?: string };
