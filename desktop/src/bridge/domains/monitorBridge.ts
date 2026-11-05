@@ -367,10 +367,11 @@ export function createMonitorBridge(core: BridgeCore) {
           fallback: () => ({ success: false }) as unknown as T,
         }),
       // 素材包：返回产物文件清单（打包由 file:save-zip 完成）
-      materialFiles: <T = { success: boolean; count: number; files: Array<{ source: string; name: string }> }>(
+      materialFiles: <T = { success: boolean; count: number; files: Array<{ source: string; name: string }>; bundle?: { path?: string } }>(
         ids: string[],
+        options?: { bundle?: boolean; name?: string },
       ) =>
-        core.invokeChannelGuarded<T>('monitor:material-files', { ids }, {
+        core.invokeChannelGuarded<T>('monitor:material-files', { ids, ...(options ?? {}) }, {
           timeoutMs: 120_000,
           fallback: () => ({ success: false, count: 0, files: [] }) as unknown as T,
         }),

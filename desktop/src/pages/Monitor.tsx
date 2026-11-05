@@ -3203,10 +3203,22 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                           { key: 'bilibili', label: 'B站改写', run: () => { setRemixTarget('bilibili'); void runRemix(detailPost, 'rewrite', 'bilibili'); } },
                           { key: 'xiaohongshu', label: '小红书改写', run: () => { setRemixTarget('xiaohongshu'); void runRemix(detailPost, 'rewrite', 'xiaohongshu'); } },
                           { key: 'bundle', label: '导出素材包', run: () => { void (async () => {
-                            // web 端没有原生保存对话框（file:save-zip 依赖 Tauri），
-                            // 直接调用会静默卡住，所以先按环境拦下来。
+                            const bundleName = (detailPost.title || detailPost.author || '素材')
+                              .replace(/[\\/:*?"<>|]/g, '_')
+                              .slice(0, 24);
+                            // web 端没有原生保存对话框：让后端直接打成 zip 落到导出根，
+                            // 再用已有的 /api/file 代理让浏览器下载。
                             if (!isTauriRuntime()) {
-                              showToast('err', '浏览器里无法直接保存文件：请在桌面端导出，或到服务器导出目录取素材');
+                              const bundled = await window.ipcRenderer.monitor.materialFiles([detailPost.id], {
+                                bundle: true,
+                                name: bundleName,
+                              }) as { success?: boolean; bundle?: { path?: string }; error?: string };
+                              const zipPath = bundled?.bundle?.path;
+                              if (!bundled?.success || !zipPath) {
+                                showToast('err', bundled?.error || '打包失败');
+                                return;
+                              }
+                              window.open(`/api/file?path=${encodeURIComponent(zipPath)}`, '_blank');
                               return;
                             }
                             const result = await window.ipcRenderer.monitor.materialFiles([detailPost.id]) as { success?: boolean; files?: Array<{ source: string; name: string }>; error?: string };
@@ -3217,7 +3229,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                             const saved = await window.ipcRenderer.files.saveZip({
                               files: result.files,
                               // 包名取标题前 24 字（去掉文件系统非法字符），便于在下载目录里认出来
-                              defaultName: `${(detailPost.title || detailPost.author || '素材').replace(/[\\/:*?"<>|]/g, '_').slice(0, 24)}.zip`,
+                              defaultName: `${bundleName}.zip`,
                             }) as { success?: boolean };
                             showToast(saved?.success ? 'ok' : 'err', saved?.success ? '素材包已导出' : '导出已取消');
                           })(); } },

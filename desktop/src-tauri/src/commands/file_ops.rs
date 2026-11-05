@@ -8,7 +8,7 @@ use crate::{
 };
 
 mod actions;
-mod archive;
+pub(crate) mod archive;
 mod preview;
 
 use actions::{copy_image, save_as, show_in_folder};

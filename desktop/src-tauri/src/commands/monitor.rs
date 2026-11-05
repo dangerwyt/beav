@@ -3358,6 +3358,26 @@ fn material_files(state: &State<'_, AppState>, payload: &Value) -> Result<Value,
         let Some(dir) = find_export_dir_for_post(&l1, &id) else { continue };
         collect_bundle_files(&dir, &root, &mut files);
     }
+    // web 端没有原生保存对话框：直接打成 zip 落到导出根下（/api/file 只放行导出根内的文件），
+    // 前端用 GET /api/file?path=... 让浏览器下载。
+    let bundle = payload.get("bundle").and_then(Value::as_bool).unwrap_or(false);
+    if bundle {
+        if files.is_empty() {
+            return Err("没有可打包的素材".to_string());
+        }
+        let name = payload
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("素材包")
+            .to_string();
+        let dir = root.join("_素材包");
+        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let target = dir.join(format!("{name}.zip"));
+        let written = crate::commands::file_ops::archive::write_zip_archive(state, &files, target)?;
+        return Ok(json!({ "success": true, "count": files.len(), "bundle": written }));
+    }
     Ok(json!({ "success": true, "count": files.len(), "files": files }))
 }
 
