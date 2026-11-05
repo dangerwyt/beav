@@ -945,6 +945,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   const [remixBusy, setRemixBusy] = useState<'' | 'storyboard' | 'rewrite'>('');
   const [remixPreview, setRemixPreview] = useState<{ kind: string; target: string; content: string } | null>(null);
   const [remixTarget, setRemixTarget] = useState('douyin');
+  const [createMenuOpen, setCreateMenuOpen] = useState(false);
 
   // —— 方法论库（已沉淀的爆文拆解列表，模态浏览）——
   const [methodsOpen, setMethodsOpen] = useState(false);
@@ -1818,14 +1819,14 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
   }, [normalizeDecon]);
 
   // 二创：基于同一条素材生成分镜脚本 / 指定平台改写。
-  const runRemix = useCallback(async (post: MonitoredPost, kind: 'storyboard' | 'rewrite') => {
+  const runRemix = useCallback(async (post: MonitoredPost, kind: 'storyboard' | 'rewrite', targetOverride?: string) => {
     setRemixBusy(kind);
     setRemixPreview(null);
     try {
       const result = (await window.ipcRenderer.monitor.remixGenerate({
         postId: post.id,
         kind,
-        target: kind === 'rewrite' ? remixTarget : undefined,
+        target: kind === 'rewrite' ? targetOverride || remixTarget : undefined,
       })) as { success?: boolean; remix?: Record<string, unknown>; error?: string };
       if (!result?.success || !result.remix) {
         showToast('err', result?.error || (kind === 'rewrite' ? '改写失败' : '分镜生成失败'));
@@ -3157,44 +3158,51 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                     </button>
                   </>
                 )}
-                <button
-                  onClick={() => void runDeconstruct(detailPost)}
-                  disabled={deconLoading || !detailPost.content || !detailPost.content.trim()}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors whitespace-nowrap disabled:opacity-50"
-                  title={detailPost.content?.trim() ? '用 AI 拆解这篇爆文的方法论' : '请先抓到正文再拆解'}
-                >
-                  <FlaskConical className={clsx('w-3 h-3', deconLoading && 'animate-spin')} />
-                  {deconResult && deconResult.postId === detailPost.id ? '重新拆解' : '拆解'}
-                </button>
-                <button
-                  onClick={() => void runRemix(detailPost, 'storyboard')}
-                  disabled={Boolean(remixBusy)}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
-                  title="按口播大纲生成可执行的分镜表，落到产物目录「二创/分镜脚本.md」"
-                >
-                  {remixBusy === 'storyboard' ? '生成中…' : '分镜'}
-                </button>
-                <span className="inline-flex items-center gap-1">
-                  <select
-                    value={remixTarget}
-                    onChange={(event) => setRemixTarget(event.target.value)}
-                    className="h-[30px] rounded-md border border-border bg-surface-secondary px-1.5 text-xs text-text-secondary"
-                    title="改写目标平台"
-                  >
-                    <option value="douyin">抖音</option>
-                    <option value="xiaohongshu">小红书</option>
-                    <option value="wechat">公众号</option>
-                    <option value="bilibili">B站</option>
-                  </select>
+                <div className="relative">
                   <button
-                    onClick={() => void runRemix(detailPost, 'rewrite')}
-                    disabled={Boolean(remixBusy)}
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-50"
-                    title="按目标平台规范改写，落到产物目录「二创/改写-平台.md」"
+                    type="button"
+                    onClick={() => setCreateMenuOpen((open) => !open)}
+                    disabled={Boolean(remixBusy) || deconLoading}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md bg-accent-primary text-white hover:bg-accent-primary/90 transition-colors whitespace-nowrap disabled:opacity-50"
+                    aria-haspopup="menu"
+                    aria-expanded={createMenuOpen}
                   >
-                    {remixBusy === 'rewrite' ? '生成中…' : '改写'}
+                    <Sparkles className={clsx('w-3 h-3', (remixBusy || deconLoading) && 'animate-spin')} />
+                    {remixBusy || deconLoading ? '生成中…' : '进行创作'}
+                    <ChevronDown className={clsx('w-3 h-3 transition-transform', createMenuOpen && 'rotate-180')} />
                   </button>
-                </span>
+                  {createMenuOpen && (
+                    <>
+                      {/* 点空白处收起菜单（透明遮罩，不影响下层布局） */}
+                      <div className="fixed inset-0 z-40" onClick={() => setCreateMenuOpen(false)} />
+                      <div
+                        role="menu"
+                        className="absolute bottom-[calc(100%+6px)] right-0 z-50 w-40 overflow-hidden rounded-lg border border-border bg-surface-primary shadow-xl"
+                      >
+                        {[
+                          { key: 'decon', label: '结构拆解', run: () => void runDeconstruct(detailPost) },
+                          { key: 'storyboard', label: '脚本分镜', run: () => void runRemix(detailPost, 'storyboard') },
+                          { key: 'douyin', label: '抖音改写', run: () => { setRemixTarget('douyin'); void runRemix(detailPost, 'rewrite', 'douyin'); } },
+                          { key: 'bilibili', label: 'B站改写', run: () => { setRemixTarget('bilibili'); void runRemix(detailPost, 'rewrite', 'bilibili'); } },
+                          { key: 'xiaohongshu', label: '小红书改写', run: () => { setRemixTarget('xiaohongshu'); void runRemix(detailPost, 'rewrite', 'xiaohongshu'); } },
+                        ].map((item) => (
+                          <button
+                            key={item.key}
+                            role="menuitem"
+                            type="button"
+                            onClick={() => {
+                              setCreateMenuOpen(false);
+                              item.run();
+                            }}
+                            className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-text-secondary transition-colors hover:bg-surface-secondary hover:text-accent-primary"
+                          >
+                            {item.label}
+                          </button>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
                 {deconResult && deconResult.postId === detailPost.id && (
                   <button
                     onClick={() => void handleInject(detailPost)}
