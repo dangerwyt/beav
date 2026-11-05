@@ -3203,6 +3203,12 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                           { key: 'bilibili', label: 'B站改写', run: () => { setRemixTarget('bilibili'); void runRemix(detailPost, 'rewrite', 'bilibili'); } },
                           { key: 'xiaohongshu', label: '小红书改写', run: () => { setRemixTarget('xiaohongshu'); void runRemix(detailPost, 'rewrite', 'xiaohongshu'); } },
                           { key: 'bundle', label: '导出素材包', run: () => { void (async () => {
+                            // web 端没有原生保存对话框（file:save-zip 依赖 Tauri），
+                            // 直接调用会静默卡住，所以先按环境拦下来。
+                            if (!isTauriRuntime()) {
+                              showToast('err', '浏览器里无法直接保存文件：请在桌面端导出，或到服务器导出目录取素材');
+                              return;
+                            }
                             const result = await window.ipcRenderer.monitor.materialFiles([detailPost.id]) as { success?: boolean; files?: Array<{ source: string; name: string }>; error?: string };
                             if (!result?.success || !result.files?.length) {
                               showToast('err', result?.error || '没有可导出的素材');
@@ -3210,7 +3216,8 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                             }
                             const saved = await window.ipcRenderer.files.saveZip({
                               files: result.files,
-                              defaultName: `${detailPost.author || '素材'}-${detailPost.id}.zip`,
+                              // 包名取标题前 24 字（去掉文件系统非法字符），便于在下载目录里认出来
+                              defaultName: `${(detailPost.title || detailPost.author || '素材').replace(/[\\/:*?"<>|]/g, '_').slice(0, 24)}.zip`,
                             }) as { success?: boolean };
                             showToast(saved?.success ? 'ok' : 'err', saved?.success ? '素材包已导出' : '导出已取消');
                           })(); } },
