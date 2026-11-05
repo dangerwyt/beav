@@ -2929,8 +2929,15 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 )}
                 <span className="text-xs text-text-tertiary truncate">{detailPost.author}</span>
               </div>
-              <button onClick={() => setDetailOpen(false)} className="text-text-tertiary hover:text-text-primary shrink-0">
-                <X className="w-4 h-4" />
+              <button
+                type="button"
+                onClick={() => setDetailOpen(false)}
+                // 图标 16→20px，同时把点击区撑到 36×36（负 margin 抵消头部原有间距，视觉位置不变）
+                className="-m-2 flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-text-tertiary transition-colors hover:bg-surface-secondary hover:text-text-primary"
+                title="关闭"
+                aria-label="关闭"
+              >
+                <X className="w-5 h-5" />
               </button>
             </div>
 
