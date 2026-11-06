@@ -1285,12 +1285,32 @@ fn parse_byte_range(header: &str, total: u64) -> Option<(u64, u64)> {
 /// 只会 200 全量返回的话，播放器只能播开头几秒就开始无限缓冲
 /// （用户实测：视频播几秒一直加载中）。这里同时改成**流式发送**，
 /// 不再把整个视频读进内存。
+/// 64KB 分块写：比 io::copy 更容易观察，也能在单次 write 异常时中止而不是静默截断。
+fn copy_chunked(reader: &mut impl std::io::Read, stream: &mut TcpStream) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        stream
+            .write_all(&buffer[..read])
+            .map_err(|error| error.to_string())?;
+    }
+    stream.flush().map_err(|error| error.to_string())
+}
+
 fn serve_local_file(
     app: &AppHandle,
     stream: &mut TcpStream,
     path: &str,
     range_header: Option<&str>,
 ) -> Result<(), String> {
+    // 连接可能带着「读请求」留下的超时；它同样作用于写，一旦触发 io::copy 就
+    // 会在 1MB 左右中断（浏览器表现为进度不动）。这里明确清掉，并关闭 Nagle。
+    let _ = stream.set_write_timeout(None);
+    let _ = stream.set_nodelay(true);
     let query = path.split_once('?').map(|(_, value)| value).unwrap_or("");
     let mut raw_path = None;
     let mut download_name = None;
@@ -1386,9 +1406,9 @@ fn serve_local_file(
         file.seek(SeekFrom::Start(start))
             .map_err(|error| error.to_string())?;
         let mut limited = std::io::Read::take(file, end - start + 1);
-        std::io::copy(&mut limited, stream).map_err(|error| error.to_string())?;
+        copy_chunked(&mut limited, stream)?;
     } else {
-        std::io::copy(&mut file, stream).map_err(|error| error.to_string())?;
+        copy_chunked(&mut file, stream)?;
     }
     Ok(())
 }
