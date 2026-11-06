@@ -3211,10 +3211,13 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                             if (!isTauriRuntime()) {
                               showToast('ok', '正在打包素材，请稍候…');
                               console.info('[bundle] 开始打包', detailPost.id, bundleName);
+                              showToast('ok', '正在打包素材，请稍候…');
+                              console.info('[bundle] 开始打包', detailPost.id, bundleName);
                               const bundled = await window.ipcRenderer.monitor.materialFiles([detailPost.id], {
                                 bundle: true,
                                 name: bundleName,
                               }) as { success?: boolean; bundle?: { path?: string }; error?: string };
+                              console.info('[bundle] 打包结果', bundled);
                               console.info('[bundle] 打包结果', bundled);
                               const zipPath = bundled?.bundle?.path;
                               if (!bundled?.success || !zipPath) {
@@ -3226,7 +3229,9 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                               // 改成先 fetch 拿字节流再走 blob: —— 同源安全上下文，不受该策略限制。
                               const url = `/api/file?path=${encodeURIComponent(zipPath)}&name=${encodeURIComponent(`${bundleName}.zip`)}`;
                               console.info('[bundle] 开始 fetch', url);
+                              console.info('[bundle] 开始 fetch', url);
                               const response = await fetch(url, { credentials: 'same-origin' });
+                              console.info('[bundle] fetch 响应', response.status, response.headers.get('content-length'));
                               console.info('[bundle] fetch 响应', response.status, response.headers.get('content-length'));
                               if (!response.ok) {
                                 showToast('err', `下载失败：HTTP ${response.status}`);
