@@ -1295,18 +1295,13 @@ fn copy_chunked(reader: &mut impl std::io::Read, stream: &mut TcpStream) -> Resu
         if read == 0 {
             break;
         }
-        if let Err(error) = stream.write_all(&buffer[..read]) {
-            println!("[api/file] write failed after {sent} bytes: {error}");
-            return Err(error.to_string());
-        }
+        stream
+            .write_all(&buffer[..read])
+            .map_err(|error| error.to_string())?;
         sent += read;
     }
-    if let Err(error) = stream.flush() {
-        println!("[api/file] flush failed after {sent} bytes: {error}");
-        return Err(error.to_string());
-    }
-    println!("[api/file] sent {sent} bytes");
-    Ok(())
+    let _ = sent;
+    stream.flush().map_err(|error| error.to_string())
 }
 
 fn serve_local_file(
