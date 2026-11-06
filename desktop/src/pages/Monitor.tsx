@@ -3218,15 +3218,27 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                                 showToast('err', bundled?.error || '打包失败');
                                 return;
                               }
-                              // 用 <a download> 而不是 window.open：后者会被弹窗拦截器拦掉
-                              // （请求根本不发出，看着像"点了没反应"）。
+                              // HTTP 页面直接下载 zip 会被 Chrome 判「insecure download」拦掉
+                              // （错误信息：This file should be served over HTTPS）。
+                              // 改成先 fetch 拿字节流再走 blob: —— 同源安全上下文，不受该策略限制。
                               const url = `/api/file?path=${encodeURIComponent(zipPath)}&name=${encodeURIComponent(`${bundleName}.zip`)}`;
+                              const response = await fetch(url, { credentials: 'same-origin' });
+                              if (!response.ok) {
+                                showToast('err', `下载失败：HTTP ${response.status}`);
+                                return;
+                              }
+                              const blob = await response.blob();
+                              const objectUrl = URL.createObjectURL(
+                                new Blob([blob], { type: 'application/zip' }),
+                              );
                               const anchor = document.createElement('a');
-                              anchor.href = url;
+                              anchor.href = objectUrl;
                               anchor.download = `${bundleName}.zip`;
                               document.body.appendChild(anchor);
                               anchor.click();
                               anchor.remove();
+                              // 延迟释放：立即 revoke 会让部分浏览器的下载中断
+                              window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
                               return;
                             }
                             const result = await window.ipcRenderer.monitor.materialFiles([detailPost.id]) as { success?: boolean; files?: Array<{ source: string; name: string }>; error?: string };
