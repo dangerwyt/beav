@@ -5,8 +5,8 @@
  * 现在导出侧已改成取发布时间（commit 0f1d02e），但历史目录还挂在旧的导出日下。
  *
  * 范围：发布时间 >= 20261001 的帖子按真实发布日归位；更早的统一归到 `20260930/`。
- * **抓不到发布时间的保持原位**（这批多是近期新抓、publishedAt 缺失的帖子，
- * 归到九月等于按抓取日错误倒灌，先补发布时间再归位）。
+ * 抓不到发布时间的也归 `20260930/`：这批是补历史捞回的旧帖，所在目录的日期是导出日，
+ * 留着只会保留一个假的发布日期。想更准就先跑 backfill-publish-time.mjs 再归位。
  *
  * 只改路径里的「日期」段，作者/标题目录名原样保留 —— 不做重命名，避免和
  * rename-export-dirs 的命名规则纠缠。
@@ -94,14 +94,10 @@ for (const dir of collect(root)) {
     meta = {};
   }
   const published = publishedDate(meta.publishedAt ?? meta.published_at);
-  if (!published) {
-    // 抓不到发布日就**保持原位**：这批帖子 createdAt 是本月（近期新抓），
-    // 归到 20260930 等于把新内容倒进九月，语义全错。
-    noDate += 1;
-    continue;
-  }
-  // 10/1 之前的统一归到兜底日期，避免散落在几十个历史目录里
-  const date = published >= CUTOFF ? published : FALLBACK_DATE;
+  if (!published) noDate += 1;
+  // 抓不到发布日的也归兜底日期：这批多是「第一次补历史」捞回的旧帖，
+  // 它们所在目录的日期是**导出日**（20261102 之类），留着同样是错的。
+  const date = published && published >= CUTOFF ? published : FALLBACK_DATE;
   if (date === currentDate) continue;
 
   const target = path.join(root, platform, date, author, title);
