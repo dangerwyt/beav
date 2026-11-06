@@ -1239,6 +1239,8 @@ fn mime_for_path(path: &std::path::Path) -> &'static str {
         "json" => "application/json; charset=utf-8",
         "txt" | "srt" => "text/plain; charset=utf-8",
         "md" => "text/markdown; charset=utf-8",
+        // 素材包下载：octet-stream 会让 Chrome 更容易判成「不安全下载」直接拦掉
+        "zip" => "application/zip",
         _ => "application/octet-stream",
     }
 }
