@@ -1,4 +1,4 @@
-# Beav Web 反向代理示例（Caddy 2）
+# Beav Web 反向代理（Caddy 2）
 #
 # 多用户模式（推荐）：浏览器 -> Caddy(443) -> web-instances (:8090) -> 各用户实例
 # 单用户模式：把 upstream 换成 127.0.0.1:8080
@@ -6,18 +6,22 @@
 # 关键点：
 #  1) flush_interval -1：SSE(/api/events) 必须立即 flush，否则事件会被缓冲、实时进度失效；
 #  2) 公网域名 Caddy 会自动申请证书；内网 IP 只能用 tls internal（自签，需客户端信任根证书）；
-#  3) 不要对 text/event-stream 开压缩（本示例未启用 encode）。
+#  3) 不要对 text/event-stream 开压缩（本示例未启用 encode）；
+#  4) 上 HTTPS 的实际收益：Chrome 会拦截「HTTP 页面发起的 zip 下载」（提示"已阻止不安全的下载"），
+#     换成 HTTPS 后该拦截消失；剪贴板、部分媒体 API 在 HTTPS 下也更稳。
 
-# ---------- 公网域名（自动 HTTPS） ----------
-beav.example.com {
+# ---------- 内网 IP（自签 HTTPS，局域网推荐） ----------
+# 把 192.168.1.10 换成这台 Mac 的局域网 IP：ipconfig getifaddr en0
+# 只写 IP 不写 scheme 时，Caddy 按 https 提供服务，并把 http 请求 301 跳到 https。
+192.168.1.10 {
+	tls internal
 	reverse_proxy 127.0.0.1:8090 {
 		flush_interval -1
 	}
 }
 
-# ---------- 内网 IP（自签） ----------
-# https://192.168.1.10 {
-# 	tls internal
+# ---------- 公网域名（自动 HTTPS） ----------
+# beav.example.com {
 # 	reverse_proxy 127.0.0.1:8090 {
 # 		flush_interval -1
 # 	}
