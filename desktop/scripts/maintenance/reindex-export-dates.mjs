@@ -4,8 +4,8 @@
  * 背景：归档日期以前取「导出当天」，同一篇内容每天凌晨重抓就会漂出一个新日期目录。
  * 现在导出侧已改成取发布时间（commit 0f1d02e），但历史目录还挂在旧的导出日下。
  *
- * 范围：只动**发布时间 >= 20261001** 的帖子；更早的一律不碰（用户要求，
- * 避免大批历史素材换父目录）。没有 publishedAt 的也不动。
+ * 范围：发布时间 >= 20261001 的帖子按真实发布日归位；更早的（含抓不到发布时间的）
+ * 统一归到 `20260930/`，避免几十个历史日期目录碎成一片。
  *
  * 只改路径里的「日期」段，作者/标题目录名原样保留 —— 不做重命名，避免和
  * rename-export-dirs 的命名规则纠缠。
@@ -21,7 +21,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { resolveStorePath } from './_store-path.mjs';
 
-const CUTOFF = '20261001'; // 早于这个发布日的目录一律不动
+const CUTOFF = '20261001'; // 早于这个发布日的帖子，统一归到 FALLBACK_DATE
+const FALLBACK_DATE = '20260930'; // 历史素材的兜底归档日（用户要求：10/1 前全归到这天）
 
 function arg(name, fallback = '') {
   const i = process.argv.indexOf(`--${name}`);
@@ -91,15 +92,10 @@ for (const dir of collect(root)) {
   } catch {
     meta = {};
   }
-  const date = publishedDate(meta.publishedAt ?? meta.published_at);
-  if (!date) {
-    noDate += 1;
-    continue;
-  }
-  if (date < CUTOFF) {
-    skipped += 1; // 20261001 之前的发布日：按用户要求不动
-    continue;
-  }
+  const published = publishedDate(meta.publishedAt ?? meta.published_at);
+  if (!published) noDate += 1;
+  // 10/1 之前（或抓不到发布日）统一归到兜底日期，不再散落在几十个历史目录里
+  const date = published && published >= CUTOFF ? published : FALLBACK_DATE;
   if (date === currentDate) continue;
 
   const target = path.join(root, platform, date, author, title);
