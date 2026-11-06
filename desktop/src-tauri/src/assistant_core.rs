@@ -1317,6 +1317,9 @@ fn serve_local_file(
 ) -> Result<(), String> {
     // 连接可能带着「读请求」留下的超时；它同样作用于写，一旦触发 io::copy 就
     // 会在 1MB 左右中断（浏览器表现为进度不动）。这里明确清掉，并关闭 Nagle。
+    // 连接可能被设成非阻塞：小文件能填进内核缓冲区，大文件一满就返回
+    // EAGAIN(35)，表现为「传到 0.7~1MB 就断」。这里强制切回阻塞模式。
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_write_timeout(None);
     let _ = stream.set_nodelay(true);
     let query = path.split_once('?').map(|(_, value)| value).unwrap_or("");
