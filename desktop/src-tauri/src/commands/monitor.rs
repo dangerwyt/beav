@@ -4716,7 +4716,6 @@ fn title_export_prefix(title: &str, n: usize) -> String {
 }
 
 /// 从文本里抠出第一个形如 `YYYY-MM-DD` / `YYYY/MM/DD` / `YYYYMMDD` 的日期，规范为 `YYYYMMDD`。
-#[allow(dead_code)]
 fn first_date_in(text: &str) -> Option<String> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -4760,7 +4759,6 @@ fn first_date_in(text: &str) -> Option<String> {
 }
 
 /// 毫秒时间戳 → 本地时区 `YYYYMMDD`。
-#[allow(dead_code)]
 fn millis_to_yyyymmdd(ms: i64) -> Option<String> {
     let secs = ms / 1000;
     let dt = match Utc.timestamp_opt(secs, 0) {
@@ -4775,10 +4773,16 @@ fn today_yyyymmdd() -> String {
     Local::now().format("%Y%m%d").to_string()
 }
 
-/// 帖子产物二级目录（日期）：按**导出当天**归档，方便「今天导出了哪些」。
-/// 不再用 `published_at`——否则一次补历史会把几十条散落到几十个历史日期目录里。
-fn export_date_yyyymmdd(_post: &MonitoredPostRecord) -> String {
-    today_yyyymmdd()
+/// 归档目录的日期：取**发布时间**，不是导出时间。
+///
+/// 原来恒返回「今天」：同一篇 11/4 的帖子，11/5 导一次落 20261105、11/6 再导落 20261106，
+/// 博主没更新的日子每天都会漂出一个新日期目录（实测 11/6 凌晨重抓 11/4 的更新）。
+/// 内容只该有一个归档日期；抓不到发布时间才退回当天。
+fn export_date_yyyymmdd(post: &MonitoredPostRecord) -> String {
+    post.published_at
+        .as_deref()
+        .and_then(first_date_in)
+        .unwrap_or_else(today_yyyymmdd)
 }
 
 /// 在三级目录（作者）下找「自己的」产物目录（依据 `.beav-post-id` 标记）。
