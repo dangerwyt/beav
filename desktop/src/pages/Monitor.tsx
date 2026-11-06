@@ -3218,10 +3218,15 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                                 showToast('err', bundled?.error || '打包失败');
                                 return;
                               }
-                              window.open(
-                                `/api/file?path=${encodeURIComponent(zipPath)}&name=${encodeURIComponent(`${bundleName}.zip`)}`,
-                                '_blank',
-                              );
+                              // 用 <a download> 而不是 window.open：后者会被弹窗拦截器拦掉
+                              // （请求根本不发出，看着像"点了没反应"）。
+                              const url = `/api/file?path=${encodeURIComponent(zipPath)}&name=${encodeURIComponent(`${bundleName}.zip`)}`;
+                              const anchor = document.createElement('a');
+                              anchor.href = url;
+                              anchor.download = `${bundleName}.zip`;
+                              document.body.appendChild(anchor);
+                              anchor.click();
+                              anchor.remove();
                               return;
                             }
                             const result = await window.ipcRenderer.monitor.materialFiles([detailPost.id]) as { success?: boolean; files?: Array<{ source: string; name: string }>; error?: string };
