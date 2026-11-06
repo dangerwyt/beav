@@ -1213,7 +1213,8 @@ pub(crate) fn interactive_runtime_tools_for_mode(
         } else {
             tool_plan_snapshot_for_session(&store, runtime_mode, session_id)
         };
-        eprintln!("[tools][plan] {snapshot}");
+        // 工具规划快照属于信息而非错误：走 stdout，别让 .err.log 被它刷满
+        println!("[tools][plan] {snapshot}");
         if let Some(session_id) = session_id {
             append_session_checkpoint(
                 store,
