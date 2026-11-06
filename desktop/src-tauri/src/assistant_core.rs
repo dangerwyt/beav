@@ -1289,16 +1289,24 @@ fn parse_byte_range(header: &str, total: u64) -> Option<(u64, u64)> {
 fn copy_chunked(reader: &mut impl std::io::Read, stream: &mut TcpStream) -> Result<(), String> {
     use std::io::{Read, Write};
     let mut buffer = vec![0u8; 64 * 1024];
+    let mut sent = 0usize;
     loop {
         let read = reader.read(&mut buffer).map_err(|error| error.to_string())?;
         if read == 0 {
             break;
         }
-        stream
-            .write_all(&buffer[..read])
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = stream.write_all(&buffer[..read]) {
+            println!("[api/file] write failed after {sent} bytes: {error}");
+            return Err(error.to_string());
+        }
+        sent += read;
     }
-    stream.flush().map_err(|error| error.to_string())
+    if let Err(error) = stream.flush() {
+        println!("[api/file] flush failed after {sent} bytes: {error}");
+        return Err(error.to_string());
+    }
+    println!("[api/file] sent {sent} bytes");
+    Ok(())
 }
 
 fn serve_local_file(
