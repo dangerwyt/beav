@@ -352,9 +352,22 @@ fn web_settings_projection(settings: &Value) -> Value {
         "video_aspect_ratio", "video_resolution", "voice_tts_model", "voice_clone_model",
         "voice_id", "voice_speed", "tts_model", "transcription_model", "embedding_model",
     ];
-    Value::Object(KEYS.iter().filter_map(|key| {
+    let mut projected = Value::Object(KEYS.iter().filter_map(|key| {
         settings.get(*key).map(|value| ((*key).to_string(), value.clone()))
-    }).collect())
+    }).collect());
+    let configured = |keys: &[&str]| keys.iter().any(|key| {
+        settings.get(*key).and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty())
+    });
+    projected["generation_capabilities"] = json!({
+        "image": configured(&["image_endpoint", "api_endpoint"]) && configured(&["image_api_key", "api_key"]),
+        "video": configured(&["video_api_key", "api_key"]),
+        "voice": configured(&["voice_endpoint", "tts_endpoint", "api_endpoint"])
+            && configured(&["voice_api_key", "tts_api_key", "api_key"]),
+        "officialVideo": settings.get("video_endpoint").and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .is_none_or(|value| value.trim() == crate::official_support::official_base_url_for_realm("cn")),
+    });
+    projected
 }
 
 pub(super) fn get_settings(state: &State<'_, AppState>) -> Result<Value, String> {
@@ -382,7 +395,7 @@ pub(super) fn save_settings(
         let active_space_id = spaces_store::active_space_id(&store);
         Ok(workspace_root_from_snapshot(&settings, &active_space_id, &state.store_path).ok())
     })?;
-    let (active_space_id, settings_snapshot, store_snapshot) = with_store_mut(state, |store| {
+    let (active_space_id, settings_snapshot) = with_store_mut(state, |store| {
         let settings_snapshot = settings_store::update_settings(store, |settings| {
             *settings = merged_settings_payload(settings, payload);
             crate::ai_model_manager::legacy_projection::normalize_settings_projection(settings);
@@ -390,10 +403,9 @@ pub(super) fn save_settings(
         Ok((
             spaces_store::active_space_id(store),
             settings_snapshot,
-            store.clone(),
         ))
     })?;
-    crate::persist_store(&state.store_path, &store_snapshot)?;
+    crate::persistence::persist_state_now(state)?;
     crate::ai_model_manager::store::sync_model_config_file(&state.store_path, &settings_snapshot)?;
     let _ = crate::ai_model_manager::defaults::repair_missing_official_defaults_for_store(
         Some(app),
@@ -445,7 +457,21 @@ mod tests {
             "ai_sources_json": "[{\"apiKey\":\"secret\"}]",
             "redbox_auth_session_json": "secret", "future_secret": "secret"
         }));
-        assert_eq!(projected, json!({"image_model": "image-model", "workspace_dir": "workspace"}));
+        assert_eq!(projected, json!({"image_model": "image-model", "workspace_dir": "workspace",
+            "generation_capabilities": {"image": false, "video": true, "voice": false, "officialVideo": true}
+        }));
+    }
+
+    #[test]
+    fn web_generation_readiness_uses_server_credentials_without_exposing_them() {
+        let projected = super::web_settings_projection(&json!({"api_endpoint": "https://provider.test/v1", "api_key": "secret"}));
+        assert_eq!(projected["generation_capabilities"], json!({"image": true, "video": true, "voice": true, "officialVideo": true}));
+        assert!(projected.get("api_key").is_none());
+        assert!(projected.get("api_endpoint").is_none());
+        let empty = super::web_settings_projection(&json!({"api_key": " ", "api_endpoint": " "}));
+        assert_eq!(empty["generation_capabilities"]["image"], false);
+        assert_eq!(empty["generation_capabilities"]["video"], false);
+        assert_eq!(empty["generation_capabilities"]["voice"], false);
     }
 
     fn parsed_routes(settings: &Value) -> Value {

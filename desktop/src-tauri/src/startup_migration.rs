@@ -658,7 +658,8 @@ fn execute_startup_migration(app: AppHandle) -> Result<AppStore, String> {
         status.message = Some("正在写入迁移后的状态。".to_string());
         status.progress = 0.9;
     })?;
-    persist_store(&state.store_path, &imported_store)?;
+    let removed = persist_store(&state.store_path, &imported_store)?;
+    for id in removed { crate::session_manager::remove_session_artifacts(&mut imported_store, &id); }
 
     {
         let mut store = state

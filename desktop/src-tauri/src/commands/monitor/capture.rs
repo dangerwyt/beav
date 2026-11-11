@@ -11,7 +11,7 @@ pub(super) fn post_detail(state: &State<'_, AppState>, payload: &Value) -> Resul
         .get("refresh")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let record = with_store_mut(state, |store| {
+    let record = with_store(state, |store| {
         Ok(store
             .monitored_posts
             .iter()
@@ -557,7 +557,8 @@ pub(super) fn fetch_monitor(
     };
     let watch: Option<crate::CompetitorWatchRecord> =
         if let Some(id) = str_field(payload, "watchId").or_else(|| str_field(payload, "watch_id")) {
-            with_store_mut(state, |store| {
+            with_store(state, |store| {
+                guard_store_target(&store, "monitor:fetch", &json!({ "watchId": id }))?;
                 Ok(store
                     .competitor_watchlist
                     .iter()
@@ -660,7 +661,7 @@ pub(super) fn fetch_monitor(
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(crate::identity::owner_or_admin);
         let (existing, original_watch_exists): (Option<crate::MonitoredPostRecord>, bool) =
-            with_store_mut(state, |store| {
+            with_store(state, |store| {
                 let found = store
                     .monitored_posts
                     .iter()
@@ -1102,7 +1103,7 @@ pub(super) fn fetch_monitor_via_cdp(
             .unwrap_or_else(crate::identity::owner_or_admin);
         // 同时查出「原归属的监控项是否还存在」——已被删除的 watch 其帖子要能被接管。
         let (existing, original_watch_exists): (Option<crate::MonitoredPostRecord>, bool) =
-            with_store_mut(state, |store| {
+            with_store(state, |store| {
                 let found = store
                     .monitored_posts
                     .iter()

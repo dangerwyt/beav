@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::store::settings as settings_store;
-use crate::{now_iso, persist_store, with_store, with_store_mut, AppState};
+use crate::{now_iso, with_store, with_store_mut, AppState};
 
 pub(crate) fn repair_missing_official_defaults_in_settings(
     settings: &mut Value,
@@ -44,7 +44,7 @@ pub(crate) fn repair_missing_official_defaults_for_store(
         });
         Ok(store.clone())
     })?;
-    persist_store(&state.store_path, &store_snapshot)?;
+    crate::persistence::persist_state_now(state)?;
     let settings_snapshot = settings_store::settings_snapshot(&store_snapshot);
     crate::ai_model_manager::store::sync_model_config_file(&state.store_path, &settings_snapshot)?;
     if let Some(app) = app {

@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 const CHATROOM_SYNTHETIC_SESSION_PREFIX: &str = "chatroom:";
 const WANDER_SYNTHESIS_SKILL: &str = "wander-synthesis";
@@ -2782,6 +2782,9 @@ pub fn handle_chat_sessions_wander_channel(
             | "chat:set-session-starred"
             | "chat:set-session-unread"
             | "chat:delete-session"
+            | "chat:archive-session"
+            | "chat:unarchive-session"
+            | "chat:list-archived-sessions"
             | "chat:clear-messages"
             | "chat:compact-context"
             | "chat:get-context-usage"
@@ -3283,6 +3286,11 @@ pub fn handle_chat_sessions_wander_channel(
             }
             "chat:archive-session" => {
                 let session_id = payload_value_as_string(&payload).unwrap_or_default();
+                // Persist pending messages before moving the session out of the active store.
+                crate::persistence::persist_state_now(state)?;
+                let _write_guard = crate::persistence::store_write_lock().lock()
+                    .map_err(|_| "store 写盘锁已损坏".to_string())?;
+                crate::persistence::archive_session(&state.store_path, &session_id)?;
                 with_store_mut(state, |store| {
                     let archived_at = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -3314,7 +3322,6 @@ pub fn handle_chat_sessions_wander_channel(
                     remove_session_artifacts(store, &session_id);
                     Ok(json!({ "success": true }))
                 })?;
-                let _ = crate::persistence::archive_session(&state.store_path, &session_id);
                 let _ = crate::runtime::remove_session_bundle(state, &session_id);
                 if let Ok(mut guard) = state.chat_runtime_states.lock() {
                     guard.remove(&session_id);
@@ -3323,45 +3330,40 @@ pub fn handle_chat_sessions_wander_channel(
             }
             "chat:unarchive-session" => {
                 let session_id = payload_value_as_string(&payload).unwrap_or_default();
-                let loaded =
-                    crate::persistence::unarchive_session(&state.store_path, &session_id).is_ok();
-                if loaded {
-                    // Reload session data into memory
-                    if let Ok(entries) =
-                        crate::persistence::load_session_file(&state.store_path, &session_id)
+                let _write_guard = crate::persistence::store_write_lock().lock()
+                    .map_err(|_| "store 写盘锁已损坏".to_string())?;
+                crate::persistence::unarchive_session(&state.store_path, &session_id)?;
+                let entries = crate::persistence::load_session_file(&state.store_path, &session_id)?;
+                with_store_mut(state, |store| {
+                    crate::persistence::apply_session_file_entries_to_store(store, entries);
+                    if let Some(session) =
+                        store.chat_sessions.iter_mut().find(|s| s.id == session_id)
                     {
-                        with_store_mut(state, |store| {
-                            crate::persistence::apply_session_file_entries_to_store(store, entries);
-                            if let Some(session) =
-                                store.chat_sessions.iter_mut().find(|s| s.id == session_id)
-                            {
-                                session.archived = false;
-                                session.archived_at = None;
-                                if let Some(metadata) = session.metadata.as_mut() {
-                                    if let Some(object) = metadata.as_object_mut() {
-                                        object.remove("archived");
-                                        object.remove("archivedAt");
-                                    }
-                                }
+                        session.archived = false;
+                        session.archived_at = None;
+                        if let Some(metadata) = session.metadata.as_mut() {
+                            if let Some(object) = metadata.as_object_mut() {
+                                object.remove("archived");
+                                object.remove("archivedAt");
                             }
-                            let now = crate::now_i64();
-                            for acp_session in store
-                                .acp_sessions
-                                .iter_mut()
-                                .filter(|item| item.chat_session_id == session_id)
-                            {
-                                acp_session.status = "active".to_string();
-                                acp_session.updated_at = now;
-                            }
-                            Ok(json!({ "success": true }))
-                        })?;
+                        }
                     }
-                }
-                Ok(json!({ "success": loaded }))
+                    let now = crate::now_i64();
+                    for acp_session in store
+                        .acp_sessions
+                        .iter_mut()
+                        .filter(|item| item.chat_session_id == session_id)
+                    {
+                        acp_session.status = "active".to_string();
+                        acp_session.updated_at = now;
+                    }
+                    Ok(json!({ "success": true }))
+                })?;
+                Ok(json!({ "success": true }))
             }
             "chat:list-archived-sessions" => {
                 let index =
-                    crate::persistence::load_session_index(&state.store_path).unwrap_or_default();
+                    crate::persistence::load_session_index(&state.store_path)?;
                 let archived: Vec<Value> = index
                     .into_iter()
                     .filter(|e| e.archived)
@@ -3495,8 +3497,7 @@ pub fn handle_chat_sessions_wander_channel(
                     rename_session(store, &session_id, title)
                         .ok_or_else(|| "session not found".to_string())
                 })?;
-                let _ = app.emit(
-                    "chat:session-title-updated",
+                let _ = crate::events::emit_request_scoped(app, "chat:session-title-updated",
                     json!({
                         "sessionId": session.id,
                         "title": session.title,
@@ -3889,8 +3890,7 @@ pub fn handle_chat_sessions_wander_channel(
                         .unwrap_or(false);
                 let wander_session_id =
                     format!("session_wander_{}", slug_from_relative_path(&request_id));
-                let _ = app.emit(
-                    "wander:progress",
+                let _ = crate::events::emit_request_scoped(app, "wander:progress",
                     json!({
                         "requestId": request_id.clone(),
                         "sessionId": wander_session_id.clone(),
@@ -3903,8 +3903,7 @@ pub fn handle_chat_sessions_wander_channel(
                     }),
                 );
                 let context_started_at = now_ms();
-                let _ = app.emit(
-                    "wander:progress",
+                let _ = crate::events::emit_request_scoped(app, "wander:progress",
                     json!({
                         "requestId": request_id.clone(),
                         "sessionId": wander_session_id.clone(),
@@ -3924,8 +3923,7 @@ pub fn handle_chat_sessions_wander_channel(
                     context_started_at,
                     Some(format!("inputItems={}", items.len())),
                 );
-                let _ = app.emit(
-                    "wander:progress",
+                let _ = crate::events::emit_request_scoped(app, "wander:progress",
                     json!({
                         "requestId": request_id.clone(),
                         "sessionId": wander_session_id.clone(),
@@ -4019,8 +4017,7 @@ pub fn handle_chat_sessions_wander_channel(
                     session_started_at,
                     Some(format!("sessionId={}", wander_session_id)),
                 );
-                let _ = app.emit(
-                    "wander:progress",
+                let _ = crate::events::emit_request_scoped(app, "wander:progress",
                     json!({
                         "requestId": request_id.clone(),
                         "sessionId": wander_session_id.clone(),
@@ -4083,8 +4080,7 @@ pub fn handle_chat_sessions_wander_channel(
                             "{prompt}\n\n重复修正：上一版输出因为「{duplicate_reason}」被拒绝。请保留同一条笔记和评论区素材，但必须换一个评论信号、内容切口、核心矛盾和叙事角度；禁止复用上面历史选题或上一版输出。只输出新的 JSON。"
                         );
                         final_prompt = retry_prompt.clone();
-                        let _ = app.emit(
-                            "wander:progress",
+                        let _ = crate::events::emit_request_scoped(app, "wander:progress",
                             json!({
                                 "requestId": request_id.clone(),
                                 "sessionId": wander_session_id.clone(),
@@ -4179,8 +4175,7 @@ pub fn handle_chat_sessions_wander_channel(
                         );
                         Ok(())
                     })?;
-                    let _ = app.emit(
-                        "wander:progress",
+                    let _ = crate::events::emit_request_scoped(app, "wander:progress",
                         json!({
                             "requestId": request_id.clone(),
                             "sessionId": wander_session_id.clone(),
@@ -4276,8 +4271,7 @@ pub fn handle_chat_sessions_wander_channel(
                     history_started_at,
                     Some(format!("historyId={}", history_id)),
                 );
-                let _ = app.emit(
-                    "wander:progress",
+                let _ = crate::events::emit_request_scoped(app, "wander:progress",
                     json!({
                         "requestId": request_id.clone(),
                         "sessionId": wander_session_id.clone(),

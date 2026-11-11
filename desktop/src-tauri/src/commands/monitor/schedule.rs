@@ -893,6 +893,14 @@ pub(super) fn patch_audio_batch(app: AppHandle, payload: &Value) -> Result<Value
 /// - `force`：无视 `history_backfilled_at` 标记强制重补（手动按钮用）；
 /// - 历史视频：**自动下载 + 抽帧/转写**，且与「补正文」并行（`spawn_video_workers`），
 ///   进度经 `monitor:backfill-progress`(phase=videos) 推给前端；不阻塞本调用返回。
+pub(super) fn history_backfill_watches(store: &AppStore, watch_id: Option<&str>) -> Vec<crate::CompetitorWatchRecord> {
+    store.competitor_watchlist.iter()
+        .filter(|watch| watch.enabled)
+        .filter(|watch| watch_id.is_none() || watch_id == Some(watch.id.as_str()))
+        .filter(|watch| crate::identity::can_access(&watch.owner, &watch.shared_to))
+        .cloned().collect()
+}
+
 pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, String> {
     let state = app.state::<AppState>();
     let now = crate::now_i64();
@@ -908,13 +916,7 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
         .unwrap_or(false);
 
     let watches: Vec<crate::CompetitorWatchRecord> = with_store(&state, |store| {
-        Ok(store
-            .competitor_watchlist
-            .iter()
-            .filter(|watch| watch.enabled)
-            .filter(|watch| watch_id.is_none() || watch_id.as_deref() == Some(watch.id.as_str()))
-            .cloned()
-            .collect())
+        Ok(history_backfill_watches(&store, watch_id.as_deref()))
     })?;
 
     let mut stats = MonitorFetchStats::default();
@@ -1331,21 +1333,21 @@ pub fn run_history_backfill(app: AppHandle, payload: &Value) -> Result<Value, St
     let (store_for_watch, store_total, store_orphan) = {
         let target_watch = watch_id.clone();
         with_store(&state, |store| {
-            let total = store.monitored_posts.len() as i64;
+            let total = store.monitored_posts.iter().filter(|post| post_accessible(&store, post)).count() as i64;
             let for_watch = target_watch
                 .as_deref()
                 .map(|id| {
                     store
                         .monitored_posts
                         .iter()
-                        .filter(|post| post.watch_id.as_deref() == Some(id))
+                        .filter(|post| post.watch_id.as_deref() == Some(id) && post_accessible(&store, post))
                         .count() as i64
                 })
                 .unwrap_or(0);
             let orphan = store
                 .monitored_posts
                 .iter()
-                .filter(|post| post.watch_id.is_none())
+                .filter(|post| post.watch_id.is_none() && post_accessible(&store, post))
                 .count() as i64;
             Ok((for_watch, total, orphan))
         })?

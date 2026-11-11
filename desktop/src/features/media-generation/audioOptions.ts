@@ -10,6 +10,7 @@ const DEFAULT_AUDIO_LANGUAGE_OPTIONS = [
 ] as const;
 
 export type SettingsShape = {
+    generation_capabilities?: { image: boolean; video: boolean; voice: boolean; officialVideo: boolean };
     api_endpoint?: string;
     api_key?: string;
     ai_sources_json?: string;

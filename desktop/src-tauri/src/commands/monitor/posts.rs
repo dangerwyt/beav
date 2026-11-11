@@ -30,7 +30,7 @@ pub(super) fn set_spike_threshold(state: &State<'_, AppState>, payload: &Value) 
 
 /// 读取当前异常倍数阈值（0 / 缺失回落默认 3.0，便于前端初始化）。
 pub(super) fn get_spike_threshold(state: &State<'_, AppState>) -> Result<Value, String> {
-    with_store_mut(state, |store| {
+    with_store(state, |store| {
         let threshold = if store.monitor_spike_threshold <= 0.0 {
             3.0
         } else {

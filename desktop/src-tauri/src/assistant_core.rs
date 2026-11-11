@@ -2,6 +2,7 @@ use crate::agent::{
     execute_prepared_session_agent_turn, AssistantDaemonTurn, PreparedSessionAgentTurn,
 };
 use crate::knowledge;
+mod web_access;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -75,11 +76,9 @@ fn assistant_channel_public_value(channel: &Value, base_url: &str, fallback_path
     value
 }
 
-fn knowledge_api_public_value(channel: &Value, base_url: &str, fallback_path: &str) -> Value {
-    let endpoint_path = normalize_endpoint_path(
-        channel.get("endpointPath").and_then(|item| item.as_str()),
-        fallback_path,
-    );
+fn knowledge_api_public_value(_channel: &Value, base_url: &str, fallback_path: &str) -> Value {
+    // The knowledge HTTP router has a fixed namespace; do not advertise a legacy custom endpoint.
+    let endpoint_path = normalize_endpoint_path(None, fallback_path);
     json!({
         "endpointPath": endpoint_path,
         "webhookUrl": if base_url.is_empty() {
@@ -833,7 +832,7 @@ fn handle_browser_ipc_http_request(
         .get("x-beav-user")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    crate::identity::set_request_owner(request_owner);
+    let _owner_scope = crate::identity::RequestOwnerScope::enter(request_owner);
 
     let outcome = if normalized_path == "/api/ipc/send" {
         crate::commands::chat::handle_send_channel(app, channel, payload, &state)
@@ -841,7 +840,6 @@ fn handle_browser_ipc_http_request(
     } else {
         crate::handle_channel(app, channel, payload, &state)
     };
-    crate::identity::clear_request_owner();
     let value = outcome?;
     Ok((200, "OK", value))
 }
@@ -960,8 +958,16 @@ fn handle_assistant_connection(app: AppHandle, mut stream: TcpStream, addr: Sock
     .unwrap_or_else(|_| AssistantStateRecord::default());
     let (raw_headers, body) = parse_http_request_parts(&request);
     let (method, _path, headers) = parse_http_request_meta(&raw_headers);
+    let request_owner = headers.get("x-beav-user").map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    if matches!(normalize_request_path(&path).as_str(), "/api/events" | "/api/file")
+        && (!addr.ip().is_loopback() || !is_allowed_browser_ipc_origin(&headers))
+    {
+        let _ = http_json_response(&mut stream, 403, "Forbidden", json!({"error": "Forbidden"}));
+        return;
+    }
     if normalize_request_path(&path) == "/api/events" {
-        stream_sse(&mut stream);
+        stream_sse(&app, &mut stream, request_owner);
         return;
     }
     if normalize_request_path(&path) == "/api/file" {
@@ -979,6 +985,7 @@ fn handle_assistant_connection(app: AppHandle, mut stream: TcpStream, addr: Sock
             &mut stream,
             &path,
             headers.get("range").map(String::as_str),
+            request_owner,
         ) {
             let _ = http_json_response(
                 &mut stream,
@@ -1140,17 +1147,28 @@ fn handle_assistant_connection(app: AppHandle, mut stream: TcpStream, addr: Sock
 // 桌面端 `emit` 的事件，除了发给 WebView，也广播给通过 HTTP 连上来的浏览器。
 // 只新增监听 + 新路由，桌面端原有行为不变。
 
-fn sse_clients() -> &'static Mutex<Vec<Sender<String>>> {
-    static CLIENTS: OnceLock<Mutex<Vec<Sender<String>>>> = OnceLock::new();
+#[derive(Clone)]
+struct SseEvent {
+    name: String,
+    payload: Value,
+    request_owner: Option<String>,
+}
+
+fn sse_clients() -> &'static Mutex<Vec<Sender<SseEvent>>> {
+    static CLIENTS: OnceLock<Mutex<Vec<Sender<SseEvent>>>> = OnceLock::new();
     CLIENTS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn broadcast_sse_event(event: &str, payload: &str) {
-    let payload_value: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
-    let frame = format!(
-        "data: {}\n\n",
-        json!({ "event": event, "payload": payload_value })
-    );
+    let mut payload: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    // Tauri may defer listeners to another thread; use the identity captured by the emitter.
+    let request_owner = payload.as_object_mut().and_then(|object| object.remove("_beavRequestOwner"))
+        .and_then(|value| value.as_str().map(str::to_string));
+    let frame = SseEvent {
+        name: event.to_string(),
+        payload,
+        request_owner,
+    };
     let Ok(mut clients) = sse_clients().lock() else {
         return;
     };
@@ -1287,7 +1305,7 @@ fn parse_byte_range(header: &str, total: u64) -> Option<(u64, u64)> {
 /// 不再把整个视频读进内存。
 /// 64KB 分块写：比 io::copy 更容易观察，也能在单次 write 异常时中止而不是静默截断。
 fn copy_chunked(reader: &mut impl std::io::Read, stream: &mut TcpStream) -> Result<(), String> {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let mut buffer = vec![0u8; 64 * 1024];
     let mut sent = 0usize;
     loop {
@@ -1309,6 +1327,7 @@ fn serve_local_file(
     stream: &mut TcpStream,
     path: &str,
     range_header: Option<&str>,
+    owner: Option<&str>,
 ) -> Result<(), String> {
     // 连接可能带着「读请求」留下的超时；它同样作用于写，一旦触发 io::copy 就
     // 会在 1MB 左右中断（浏览器表现为进度不动）。这里明确清掉，并关闭 Nagle。
@@ -1357,6 +1376,9 @@ fn serve_local_file(
     if !roots.iter().any(|root| canonical.starts_with(root)) {
         return Err("路径不在允许的目录内".to_string());
     }
+    if !web_access::file_allowed(&state, owner, &canonical, &roots)? {
+        return Err("文件不存在或无权访问".to_string());
+    }
 
     let metadata = std::fs::metadata(&canonical).map_err(|error| error.to_string())?;
     let total = metadata.len();
@@ -1384,7 +1406,7 @@ fn serve_local_file(
         // filename 给 ASCII 兜底，filename* 给浏览器真实中文名
         let ascii_fallback: String = name
             .chars()
-            .map(|c| if c.is_ascii() && c != '"' && c != '\\' { c } else { '_' })
+            .map(|c| if c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\' { c } else { '_' })
             .collect();
         head.push_str(&format!(
             "Content-Disposition: attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{}\r\n",
@@ -1399,7 +1421,7 @@ fn serve_local_file(
         head.push_str(&content_range);
     }
     head.push_str("Access-Control-Allow-Origin: *\r\n");
-    head.push_str("Cache-Control: private, max-age=3600\r\n");
+    head.push_str("Cache-Control: private, no-store\r\n");
     head.push_str("Connection: close\r\n\r\n");
     stream
         .write_all(head.as_bytes())
@@ -1419,7 +1441,12 @@ fn serve_local_file(
     Ok(())
 }
 
-fn stream_sse(stream: &mut TcpStream) {
+fn filter_sse_frame(state: &State<'_, AppState>, owner: Option<&str>, frame: &SseEvent) -> Option<String> {
+    let payload = web_access::event_payload(state, owner, frame.request_owner.as_deref(), &frame.name, &frame.payload)?;
+    Some(format!("data: {}\n\n", json!({"event": frame.name, "payload": payload})))
+}
+
+fn stream_sse(app: &AppHandle, stream: &mut TcpStream, owner: Option<&str>) {
     const HEADERS: &str = concat!(
         "HTTP/1.1 200 OK\r\n",
         "Content-Type: text/event-stream\r\n",
@@ -1432,7 +1459,7 @@ fn stream_sse(stream: &mut TcpStream) {
         return;
     }
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-    let (sender, receiver) = mpsc_channel::<String>();
+    let (sender, receiver) = mpsc_channel::<SseEvent>();
     if sse_clients()
         .lock()
         .map(|mut clients| clients.push(sender))
@@ -1445,6 +1472,7 @@ fn stream_sse(stream: &mut TcpStream) {
     loop {
         match receiver.recv_timeout(Duration::from_secs(15)) {
             Ok(frame) => {
+                let Some(frame) = filter_sse_frame(&app.state::<AppState>(), owner, &frame) else { continue; };
                 if stream.write_all(frame.as_bytes()).is_err() {
                     break;
                 }
@@ -1693,10 +1721,11 @@ mod tests {
             "generic"
         );
         assert!(is_knowledge_api_path("/api/knowledge/entries", &state));
-        assert!(!is_knowledge_api_path(
+        assert!(is_knowledge_api_path(
             "/api/knowledge/custom/entries",
             &state
         ));
+        assert!(!is_knowledge_api_path("/api/knowledge-other/entries", &state));
     }
 
     #[test]

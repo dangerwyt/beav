@@ -19,8 +19,23 @@ pub(crate) fn set_request_owner(owner: Option<String>) {
     CURRENT_OWNER.with(|cell| *cell.borrow_mut() = normalized);
 }
 
+#[cfg(test)]
 pub(crate) fn clear_request_owner() {
     CURRENT_OWNER.with(|cell| *cell.borrow_mut() = None);
+}
+
+pub(crate) struct RequestOwnerScope(Option<String>);
+
+impl RequestOwnerScope {
+    pub(crate) fn enter(owner: Option<String>) -> Self {
+        let previous = current_owner();
+        set_request_owner(owner);
+        Self(previous)
+    }
+}
+
+impl Drop for RequestOwnerScope {
+    fn drop(&mut self) { set_request_owner(self.0.take()); }
 }
 
 /// `None` = 管理员（桌面端）。
@@ -71,12 +86,12 @@ pub(crate) fn owner_equals(left: &str, right: &str) -> bool {
 /// 用途限于「看」和「对已有数据做增量处理」（抓取、补历史、下载）；
 /// 删除类操作必须继续用 `owner_matches`，否则被分配者能反过来删掉别人的东西。
 pub(crate) fn can_access(owner: &str, shared_to: &[String]) -> bool {
-    if owner_matches(owner) {
-        return true;
-    }
-    let Some(current) = current_owner() else {
-        return true;
-    };
+    can_access_as(current_owner().as_deref(), owner, shared_to)
+}
+
+pub(crate) fn can_access_as(current: Option<&str>, owner: &str, shared_to: &[String]) -> bool {
+    let Some(current) = current else { return true; };
+    if owner_equals(current, owner) { return true; }
     let me = current.trim();
     shared_to.iter().any(|user| user.trim() == me)
 }

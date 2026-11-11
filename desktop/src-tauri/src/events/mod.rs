@@ -139,8 +139,7 @@ fn emit_legacy_chat_compat_event<R: Runtime>(
                 "chat.session_title_updated" => {
                     let session_from_payload = payload_string(&checkpoint_payload, "sessionId");
                     let title = payload_string(&checkpoint_payload, "title").unwrap_or_default();
-                    let _ = app.emit(
-                        "chat:session-title-updated",
+                    let _ = emit_request_scoped(app, "chat:session-title-updated",
                         json!({
                             "sessionId": session_from_payload
                                 .or_else(|| session_id.map(ToString::to_string))
@@ -314,6 +313,39 @@ pub fn emit_runtime_event<R: Runtime>(
     emit_runtime_event_with_lineage(app, event_type, session_id, task_id, None, None, payload);
 }
 
+/// Capture Web identity before Tauri queues callbacks on a different thread.
+pub(crate) fn emit_request_scoped<R: Runtime>(
+    app: &AppHandle<R>, event: &str, payload: impl serde::Serialize,
+) -> tauri::Result<()> {
+    app.emit(event, request_scoped_payload(payload)?)
+}
+
+fn request_scoped_payload(payload: impl serde::Serialize) -> tauri::Result<Value> {
+    let mut value = serde_json::to_value(payload).map_err(tauri::Error::Json)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("_beavRequestOwner".to_string(), json!(crate::identity::current_owner()));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod web_request_tests {
+    use super::*;
+
+    #[test]
+    fn event_identity_is_captured_before_delivery_and_cannot_be_spoofed() {
+        let value = {
+            let _scope = crate::identity::RequestOwnerScope::enter(Some("alice".into()));
+            request_scoped_payload(json!({"_beavRequestOwner": "bob", "content": "reply"})).unwrap()
+        };
+        assert!(crate::identity::current_owner().is_none());
+        assert_eq!(value["_beavRequestOwner"], "alice");
+        assert_eq!(value["content"], "reply");
+        let admin = request_scoped_payload(json!({"_beavRequestOwner": "alice"})).unwrap();
+        assert!(admin["_beavRequestOwner"].is_null());
+    }
+}
+
 pub fn emit_runtime_event_with_lineage<R: Runtime>(
     app: &AppHandle<R>,
     event_type: &str,
@@ -336,8 +368,7 @@ pub fn emit_runtime_event_with_lineage<R: Runtime>(
     project_acp_runtime_event(app, event_type, session_id, &payload);
     let state = app.state::<AppState>();
     crate::analytics::observe_runtime_event(&state, event_type, &payload);
-    let _ = app.emit(
-        "runtime:event",
+    let _ = emit_request_scoped(app, "runtime:event",
         RuntimeEventEnvelope::new(
             event_type,
             session_id,

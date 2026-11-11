@@ -701,10 +701,10 @@ pub(super) fn material_files(state: &State<'_, AppState>, payload: &Value) -> Re
     }
     let root = resolve_export_target(state)?;
     let mut files: Vec<Value> = Vec::new();
-    for id in ids {
+    for id in &ids {
         try_export_post_product(state, &id)?; // 幂等：已有产物只是补齐
         let post = with_store(state, |store| {
-            Ok(store.monitored_posts.iter().find(|p| p.id == id).cloned())
+            Ok(store.monitored_posts.iter().find(|p| p.id == *id).cloned())
         })?;
         let Some(post) = post else { continue };
         let l1 = root.join(platform_label(&post.platform));
@@ -725,12 +725,16 @@ pub(super) fn material_files(state: &State<'_, AppState>, payload: &Value) -> Re
             .filter(|value| !value.is_empty())
             .unwrap_or("素材包")
             .to_string();
-        let dir = root.join("_素材包");
+        // Each request gets a separate directory so users cannot overwrite each other's bundle.
+        let dir = root.join("_素材包").join(make_id("bundle"));
         std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
         let name = sanitize_fs_name(&name).trim_matches('.').to_string();
         if name.is_empty() { return Err("素材包名称无效".to_string()); }
         let target = dir.join(format!("{name}.zip"));
         let written = crate::commands::file_ops::archive::write_zip_archive(state, &files, target)?;
+        std::fs::write(dir.join(".beav-bundle.json"), serde_json::to_vec(&json!({
+            "owner": crate::identity::owner_or_admin(), "postIds": ids,
+        })).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
         return Ok(json!({ "success": true, "count": files.len(), "bundle": written }));
     }
     Ok(json!({ "success": true, "count": files.len(), "files": files }))

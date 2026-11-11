@@ -19,4 +19,8 @@
 
 手动导出和素材打包必须返回文件错误。自动导出继续记录错误而不打断采集；二创内容已保存但导出失败时，通过 `exported` / `exportError` 告知前端，避免用户为重试导出重复生成内容。
 
+Web 文件访问还会在 `assistant_core/web_access.rs` 校验记录归属。共享博主的原片、预览、抽帧和标记产物目录继续可读；素材包按请求生成独立目录，并记录请求用户及帖子清单。无归属清单的旧 ZIP 需重新打包。撤销共享后，文件和进度事件也会失去访问权限。
+
+省略 `watchId` 的历史补采只选择当前用户拥有或获共享的监控项；后台管理员调度仍可处理全部启用项。SSE 的全局预取通知只向普通用户发送刷新信号，不包含其他用户的统计和诊断内容。
+
 验证：`cargo check --bin beav`、`cargo test --bin beav commands::monitor::tests`。修改打包路径时同时运行 `commands::file_ops::archive::tests`。

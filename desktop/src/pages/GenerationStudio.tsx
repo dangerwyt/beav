@@ -2112,16 +2112,16 @@ export function GenerationStudio({
 
     const resolvedImageEndpoint = (settings.image_endpoint || settings.api_endpoint || '').trim();
     const resolvedImageApiKey = (settings.image_api_key || settings.api_key || '').trim();
-    const hasImageConfig = Boolean(resolvedImageEndpoint) && Boolean(resolvedImageApiKey);
+    const hasImageConfig = settings.generation_capabilities?.image ?? (Boolean(resolvedImageEndpoint) && Boolean(resolvedImageApiKey));
     const resolvedVideoEndpoint = (settings.video_endpoint || REDBOX_OFFICIAL_VIDEO_BASE_URL).trim();
     const resolvedVideoApiKey = (settings.video_api_key || settings.api_key || '').trim();
-    const hasVideoConfig = Boolean(resolvedVideoEndpoint) && Boolean(resolvedVideoApiKey);
-    const effectiveVideoModel = resolvedVideoEndpoint === REDBOX_OFFICIAL_VIDEO_BASE_URL
+    const hasVideoConfig = settings.generation_capabilities?.video ?? (Boolean(resolvedVideoEndpoint) && Boolean(resolvedVideoApiKey));
+    const effectiveVideoModel = (settings.generation_capabilities?.officialVideo ?? (resolvedVideoEndpoint === REDBOX_OFFICIAL_VIDEO_BASE_URL))
         ? getRedBoxOfficialVideoModel(videoMode)
         : (settings.video_model || getRedBoxOfficialVideoModel(videoMode)).trim();
     const resolvedVoiceEndpoint = (settings.voice_endpoint || settings.tts_endpoint || settings.api_endpoint || '').trim();
     const resolvedVoiceApiKey = (settings.voice_api_key || settings.tts_api_key || settings.api_key || '').trim();
-    const hasVoiceConfig = Boolean(resolvedVoiceEndpoint) && Boolean(resolvedVoiceApiKey);
+    const hasVoiceConfig = settings.generation_capabilities?.voice ?? (Boolean(resolvedVoiceEndpoint) && Boolean(resolvedVoiceApiKey));
     const audioModelOptions = useMemo<PickerOption[]>(() => buildAudioModelOptions(settings), [settings]);
     const effectiveAudioModel = (audioModel || settings.voice_tts_model || settings.tts_model || DEFAULT_AUDIO_TTS_MODEL).trim();
     const audioVoicesForModel = useMemo(

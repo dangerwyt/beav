@@ -1071,8 +1071,9 @@ mod tests {
 
     #[test]
     fn persisted_store_can_resume_and_continue_session_after_reload() {
-        let path =
-            std::env::temp_dir().join(format!("redbox-session-manager-{}.json", crate::now_ms()));
+        let root = std::env::temp_dir().join(crate::make_id("session-manager-test"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("store.json");
         let mut store = AppStore::default();
         let session = create_context_session(
             &mut store,
@@ -1103,6 +1104,8 @@ mod tests {
         let mut reloaded = load_store(&path).expect("store should load");
         let resumed_id =
             resolve_resume_target_session_id(&reloaded, None).expect("resume target session");
+        let entries = crate::persistence::load_session_file(&path, &resumed_id).expect("lazy-load session history");
+        crate::persistence::apply_session_file_entries_to_store(&mut reloaded, entries);
         let resumed = build_session_snapshot(&reloaded, &resumed_id, None, None).expect("snapshot");
         assert_eq!(resumed.session.chat_session.title, "Reloadable");
         assert_eq!(resumed.session.message_count, 2);
@@ -1139,6 +1142,6 @@ mod tests {
             Some("first turn")
         );
 
-        let _ = fs::remove_file(path);
+        fs::remove_dir_all(root).unwrap();
     }
 }

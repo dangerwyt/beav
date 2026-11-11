@@ -265,6 +265,11 @@ pub fn handle_cli_runtime_channel(
     channel: &str,
     payload: &Value,
 ) -> Option<Result<Value, String>> {
+    if channel.starts_with("cli-runtime:") {
+        if let Err(error) = crate::identity::require_admin() {
+            return Some(Err(error));
+        }
+    }
     let result = match channel {
         "cli-runtime:detect" => detect_tools_value(state, payload),
         "cli-runtime:list-tools" => {

@@ -176,6 +176,7 @@ pub fn handle_mcp_tools_channel(
     }
 
     Some((|| -> Result<Value, String> {
+        crate::identity::require_admin()?;
         if let Some(result) = handle_tools_diagnostics_channel(state, channel, payload) {
             return result;
         }

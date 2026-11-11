@@ -12,6 +12,15 @@ pub fn handle_media_jobs_channel(
     channel: &str,
     payload: &Value,
 ) -> Option<Result<Value, String>> {
+    if channel.starts_with("generation:") && !crate::identity::is_admin() {
+        if let Some(job_id) = payload_string(payload, "jobId") {
+            match media_runtime::web_job_visible(state, crate::identity::current_owner().as_deref(), &job_id) {
+                Ok(true) => {}
+                Ok(false) => return Some(Err("生成任务不存在或无权访问".to_string())),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
     match channel {
         "generation:submit-image" => Some(media_runtime::submit_media_job(
             app, state, "image", payload,

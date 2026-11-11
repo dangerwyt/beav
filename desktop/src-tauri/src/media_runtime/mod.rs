@@ -923,7 +923,43 @@ pub(crate) fn get_media_job_projection(
     job_id: &str,
 ) -> Result<Value, String> {
     let conn = open_media_runtime_connection(state)?;
+    require_job_access(&conn, job_id)?;
     get_job_projection_with_connection(&conn, job_id)
+}
+
+fn job_visible_as(owner: Option<&str>, request: &Value) -> bool {
+    crate::identity::can_access_as(owner, request.get("_beavOwner").and_then(Value::as_str).unwrap_or("admin"), &[])
+}
+
+fn require_job_access(conn: &Connection, job_id: &str) -> Result<(), String> {
+    if crate::identity::is_admin() { return Ok(()); }
+    let job = load_job_with_current_attempt(conn, job_id)?;
+    if job.is_some_and(|loaded| job_visible_as(crate::identity::current_owner().as_deref(), &loaded.job.request_json)) {
+        Ok(())
+    } else {
+        Err("生成任务不存在或无权访问".to_string())
+    }
+}
+
+pub(crate) fn web_job_visible(state: &State<'_, AppState>, owner: Option<&str>, job_id: &str) -> Result<bool, String> {
+    let conn = open_media_runtime_connection(state)?;
+    Ok(load_job_with_current_attempt(&conn, job_id)?
+        .is_some_and(|loaded| job_visible_as(owner, &loaded.job.request_json)))
+}
+
+pub(crate) fn web_artifact_allowed(state: &State<'_, AppState>, owner: Option<&str>, path: &Path) -> Result<bool, String> {
+    let conn = open_media_runtime_connection(state)?;
+    let mut statement = conn.prepare(
+        "SELECT a.absolute_path FROM media_job_artifacts a JOIN media_jobs j ON j.job_id = a.job_id
+         WHERE (?1 IS NULL OR COALESCE(NULLIF(json_extract(j.request_json, '$._beavOwner'), ''), 'admin') = ?1)"
+    ).map_err(|error| error.to_string())?;
+    let rows = statement.query_map(params![owner], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    for item in rows {
+        let candidate = item.map_err(|error| error.to_string())?;
+        if Path::new(&candidate).canonicalize().is_ok_and(|candidate| candidate == path) { return Ok(true); }
+    }
+    Ok(false)
 }
 
 fn artifact_count_for_job(conn: &Connection, job_id: &str) -> Result<i64, String> {
@@ -1803,7 +1839,9 @@ pub(crate) fn submit_media_job(
     ensure_media_runtime_ready(state)?;
     let kind = effective_media_job_kind(kind, payload);
     let kind = kind.as_str();
-    let payload = normalize_media_job_file_references(state, kind, payload)?;
+    let mut payload = normalize_media_job_file_references(state, kind, payload)?;
+    let object = payload.as_object_mut().ok_or_else(|| "生成请求必须是对象".to_string())?;
+    object.insert("_beavOwner".to_string(), json!(crate::identity::owner_or_admin()));
     let source = infer_job_source(&payload);
     let queue_mode = infer_job_queue_mode(&source, &payload);
     let priority = infer_job_priority(&source, &payload);
@@ -1958,6 +1996,30 @@ fn validate_resolved_media_reference(field: &str, value: &str) -> Result<(), Str
     ))
 }
 
+const LIST_MEDIA_JOBS_SQL: &str = "SELECT job_id FROM media_jobs
+             WHERE (?1 IS NULL OR kind = ?1)
+               AND (?2 IS NULL OR status = ?2)
+               AND (?3 IS NULL OR source = ?3)
+               AND (?4 IS NULL OR queue_mode = ?4)
+               AND (?5 IS NULL OR manuscript_path = ?5)
+               AND (?6 IS NULL OR video_project_path = ?6)
+               AND (?7 IS NULL OR owner_session_id = ?7)
+               AND (?8 OR archived_at IS NULL)
+               AND (?10 IS NULL OR COALESCE(NULLIF(json_extract(request_json, '$._beavOwner'), ''), 'admin') = ?10)
+             ORDER BY updated_at DESC, job_id DESC
+             LIMIT ?9";
+
+const LIST_MEDIA_SUMMARIES_SQL: &str = "SELECT job_id FROM media_jobs
+             WHERE (?1 IS NULL OR kind = ?1)
+               AND (?2 IS NULL OR status = ?2)
+               AND (?3 IS NULL OR source = ?3)
+               AND (?4 IS NULL OR queue_mode = ?4)
+               AND (?5 IS NULL OR owner_session_id = ?5)
+               AND (?6 OR archived_at IS NULL)
+               AND (?8 IS NULL OR COALESCE(NULLIF(json_extract(request_json, '$._beavOwner'), ''), 'admin') = ?8)
+             ORDER BY updated_at DESC, job_id DESC
+             LIMIT ?7";
+
 pub(crate) fn list_media_jobs(
     state: &State<'_, AppState>,
     payload: &Value,
@@ -1985,17 +2047,7 @@ pub(crate) fn list_media_jobs(
         .unwrap_or(false);
     let mut statement = conn
         .prepare(
-            "SELECT job_id FROM media_jobs
-             WHERE (?1 IS NULL OR kind = ?1)
-               AND (?2 IS NULL OR status = ?2)
-               AND (?3 IS NULL OR source = ?3)
-               AND (?4 IS NULL OR queue_mode = ?4)
-               AND (?5 IS NULL OR manuscript_path = ?5)
-               AND (?6 IS NULL OR video_project_path = ?6)
-               AND (?7 IS NULL OR owner_session_id = ?7)
-               AND (?8 OR archived_at IS NULL)
-             ORDER BY updated_at DESC, job_id DESC
-             LIMIT ?9",
+            LIST_MEDIA_JOBS_SQL,
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
@@ -2009,7 +2061,8 @@ pub(crate) fn list_media_jobs(
                 video_project_path_filter.as_deref(),
                 owner_session_id_filter.as_deref(),
                 include_archived,
-                limit
+                limit,
+                crate::identity::current_owner()
             ],
             |row| row.get::<_, String>(0),
         )
@@ -2047,15 +2100,7 @@ pub(crate) fn list_media_job_summaries(
         .unwrap_or(false);
     let mut statement = conn
         .prepare(
-            "SELECT job_id FROM media_jobs
-             WHERE (?1 IS NULL OR kind = ?1)
-               AND (?2 IS NULL OR status = ?2)
-               AND (?3 IS NULL OR source = ?3)
-               AND (?4 IS NULL OR queue_mode = ?4)
-               AND (?5 IS NULL OR owner_session_id = ?5)
-               AND (?6 OR archived_at IS NULL)
-             ORDER BY updated_at DESC, job_id DESC
-             LIMIT ?7",
+            LIST_MEDIA_SUMMARIES_SQL,
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
@@ -2067,7 +2112,8 @@ pub(crate) fn list_media_job_summaries(
                 queue_mode_filter.as_deref(),
                 owner_session_id_filter.as_deref(),
                 include_archived,
-                limit
+                limit,
+                crate::identity::current_owner()
             ],
             |row| row.get::<_, String>(0),
         )
@@ -5787,6 +5833,42 @@ mod tests {
                 updated_at: now_iso(),
             },
         }
+    }
+
+    #[test]
+    fn web_job_sql_filters_owner_before_applying_limit() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE media_jobs (
+            job_id TEXT, kind TEXT, status TEXT, source TEXT, queue_mode TEXT,
+            manuscript_path TEXT, video_project_path TEXT, owner_session_id TEXT,
+            archived_at TEXT, updated_at TEXT, request_json TEXT
+        )").unwrap();
+        for (id, owner, time) in [("own", Some("alice"), "1"), ("other", Some("bob"), "2"), ("legacy", None, "3")] {
+            let request = owner.map(|owner| json!({"_beavOwner":owner})).unwrap_or_else(|| json!({}));
+            conn.execute("INSERT INTO media_jobs (job_id, updated_at, request_json) VALUES (?1, ?2, ?3)",
+                params![id, time, request.to_string()]).unwrap();
+        }
+        for (query, limit_slot, owner_slot) in [(LIST_MEDIA_JOBS_SQL, 9, 10), (LIST_MEDIA_SUMMARIES_SQL, 7, 8)] {
+            let mut params = vec![rusqlite::types::Value::Null; owner_slot];
+            params[limit_slot - 1] = 1.into();
+            params[owner_slot - 1] = "alice".to_string().into();
+            let mut statement = conn.prepare(query).unwrap();
+            let ids: Vec<String> = statement.query_map(rusqlite::params_from_iter(&params), |row| row.get(0))
+                .unwrap().collect::<Result<_,_>>().unwrap();
+            assert_eq!(ids, ["own"]);
+            params[owner_slot - 1] = rusqlite::types::Value::Null;
+            let ids: Vec<String> = statement.query_map(rusqlite::params_from_iter(&params), |row| row.get(0))
+                .unwrap().collect::<Result<_,_>>().unwrap();
+            assert_eq!(ids, ["legacy"]);
+        }
+    }
+
+    #[test]
+    fn web_job_visibility_defaults_legacy_jobs_to_admin() {
+        assert!(job_visible_as(None, &json!({})));
+        assert!(!job_visible_as(Some("alice"), &json!({})));
+        assert!(job_visible_as(Some("alice"), &json!({"_beavOwner": "alice"})));
+        assert!(!job_visible_as(Some("bob"), &json!({"_beavOwner": "alice"})));
     }
 
     #[test]

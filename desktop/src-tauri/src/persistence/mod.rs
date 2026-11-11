@@ -367,21 +367,26 @@ fn write_session_file_entries(
         let line = serde_json::to_string(entry).map_err(|error| error.to_string())?;
         writeln!(file, "{}", line).map_err(|error| error.to_string())?;
     }
+    file.sync_all().map_err(|error| error.to_string())?;
+    drop(file);
     fs::rename(&tmp, &path).map_err(|error| error.to_string())
 }
 
 fn write_session_index(store_path: &Path, entries: &[SessionIndexEntry]) -> Result<(), String> {
     let path = session_index_path(store_path)?;
     let serialized = serde_json::to_string_pretty(entries).map_err(|error| error.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serialized).map_err(|error| error.to_string())?;
-    fs::rename(&tmp, &path).map_err(|error| error.to_string())
+    write_store_snapshot(&path, &serialized)
 }
 
 pub(crate) fn load_session_index(store_path: &Path) -> Result<Vec<SessionIndexEntry>, String> {
     let path = session_index_path(store_path)?;
-    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    serde_json::from_str(&content).map_err(|error| error.to_string())
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("无法读取会话索引 {}：{error}", path.display())),
+    };
+    serde_json::from_str(&content)
+        .map_err(|error| format!("会话索引 {} 已损坏：{error}；原文件未改动", path.display()))
 }
 
 pub(crate) fn load_session_file(
@@ -511,10 +516,7 @@ pub(crate) fn apply_session_file_entries_to_store(
 }
 
 fn load_sessions_from_jsonl(store_path: &Path, store: &mut AppStore) -> Result<(), String> {
-    let index = match load_session_index(store_path) {
-        Ok(idx) => idx,
-        Err(_) => return Ok(()),
-    };
+    let index = load_session_index(store_path)?;
     store.chat_sessions.extend(
         index
             .into_iter()
@@ -558,43 +560,42 @@ pub(crate) fn is_session_file_loaded(store: &AppStore, session_id: &str) -> bool
 }
 
 pub(crate) fn archive_session(store_path: &Path, session_id: &str) -> Result<(), String> {
+    let mut index = load_session_index(store_path)?;
+    let entry = index.iter_mut().find(|entry| entry.id == session_id)
+        .ok_or_else(|| "会话不存在".to_string())?;
+    if entry.archived { return Ok(()); }
     let src = session_file_path(store_path, session_id)?;
     let dst = archived_session_path(store_path, session_id)?;
-    if src.exists() {
-        fs::rename(&src, &dst).map_err(|error| error.to_string())?;
+    fs::rename(&src, &dst).map_err(|error| error.to_string())?;
+    entry.archived = true;
+    entry.archived_at = Some(crate::now_i64());
+    if let Err(error) = write_session_index(store_path, &index) {
+        fs::rename(&dst, &src).map_err(|rollback| format!("{error}；恢复会话文件失败：{rollback}"))?;
+        return Err(error);
     }
-    // Update index to mark as archived
-    let mut index = load_session_index(store_path).unwrap_or_default();
-    if let Some(entry) = index.iter_mut().find(|e| e.id == session_id) {
-        entry.archived = true;
-        entry.archived_at = Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0),
-        );
-    }
-    write_session_index(store_path, &index)
+    Ok(())
 }
 
 pub(crate) fn unarchive_session(store_path: &Path, session_id: &str) -> Result<(), String> {
+    let mut index = load_session_index(store_path)?;
+    let entry = index.iter_mut().find(|entry| entry.id == session_id)
+        .ok_or_else(|| "会话不存在".to_string())?;
+    if !entry.archived { return Ok(()); }
     let src = archived_session_path(store_path, session_id)?;
     let dst = session_file_path(store_path, session_id)?;
-    if src.exists() {
-        fs::rename(&src, &dst).map_err(|error| error.to_string())?;
+    fs::rename(&src, &dst).map_err(|error| error.to_string())?;
+    entry.archived = false;
+    entry.archived_at = None;
+    if let Err(error) = write_session_index(store_path, &index) {
+        fs::rename(&dst, &src).map_err(|rollback| format!("{error}；恢复归档文件失败：{rollback}"))?;
+        return Err(error);
     }
-    // Update index to mark as unarchived
-    let mut index = load_session_index(store_path).unwrap_or_default();
-    if let Some(entry) = index.iter_mut().find(|e| e.id == session_id) {
-        entry.archived = false;
-        entry.archived_at = None;
-    }
-    write_session_index(store_path, &index)?;
     // Reload session into memory is handled by the caller via load_session_file
     Ok(())
 }
 
 pub(crate) fn delete_session_file(store_path: &Path, session_id: &str) -> Result<(), String> {
+    let mut index = load_session_index(store_path)?;
     let path = session_file_path(store_path, session_id)?;
     if path.exists() {
         fs::remove_file(&path).map_err(|error| error.to_string())?;
@@ -604,50 +605,53 @@ pub(crate) fn delete_session_file(store_path: &Path, session_id: &str) -> Result
         fs::remove_file(&archived).map_err(|error| error.to_string())?;
     }
     // Remove from index
-    let mut index = load_session_index(store_path).unwrap_or_default();
     index.retain(|e| e.id != session_id);
     write_session_index(store_path, &index)
 }
 
-pub(crate) fn enforce_disk_retention(store_path: &Path) {
-    const MAX_DISK_MB: u64 = 500;
-    let sessions_dir = match sessions_dir(store_path) {
-        Ok(dir) => dir,
-        Err(_) => return,
-    };
-    let total_size = dir_size(&sessions_dir);
-    if total_size < MAX_DISK_MB * 1024 * 1024 {
-        return;
-    }
-    // Load index, sort by updated_at ascending (oldest first), prune until under limit
-    let mut index = match load_session_index(store_path) {
-        Ok(idx) => idx,
-        Err(_) => return,
-    };
-    index.retain(|e| !e.archived);
-    index.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
-    let mut removed_size: u64 = 0;
-    for entry in &index {
-        if total_size.saturating_sub(removed_size) < MAX_DISK_MB * 1024 * 1024 {
-            break;
+fn enforce_disk_retention(store_path: &Path) -> Result<Vec<String>, String> {
+    prune_session_disk(store_path, 500 * 1024 * 1024)
+}
+
+fn prune_session_disk(store_path: &Path, max_bytes: u64) -> Result<Vec<String>, String> {
+    let total_size = dir_size(&sessions_dir(store_path)?);
+    if total_size < max_bytes { return Ok(Vec::new()); }
+    let mut index = load_session_index(store_path)?;
+    let mut candidates: Vec<_> = index.iter().filter(|entry| !entry.archived).cloned().collect();
+    candidates.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+    let mut remaining = total_size;
+    let mut removed = HashSet::new();
+    let mut staged = Vec::new();
+    for entry in candidates {
+        if remaining < max_bytes { break; }
+        let path = session_file_path(store_path, &entry.id)?;
+        let size = path.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let staged_path = path.with_extension("jsonl.prune");
+        match fs::rename(&path, &staged_path) {
+            Ok(()) => {
+                remaining = remaining.saturating_sub(size);
+                removed.insert(entry.id);
+                staged.push((path, staged_path));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => { removed.insert(entry.id); }
+            Err(error) => eprintln!("[persist] session cleanup failed for {}: {error}", path.display()),
         }
-        let path = match session_file_path(store_path, &entry.id) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if let Ok(meta) = path.metadata() {
-            removed_size += meta.len();
-        }
-        let _ = fs::remove_file(&path);
     }
-    // Rebuild index without removed entries
-    let remaining_ids: HashSet<&str> = index.iter().map(|e| e.id.as_str()).collect();
-    let mut new_index = match load_session_index(store_path) {
-        Ok(idx) => idx,
-        Err(_) => return,
-    };
-    new_index.retain(|e| remaining_ids.contains(e.id.as_str()));
-    let _ = write_session_index(store_path, &new_index);
+    if !removed.is_empty() {
+        index.retain(|entry| !removed.contains(&entry.id));
+        if let Err(error) = write_session_index(store_path, &index) {
+            for (original, temporary) in &staged {
+                fs::rename(temporary, original).map_err(|rollback| format!("{error}；恢复清理文件失败：{rollback}"))?;
+            }
+            return Err(error);
+        }
+        for (_, temporary) in staged {
+            if let Err(error) = fs::remove_file(&temporary) {
+                eprintln!("[persist] cleanup temporary file {} failed: {error}", temporary.display());
+            }
+        }
+    }
+    Ok(removed.into_iter().collect())
 }
 
 fn dir_size(dir: &Path) -> u64 {
@@ -1035,20 +1039,12 @@ pub fn load_store(path: &PathBuf) -> Result<AppStore, String> {
 
     // Prefer per-session JSONL if available, fall back to legacy disk artifacts
     let mut loaded_from_legacy = false;
-    let disk_session_ids = if session_index_path(path).is_ok_and(|p| p.exists()) {
-        if let Err(e) = load_sessions_from_jsonl(path, &mut store) {
-            eprintln!(
-                "[{}] JSONL session load failed, falling back to legacy: {e}",
-                app_brand_display_name()
-            );
-            let ids = restore_session_artifacts_from_disk(path, &mut store).unwrap_or_default();
-            loaded_from_legacy = true;
-            ids
-        } else {
-            HashSet::new()
-        }
+    let index_exists = session_index_path(path)?.try_exists().map_err(|error| error.to_string())?;
+    let disk_session_ids = if index_exists {
+        load_sessions_from_jsonl(path, &mut store)?;
+        HashSet::new()
     } else {
-        let ids = restore_session_artifacts_from_disk(path, &mut store).unwrap_or_default();
+        let ids = restore_session_artifacts_from_disk(path, &mut store)?;
         loaded_from_legacy = true;
         ids
     };
@@ -1075,13 +1071,14 @@ pub fn load_store(path: &PathBuf) -> Result<AppStore, String> {
         || migrated_session_artifacts
         || loaded_from_legacy
     {
-        let _ = persist_store(path, &store);
+        let removed = persist_store(path, &store)?;
+        for id in removed { crate::session_manager::remove_session_artifacts(&mut store, &id); }
     }
     Ok(store)
 }
 
 /// 全局写盘锁：`persist_store` 与延迟写盘任务共用，避免并发写坏 `beav-state.json`。
-fn store_write_lock() -> &'static Mutex<()> {
+pub(crate) fn store_write_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -1094,39 +1091,33 @@ pub fn flush_store_now(state: &State<'_, AppState>) {
     if FLUSHED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let snapshot = match state.store.lock() {
-        Ok(store) => store.clone(),
-        Err(_) => return,
-    };
-    if let Err(error) = persist_store(&state.store_path, &snapshot) {
+    if let Err(error) = persist_state_now(state) {
         eprintln!("[persist] flush on exit failed: {error}");
     }
 }
 
-pub fn persist_store(path: &PathBuf, store: &AppStore) -> Result<(), String> {
-    let _write_guard = store_write_lock()
-        .lock()
-        .map_err(|_| "store 写盘锁已损坏".to_string())?;
-    let mut snapshot = store.clone();
-    crate::session_manager::enforce_default_retention(&mut snapshot);
-    crate::auth::sanitize_store_for_persist(&mut snapshot);
-    let mut session_artifacts = take_session_artifacts_from_store(&mut snapshot);
-    for artifact in &mut session_artifacts {
-        dedupe_session_artifacts(artifact);
-    }
-    let sessions = std::mem::take(&mut snapshot.chat_sessions);
-    let context_records = std::mem::take(&mut snapshot.session_context_records);
-    snapshot.debug_logs.clear();
-
+fn persist_sessions(
+    path: &Path,
+    sessions: &[crate::ChatSessionRecord],
+    session_artifacts: &[PersistedSessionArtifacts],
+    context_records: &[crate::ChatSessionContextRecord],
+) -> Result<Vec<String>, String> {
     // Write per-session JSONL files
-    let existing_index = load_session_index(path)
-        .unwrap_or_default()
+    let existing_index = load_session_index(path)?
         .into_iter()
         .map(|entry| (entry.id.clone(), entry))
         .collect::<HashMap<_, _>>();
-    let mut index_entries: Vec<SessionIndexEntry> = Vec::new();
-    for session in &sessions {
+    let session_ids: HashSet<&str> = sessions.iter().map(|session| session.id.as_str()).collect();
+    let mut index_entries: Vec<SessionIndexEntry> = existing_index.values()
+        .filter(|entry| entry.archived && !session_ids.contains(entry.id.as_str()))
+        .cloned().collect();
+    for session in sessions {
         let session_id = &session.id;
+        // The disk index owns archive transitions; a queued older snapshot must not undo them.
+        if let Some(archived) = existing_index.get(session_id).filter(|entry| entry.archived) {
+            index_entries.push(archived.clone());
+            continue;
+        }
         let mut entries: Vec<SessionFileEntry> = Vec::new();
         entries.push(SessionFileEntry::Session(session.clone()));
 
@@ -1173,7 +1164,7 @@ pub fn persist_store(path: &PathBuf, store: &AppStore) -> Result<(), String> {
                 .map(|file_path| !file_path.exists())
                 .unwrap_or(true);
         if should_write_session_file {
-            let _ = write_session_file_entries(path, session_id, &entries);
+            write_session_file_entries(path, session_id, &entries)?;
         }
 
         index_entries.push(SessionIndexEntry {
@@ -1192,8 +1183,31 @@ pub fn persist_store(path: &PathBuf, store: &AppStore) -> Result<(), String> {
                 .and_then(|m| crate::payload_string(m, "workingDirectory")),
         });
     }
-    let _ = write_session_index(path, &index_entries);
-    enforce_disk_retention(path);
+    write_session_index(path, &index_entries)?;
+    enforce_disk_retention(path)
+}
+
+pub fn persist_store(path: &PathBuf, store: &AppStore) -> Result<Vec<String>, String> {
+    let _write_guard = store_write_lock()
+        .lock()
+        .map_err(|_| "store 写盘锁已损坏".to_string())?;
+    persist_store_locked(path, store)
+}
+
+fn persist_store_locked(path: &PathBuf, store: &AppStore) -> Result<Vec<String>, String> {
+    let mut snapshot = store.clone();
+    crate::session_manager::enforce_default_retention(&mut snapshot);
+    crate::auth::sanitize_store_for_persist(&mut snapshot);
+    let mut session_artifacts = take_session_artifacts_from_store(&mut snapshot);
+    for artifact in &mut session_artifacts {
+        dedupe_session_artifacts(artifact);
+    }
+    let sessions = std::mem::take(&mut snapshot.chat_sessions);
+    let context_records = std::mem::take(&mut snapshot.session_context_records);
+    snapshot.debug_logs.clear();
+
+    let removed = persist_sessions(path, &sessions, &session_artifacts, &context_records)?;
+    session_artifacts.retain(|artifact| !removed.contains(&artifact.session_id));
 
     // Still write legacy format (dual-write during transition)
     write_session_artifacts_to_disk(path, &session_artifacts)?;
@@ -1201,7 +1215,28 @@ pub fn persist_store(path: &PathBuf, store: &AppStore) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    write_store_snapshot(path, &serialized)
+    write_store_snapshot(path, &serialized)?;
+    Ok(removed)
+}
+
+/// Apply successful disk pruning to the live state, without deleting sessions edited since the snapshot.
+fn apply_disk_pruning(store: &mut AppStore, snapshot_sessions: &[crate::ChatSessionRecord], removed: &[String]) {
+    for id in removed {
+        let unchanged = store.chat_sessions.iter().find(|session| &session.id == id)
+            .is_some_and(|session| snapshot_sessions.iter().any(|old| old.id == session.id && old.updated_at == session.updated_at));
+        if unchanged { crate::session_manager::remove_session_artifacts(store, id); }
+    }
+}
+
+pub(crate) fn persist_state_now(state: &State<'_, AppState>) -> Result<(), String> {
+    let _write_guard = store_write_lock().lock().map_err(|_| "store 写盘锁已损坏".to_string())?;
+    let snapshot = with_store(state, |store| Ok(store.clone()))?;
+    let removed = persist_store_locked(&state.store_path, &snapshot)?;
+    if !removed.is_empty() {
+        let mut store = state.store.lock().map_err(|_| "状态锁已损坏".to_string())?;
+        apply_disk_pruning(&mut store, &snapshot.chat_sessions, &removed);
+    }
+    Ok(())
 }
 
 // 同步保存与后台保存都先写临时文件，失败时保留上一个完整快照。
@@ -1460,6 +1495,15 @@ fn schedule_store_persist(state: &State<'_, AppState>) {
             if target_version != latest.load(Ordering::SeqCst) {
                 continue;
             }
+            // 与 persist_store 共用写盘锁，避免与退出 flush 并发写坏文件。
+            let _write_guard = match store_write_lock().lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    scheduled.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
             let mut snapshot = match store_handle.lock() {
                 Ok(store) => store.clone(),
                 Err(_) => {
@@ -1481,88 +1525,18 @@ fn schedule_store_persist(state: &State<'_, AppState>) {
             let context_records = std::mem::take(&mut snapshot.session_context_records);
             snapshot.debug_logs.clear();
 
-            // 与 persist_store 共用写盘锁，避免与退出 flush 并发写坏文件。
-            let _write_guard = match store_write_lock().lock() {
-                Ok(guard) => guard,
-                Err(_) => {
+            let removed = match persist_sessions(&path, &sessions, &session_artifacts, &context_records) {
+                Ok(removed) => removed,
+                Err(error) => {
+                    eprintln!("[persist] session write failed: {error}");
                     scheduled.store(false, Ordering::SeqCst);
                     return;
                 }
             };
-
-            // Write per-session JSONL files
-            let existing_index = load_session_index(&path)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|entry| (entry.id.clone(), entry))
-                .collect::<HashMap<_, _>>();
-            let mut index_entries: Vec<SessionIndexEntry> = Vec::new();
-            for session in &sessions {
-                let session_id = &session.id;
-                let mut entries: Vec<SessionFileEntry> = Vec::new();
-                entries.push(SessionFileEntry::Session(session.clone()));
-
-                let artifact = session_artifacts
-                    .iter()
-                    .find(|a| a.session_id == *session_id);
-                let session_context_records = context_records
-                    .iter()
-                    .filter(|c| c.session_id == *session_id)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let message_count = artifact
-                    .map(|a| a.chat_messages.len() as i64)
-                    .or_else(|| {
-                        existing_index
-                            .get(session_id)
-                            .map(|entry| entry.message_count)
-                    })
-                    .unwrap_or(0);
-                if let Some(artifact) = artifact {
-                    for msg in &artifact.chat_messages {
-                        entries.push(SessionFileEntry::Message(msg.clone()));
-                    }
-                    for tr in &artifact.session_transcript_records {
-                        entries.push(SessionFileEntry::Transcript(tr.clone()));
-                    }
-                    for ch in &artifact.session_checkpoints {
-                        entries.push(SessionFileEntry::Checkpoint(ch.clone()));
-                    }
-                    for tr in &artifact.session_tool_results {
-                        entries.push(SessionFileEntry::ToolResult(tr.clone()));
-                    }
-                }
-                for ctx in &session_context_records {
-                    entries.push(SessionFileEntry::Context(ctx.clone()));
-                }
-
-                let should_write_session_file = artifact.is_some()
-                    || !session_context_records.is_empty()
-                    || session_file_path(&path, session_id)
-                        .map(|file_path| !file_path.exists())
-                        .unwrap_or(true);
-                if should_write_session_file {
-                    let _ = write_session_file_entries(&path, session_id, &entries);
-                }
-
-                index_entries.push(SessionIndexEntry {
-                    id: session.id.clone(),
-                    title: session.title.clone(),
-                    created_at: session.created_at.clone(),
-                    updated_at: session.updated_at.clone(),
-                    metadata: session.metadata.clone(),
-                    archived: false,
-                    archived_at: None,
-                    starred: session.starred,
-                    message_count,
-                    working_directory: session
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| crate::payload_string(m, "workingDirectory")),
-                });
+            if !removed.is_empty() {
+                if let Ok(mut store) = store_handle.lock() { apply_disk_pruning(&mut store, &sessions, &removed); }
+                session_artifacts.retain(|artifact| !removed.contains(&artifact.session_id));
             }
-            let _ = write_session_index(&path, &index_entries);
-            enforce_disk_retention(&path);
 
             let serialized = match serde_json::to_string_pretty(&snapshot) {
                 Ok(value) => value,
@@ -1596,25 +1570,8 @@ fn schedule_store_persist(state: &State<'_, AppState>) {
                     return;
                 }
             }
-            let tmp_path = path.with_extension(format!("json.tmp.{target_version}"));
-            if let Err(error) = fs::write(&tmp_path, serialized) {
-                eprintln!(
-                    "[{} async persist] temp write failed: {error}",
-                    app_brand_display_name()
-                );
-                scheduled.store(false, Ordering::SeqCst);
-                return;
-            }
-            if target_version != latest.load(Ordering::SeqCst) {
-                let _ = fs::remove_file(&tmp_path);
-                continue;
-            }
-            if let Err(error) = fs::rename(&tmp_path, &path) {
-                let _ = fs::remove_file(&tmp_path);
-                eprintln!(
-                    "[{} async persist] rename failed: {error}",
-                    app_brand_display_name()
-                );
+            if let Err(error) = write_store_snapshot(&path, &serialized) {
+                eprintln!("[persist] snapshot write failed: {error}");
                 scheduled.store(false, Ordering::SeqCst);
                 return;
             }
@@ -1817,6 +1774,118 @@ mod tests {
         assert_eq!(tts_director.source_scope.as_deref(), Some("builtin"));
         assert_eq!(tts_director.is_builtin, Some(true));
         assert!(tts_director.body.contains("name: tts-director"));
+    }
+
+    #[test]
+    fn corrupt_session_index_stops_load_and_save_without_overwriting_files() {
+        let path = test_store_path("corrupt-index");
+        let store = seeded_store();
+        persist_store(&path, &store).unwrap();
+        let index = session_index_path(&path).unwrap();
+        let session = session_file_path(&path, &store.chat_sessions[0].id).unwrap();
+        let before_main = fs::read(&path).unwrap();
+        let before_session = fs::read(&session).unwrap();
+        fs::write(&index, "{broken").unwrap();
+        assert!(load_store(&path).is_err());
+        assert!(persist_store(&path, &store).is_err());
+        assert_eq!(fs::read_to_string(&index).unwrap(), "{broken");
+        assert_eq!(fs::read(&path).unwrap(), before_main);
+        assert_eq!(fs::read(session).unwrap(), before_session);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn session_and_index_write_errors_preserve_main_snapshot() {
+        for block_index in [false, true] {
+            let path = test_store_path("session-write-error");
+            let mut store = seeded_store();
+            persist_store(&path, &store).unwrap();
+            let index = session_index_path(&path).unwrap();
+            let session = session_file_path(&path, &store.chat_sessions[0].id).unwrap();
+            let before_main = fs::read(&path).unwrap();
+            let before_index = fs::read(&index).unwrap();
+            let before_session = fs::read(&session).unwrap();
+            let blocked = if block_index { index.with_extension("json.tmp") } else { session.with_extension("jsonl.tmp") };
+            fs::create_dir(&blocked).unwrap();
+            store.chat_messages[0].content = "new message".into();
+            assert!(persist_store(&path, &store).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before_main);
+            assert_eq!(fs::read(index).unwrap(), before_index);
+            if !block_index { assert_eq!(fs::read(session).unwrap(), before_session); }
+            fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn archived_session_survives_stale_save_restart_and_restore() {
+        let path = test_store_path("archive-reload");
+        let store = seeded_store();
+        let id = &store.chat_sessions[0].id;
+        persist_store(&path, &store).unwrap();
+        archive_session(&path, id).unwrap();
+        persist_store(&path, &store).unwrap(); // Snapshot queued before archive.
+        let mut reloaded = load_store(&path).unwrap();
+        assert!(!reloaded.chat_sessions.iter().any(|session| &session.id == id));
+        persist_store(&path, &reloaded).unwrap();
+        let index = load_session_index(&path).unwrap();
+        assert!(index.iter().find(|entry| &entry.id == id).unwrap().archived);
+        assert!(!session_file_path(&path, id).unwrap().exists());
+        unarchive_session(&path, id).unwrap();
+        apply_session_file_entries_to_store(&mut reloaded, load_session_file(&path, id).unwrap());
+        persist_store(&path, &reloaded).unwrap();
+        assert_eq!(reloaded.chat_messages[0].content, "hello");
+        assert!(!load_session_index(&path).unwrap()[0].archived);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn archive_index_failure_rolls_back_file_move() {
+        let path = test_store_path("archive-error");
+        let store = seeded_store();
+        let id = &store.chat_sessions[0].id;
+        persist_store(&path, &store).unwrap();
+        fs::create_dir(session_index_path(&path).unwrap().with_extension("json.tmp")).unwrap();
+        assert!(archive_session(&path, id).is_err());
+        assert!(session_file_path(&path, id).unwrap().exists());
+        assert!(!archived_session_path(&path, id).unwrap().exists());
+        assert!(!load_session_index(&path).unwrap()[0].archived);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn disk_retention_removes_only_deleted_active_entries_and_keeps_archives() {
+        let path = test_store_path("disk-retention");
+        let mut store = seeded_store();
+        let mut other = store.chat_sessions[0].clone();
+        other.id = "archived".into();
+        store.chat_sessions.push(other);
+        persist_store(&path, &store).unwrap();
+        archive_session(&path, "archived").unwrap();
+        let removed = prune_session_disk(&path, 1).unwrap();
+        let index = load_session_index(&path).unwrap();
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0].id, "archived");
+        assert!(index[0].archived);
+        assert!(!session_file_path(&path, "session-test-1").unwrap().exists());
+        assert!(archived_session_path(&path, "archived").unwrap().exists());
+        let snapshot_sessions = store.chat_sessions.clone();
+        apply_disk_pruning(&mut store, &snapshot_sessions, &removed);
+        persist_store(&path, &store).unwrap();
+        assert_eq!(load_session_index(&path).unwrap().len(), 1, "deleted sessions must not be recreated by the next save");
+        assert!(!session_file_path(&path, "session-test-1").unwrap().exists());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn disk_retention_restores_files_when_index_write_fails() {
+        let path = test_store_path("retention-index-error");
+        let store = seeded_store();
+        persist_store(&path, &store).unwrap();
+        fs::create_dir(session_index_path(&path).unwrap().with_extension("json.tmp")).unwrap();
+        assert!(prune_session_disk(&path, 1).is_err());
+        assert!(session_file_path(&path, "session-test-1").unwrap().exists());
+        assert_eq!(load_session_index(&path).unwrap().len(), 1);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

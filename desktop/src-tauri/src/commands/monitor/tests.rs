@@ -38,6 +38,28 @@ fn monitor_access_checks_aliases_batches_shares_and_deletes() {
 }
 
 #[test]
+fn history_backfill_without_id_only_selects_own_or_shared_watches() {
+    use super::*;
+    struct ResetOwner;
+    impl Drop for ResetOwner { fn drop(&mut self) { crate::identity::clear_request_owner(); } }
+    let _reset = ResetOwner;
+    let mut store = AppStore::default();
+    for (id, owner, shared) in [("own", "alice", false), ("shared", "bob", true), ("private", "bob", false)] {
+        store.competitor_watchlist.push(crate::CompetitorWatchRecord {
+            id: id.into(), owner: owner.into(), enabled: true,
+            shared_to: if shared { vec!["alice".into()] } else { vec![] }, ..Default::default()
+        });
+    }
+    crate::identity::set_request_owner(Some("alice".into()));
+    let ids: Vec<_> = history_backfill_watches(&store, None).into_iter().map(|watch| watch.id).collect();
+    assert_eq!(ids, ["own", "shared"]);
+    assert!(history_backfill_watches(&store, Some("private")).is_empty());
+    assert_eq!(history_backfill_watches(&store, Some("shared")).len(), 1);
+    crate::identity::clear_request_owner();
+    assert_eq!(history_backfill_watches(&store, None).len(), 3);
+}
+
+#[test]
 fn failed_transcription_keeps_previous_content_and_records_error() {
     use super::*;
     let mut record = PostVideoAnalysisRecord { transcript: "旧正文".into(), transcript_srt: "旧字幕".into(), transcript_status: "ok".into(), ..Default::default() };
