@@ -5312,6 +5312,39 @@ fn write_obsidian_card(
     }
 }
 
+/// 把 ASR 转写里的「按句硬换行」折叠掉，只保留空行分段。
+///
+/// ASR 每句都带 `\n`，直接落盘成 `转写全文.txt` 后，在编辑器/Markdown 里渲染
+/// 就是断在词中间的锯齿（实测 "Global⏎Bot"、"OPS⏎5.5"）。
+/// 段内合并：中文直接相连、西文补一个空格；`转写时间轴.srt` 不动（换行是结构）。
+fn normalize_transcript_text(text: &str) -> String {
+    let is_cjk = |ch: char| matches!(ch, '\u{2e80}'..='\u{9fff}' | '\u{ff00}'..='\u{ffef}');
+    text.replace("\r\n", "\n")
+        .split("\n\n")
+        .map(|paragraph| {
+            let lines: Vec<&str> = paragraph
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect();
+            let mut merged = String::new();
+            for line in lines {
+                let need_space = match (merged.chars().last(), line.chars().next()) {
+                    (Some(last), Some(first)) => !is_cjk(last) && !is_cjk(first),
+                    _ => false,
+                };
+                if need_space {
+                    merged.push(' ');
+                }
+                merged.push_str(line);
+            }
+            merged
+        })
+        .filter(|paragraph| !paragraph.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn try_export_post_product(
     state: &State<'_, AppState>,
     post_id: &str,
@@ -5424,7 +5457,7 @@ fn try_export_post_product(
             copy_if_changed(src, &dst);
         }
         if !a.transcript.trim().is_empty() {
-            let _ = std::fs::write(l4.join("转写全文.txt"), &a.transcript);
+            let _ = std::fs::write(l4.join("转写全文.txt"), normalize_transcript_text(&a.transcript));
         }
         if !a.transcript_srt.trim().is_empty() {
             let _ = std::fs::write(l4.join("转写时间轴.srt"), &a.transcript_srt);
