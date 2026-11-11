@@ -5181,7 +5181,8 @@ fn write_obsidian_card(
                 "<details>\n<summary>展开全文（{} 字）</summary>\n\n",
                 transcript.chars().count()
             ));
-            md.push_str(&transcript);
+            // 与 转写全文.txt 同一套归一化：ASR 的逐句换行直接内联会断在词中间
+            md.push_str(&normalize_transcript_text(&transcript));
             md.push_str("\n\n</details>\n\n");
         }
         // ---- 逐句时间轴：直接展开显示 ----
