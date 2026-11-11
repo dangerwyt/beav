@@ -1100,7 +1100,7 @@ mod tests {
         });
 
         persist_store(&path, &store).expect("persist store");
-        let mut reloaded = load_store(&path);
+        let mut reloaded = load_store(&path).expect("store should load");
         let resumed_id =
             resolve_resume_target_session_id(&reloaded, None).expect("resume target session");
         let resumed = build_session_snapshot(&reloaded, &resumed_id, None, None).expect("snapshot");

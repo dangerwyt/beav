@@ -1,5 +1,6 @@
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { isTauriRuntime } from '../bridge/browserHost';
+import { subscribeMonitorBackfillProgress, subscribeMonitorPrefetchDone } from '../bridge/appEvents';
 import { Radar, Plus, RefreshCw, Trash2, ExternalLink, Zap, Sparkles, Check, X, Eye, Loader2, Link2, Lock, LogOut, ChevronDown, ChevronLeft, ChevronRight, FlaskConical, BookOpen, Copy, Download, Video, Film, History, AudioLines, Users } from 'lucide-react';
 import { createPortal } from 'react-dom';
 import { clsx } from 'clsx';
@@ -1215,8 +1216,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
         );
       }
     };
-    window.ipcRenderer.on('monitor:prefetch-done', handler);
-    return () => window.ipcRenderer.off('monitor:prefetch-done', handler);
+    return subscribeMonitorPrefetchDone(handler);
   }, [isActive, loadPosts, showToast]);
 
   // 监听后端「补历史」实时进度：深翻是 Rust 侧逐轮滚动，每轮上报一次
@@ -1251,8 +1251,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
         },
       }));
     };
-    window.ipcRenderer.on('monitor:backfill-progress', handler);
-    return () => window.ipcRenderer.off('monitor:backfill-progress', handler);
+    return subscribeMonitorBackfillProgress(handler);
   }, [isActive]);
 
   const openExternal = useCallback(async (url?: string | null) => {
@@ -1827,7 +1826,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
         postId: post.id,
         kind,
         target: kind === 'rewrite' ? targetOverride || remixTarget : undefined,
-      })) as { success?: boolean; remix?: Record<string, unknown>; error?: string };
+      })) as { success?: boolean; remix?: Record<string, unknown>; exported?: boolean; exportError?: string; error?: string };
       if (!result?.success || !result.remix) {
         showToast('err', result?.error || (kind === 'rewrite' ? '改写失败' : '分镜生成失败'));
         return;
@@ -1838,7 +1837,11 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
         target: String(record.target ?? ''),
         content: String(record.content ?? ''),
       });
-      showToast('ok', kind === 'rewrite' ? '改写已生成，并写入产物目录「二创/」' : '分镜脚本已生成，并写入产物目录「二创/」');
+      if (result.exported === false) {
+        showToast('err', `内容已生成并保存在应用中，但文件导出失败：${result.exportError || '请检查导出目录后重试导出'}`);
+      } else {
+        showToast('ok', kind === 'rewrite' ? '改写已生成，并写入产物目录「二创/」' : '分镜脚本已生成，并写入产物目录「二创/」');
+      }
     } catch (e) {
       showToast('err', e instanceof Error ? e.message : '生成失败');
     } finally {

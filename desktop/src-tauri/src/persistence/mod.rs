@@ -1020,12 +1020,14 @@ pub fn default_store() -> AppStore {
     }
 }
 
-pub fn load_store(path: &PathBuf) -> AppStore {
+pub fn load_store(path: &PathBuf) -> Result<AppStore, String> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
-        Err(_) => return default_store(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(default_store()),
+        Err(error) => return Err(format!("无法读取状态文件 {}：{error}；已停止加载，原文件未改动", path.display())),
     };
-    let mut store = serde_json::from_str(&content).unwrap_or_else(|_| default_store());
+    let mut store: AppStore = serde_json::from_str(&content)
+        .map_err(|error| format!("状态文件 {} 无法解析：{error}；请从备份恢复，原文件未改动", path.display()))?;
     store.debug_logs.clear();
     assistant_store::reset_runtime_state_after_load(&mut store);
     let acp_runs_repaired = crate::repair_acp_runs_after_load(&mut store) > 0;
@@ -1075,7 +1077,7 @@ pub fn load_store(path: &PathBuf) -> AppStore {
     {
         let _ = persist_store(path, &store);
     }
-    store
+    Ok(store)
 }
 
 /// 全局写盘锁：`persist_store` 与延迟写盘任务共用，避免并发写坏 `beav-state.json`。
@@ -1199,7 +1201,24 @@ pub fn persist_store(path: &PathBuf, store: &AppStore) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    fs::write(path, serialized).map_err(|error| error.to_string())
+    write_store_snapshot(path, &serialized)
+}
+
+// 同步保存与后台保存都先写临时文件，失败时保留上一个完整快照。
+fn write_store_snapshot(path: &Path, serialized: &str) -> Result<(), String> {
+    use std::io::Write;
+    let tmp = path.with_extension("json.tmp");
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(serialized.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map_err(|error| format!("保存状态文件 {} 失败：{error}", path.display()))
 }
 
 pub fn with_store_mut<T>(
@@ -1637,6 +1656,33 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_or_unreadable_store_is_not_replaced_with_defaults() {
+        let path = test_store_path("corrupt");
+        fs::write(&path, "{broken-json").unwrap();
+        assert!(load_store(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{broken-json");
+        assert!(load_store(&path.parent().unwrap().to_path_buf()).is_err());
+        assert!(load_store(&path.with_file_name("missing.json")).is_ok());
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn snapshot_replacement_preserves_old_file_on_write_failure() {
+        let path = test_store_path("atomic");
+        write_store_snapshot(&path, "old").unwrap();
+        let tmp = path.with_extension("json.tmp");
+        fs::create_dir(&tmp).unwrap();
+        assert!(write_store_snapshot(&path, "new").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+        fs::remove_dir(&tmp).unwrap();
+        write_store_snapshot(&path, "new").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn select_store_path_uses_beav_for_new_users() {
         let base = temp_config_base("new-user");
         let selected = select_store_path(&base);
@@ -1738,6 +1784,7 @@ mod tests {
             .iter_mut()
             .find(|item| item.name == "image-prompt-optimizer")
             .expect("image-prompt-optimizer builtin should exist");
+        let builtin_body = skill.body.clone();
         skill.body = "---\nallowedRuntimeModes: [team, image-generation]\n---\n# stale".to_string();
         skill.disabled = Some(true);
 
@@ -1748,9 +1795,7 @@ mod tests {
             .iter()
             .find(|item| item.name == "image-prompt-optimizer")
             .expect("refreshed image-prompt-optimizer should exist");
-        assert!(refreshed
-            .body
-            .contains("allowedRuntimeModes: [team, redclaw, image-generation]"));
+        assert_eq!(refreshed.body, builtin_body);
         assert_eq!(refreshed.disabled, Some(false));
         assert_eq!(refreshed.source_scope.as_deref(), Some("builtin"));
         assert_eq!(refreshed.is_builtin, Some(true));
@@ -1803,7 +1848,12 @@ mod tests {
             "main snapshot should no longer embed tool results"
         );
 
-        let reloaded = load_store(&path);
+        let mut reloaded = load_store(&path).expect("store should load");
+        // 启动只加载 JSONL 索引；会话内容按需加载，测试要验证实际落盘的数据。
+        let session_id = &store.chat_sessions[0].id;
+        assert!(reloaded.chat_sessions.iter().any(|session| &session.id == session_id));
+        let entries = load_session_file(&path, session_id).expect("session should be readable");
+        apply_session_file_entries_to_store(&mut reloaded, entries);
         assert_eq!(reloaded.chat_messages.len(), 1);
         assert_eq!(reloaded.session_transcript_records.len(), 1);
         assert_eq!(reloaded.session_checkpoints.len(), 1);
@@ -1825,7 +1875,7 @@ mod tests {
         )
         .expect("legacy store should write");
 
-        let migrated = load_store(&path);
+        let migrated = load_store(&path).expect("store should load");
         assert_eq!(migrated.chat_messages.len(), 1);
         assert_eq!(migrated.session_transcript_records.len(), 1);
         assert_eq!(migrated.session_checkpoints.len(), 1);

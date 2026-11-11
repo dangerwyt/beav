@@ -19,6 +19,7 @@
 - `library`：知识库/素材库命令。
 - `manuscripts`：稿件命令。
 - `mcp_tools`：MCP 配置与调用命令。
+- `monitor.rs` / `monitor/`：监控 IPC 入口及按职责拆分的采集、视频、创作、导出和调度模块，见 [monitor/README.md](monitor/README.md)。
 - `official`：官方平台相关命令。
 - `plugin`：插件相关命令。
 - `redclaw` / `redclaw_runtime`：RedClaw 任务与运行态命令。

@@ -32,6 +32,10 @@ pub(crate) fn is_admin() -> bool {
     current_owner().is_none()
 }
 
+pub(crate) fn require_admin() -> Result<(), String> {
+    if is_admin() { Ok(()) } else { Err("该操作仅管理员可用".to_string()) }
+}
+
 pub(crate) fn owner_or_admin() -> String {
     current_owner().unwrap_or_else(|| "admin".to_string())
 }

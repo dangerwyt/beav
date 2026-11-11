@@ -1,4 +1,4 @@
-import type { BridgeCore } from '../types';
+import type { BridgeCore, Listener } from '../types';
 
 export interface MonitorWatchPayload {
   name: string;
@@ -133,6 +133,10 @@ const CHROME_TIMEOUT_MS = 30_000;
 export function createMonitorBridge(core: BridgeCore) {
   return {
     monitor: {
+      onPrefetchDone: (listener: Listener) => core.on('monitor:prefetch-done', listener),
+      offPrefetchDone: (listener: Listener) => core.off('monitor:prefetch-done', listener),
+      onBackfillProgress: (listener: Listener) => core.on('monitor:backfill-progress', listener),
+      offBackfillProgress: (listener: Listener) => core.off('monitor:backfill-progress', listener),
       watchAdd: <T = unknown>(payload: MonitorWatchPayload) =>
         core.invokeChannelGuarded<T>('monitor:watch-add', payload, {
           timeoutMs: READ_TIMEOUT_MS,

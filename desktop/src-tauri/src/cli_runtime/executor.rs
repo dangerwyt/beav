@@ -1101,7 +1101,7 @@ mod tests {
         let workspace_root = temp_root.join("workspace");
         fs::create_dir_all(&workspace_root).expect("workspace root should exist");
         let store_path = temp_root.join("store.json");
-        let store = crate::persistence::load_store(&store_path);
+        let store = crate::persistence::load_store(&store_path).expect("store should load");
         let shared_store = Arc::new(Mutex::new(store));
         mock_builder()
             .manage(crate::AppState {

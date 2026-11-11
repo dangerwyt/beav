@@ -6,6 +6,7 @@ import type { PendingChatMessage } from '../features/app-shell/types';
 import { useFeatureFlag } from '../hooks/useFeatureFlags';
 import { hasRenderableAssetUrl, resolveAssetUrl } from '../utils/pathManager';
 import { isTauriRuntime } from '../bridge/browserHost';
+import { subscribeSettingsUpdated } from '../bridge/appEvents';
 import { SAFE_REMARK_PLUGINS } from '../utils/markdownRemarkPlugins';
 import { buildRedClawAuthoringMessage } from '../utils/redclawAuthoring';
 import { appAlert, appConfirm } from '../utils/appDialogs';
@@ -803,10 +804,7 @@ export function Knowledge({ onNavigateToRedClaw, isEmbedded = false, isActive = 
         const handleSettingsUpdated = () => {
             void loadVisualIndexSetting();
         };
-        window.ipcRenderer.onSettingsUpdated(handleSettingsUpdated);
-        return () => {
-            window.ipcRenderer.offSettingsUpdated(handleSettingsUpdated);
-        };
+        return subscribeSettingsUpdated(handleSettingsUpdated);
     }, [loadVisualIndexSetting]);
 
     // 每次从其他页面切回知识库时，强制刷新当前列表，避免页面显示旧缓存。

@@ -341,6 +341,22 @@ fn payload_requests_visual_index_backfill(payload: &Value) -> bool {
         })
 }
 
+fn web_settings_projection(settings: &Value) -> Value {
+    // 白名单保持页面所需的展示值；新配置默认不向普通用户暴露。
+    const KEYS: &[&str] = &[
+        "workspace_dir", "active_space_id", "notifications_json", "wander_deep_think_enabled",
+        "model_name", "model_name_wander", "model_name_chatroom", "model_name_knowledge",
+        "model_name_redclaw", "chat_max_tokens", "visual_index_enabled", "video_analysis_enabled",
+        "image_model", "image_provider", "image_provider_template", "image_aspect_ratio",
+        "image_size", "image_quality", "video_model", "video_provider", "video_duration",
+        "video_aspect_ratio", "video_resolution", "voice_tts_model", "voice_clone_model",
+        "voice_id", "voice_speed", "tts_model", "transcription_model", "embedding_model",
+    ];
+    Value::Object(KEYS.iter().filter_map(|key| {
+        settings.get(*key).map(|value| ((*key).to_string(), value.clone()))
+    }).collect())
+}
+
 pub(super) fn get_settings(state: &State<'_, AppState>) -> Result<Value, String> {
     with_store(state, |store| {
         let runtime = state
@@ -351,7 +367,7 @@ pub(super) fn get_settings(state: &State<'_, AppState>) -> Result<Value, String>
         let mut projected = crate::auth::project_settings_for_runtime(&settings, &runtime);
         crate::ai_model_manager::legacy_projection::normalize_settings_projection(&mut projected);
         normalize_default_ai_route_settings(&mut projected);
-        Ok(projected)
+        Ok(if crate::identity::is_admin() { projected } else { web_settings_projection(&projected) })
     })
 }
 
@@ -360,6 +376,7 @@ pub(super) fn save_settings(
     state: &State<'_, AppState>,
     payload: &Value,
 ) -> Result<Value, String> {
+    crate::identity::require_admin()?;
     let previous_workspace_root = with_store(state, |store| {
         let settings = settings_store::settings_snapshot(&store);
         let active_space_id = spaces_store::active_space_id(&store);
@@ -419,6 +436,17 @@ pub(super) fn save_settings(
 mod tests {
     use super::{merged_settings_payload, normalize_default_ai_route_settings};
     use serde_json::{json, Value};
+
+    #[test]
+    fn web_settings_never_expose_credentials_or_unknown_fields() {
+        let projected = super::web_settings_projection(&json!({
+            "image_model": "image-model", "workspace_dir": "workspace",
+            "api_key": "secret", "transcription_key": "secret",
+            "ai_sources_json": "[{\"apiKey\":\"secret\"}]",
+            "redbox_auth_session_json": "secret", "future_secret": "secret"
+        }));
+        assert_eq!(projected, json!({"image_model": "image-model", "workspace_dir": "workspace"}));
+    }
 
     fn parsed_routes(settings: &Value) -> Value {
         settings

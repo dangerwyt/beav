@@ -30,3 +30,13 @@ export function subscribeYoutubeFetchInfoProgress(listener: Listener): () => voi
   window.ipcRenderer.onFetchYoutubeInfoProgress(listener);
   return () => window.ipcRenderer.offFetchYoutubeInfoProgress(listener);
 }
+
+export function subscribeMonitorPrefetchDone(listener: Listener): () => void {
+  window.ipcRenderer.monitor.onPrefetchDone(listener);
+  return () => window.ipcRenderer.monitor.offPrefetchDone(listener);
+}
+
+export function subscribeMonitorBackfillProgress(listener: Listener): () => void {
+  window.ipcRenderer.monitor.onBackfillProgress(listener);
+  return () => window.ipcRenderer.monitor.offBackfillProgress(listener);
+}

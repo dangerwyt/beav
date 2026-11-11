@@ -1,19 +1,19 @@
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use tauri::State;
 
 use crate::AppState;
 
-fn sanitize_zip_entry_name(value: &str, fallback: &str) -> String {
-    let trimmed = value.trim();
-    let file_name = Path::new(trimmed)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(trimmed);
-    let sanitized = file_name
+fn sanitize_zip_entry_name(value: &str, fallback: &str) -> Result<String, String> {
+    let normalized = value.trim().replace('\\', "/");
+    if normalized.starts_with('/') || normalized.as_bytes().get(1) == Some(&b':')
+        || normalized.split('/').any(|part| part.trim() == "..") {
+        return Err("压缩包条目必须是安全的相对路径".to_string());
+    }
+    let parts: Vec<String> = normalized.split('/').filter(|part| !part.is_empty() && *part != ".")
+        .map(|part| part
         .chars()
         .map(|ch| match ch {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
@@ -21,13 +21,13 @@ fn sanitize_zip_entry_name(value: &str, fallback: &str) -> String {
             ch => ch,
         })
         .collect::<String>()
-        .trim_matches('.')
-        .trim()
-        .to_string();
+        .trim_matches(|ch: char| ch == '.' || ch.is_whitespace())
+        .to_string()).filter(|part| !part.is_empty()).collect();
+    let sanitized = parts.join("/");
     if sanitized.is_empty() {
-        fallback.to_string()
+        Ok(fallback.to_string())
     } else {
-        sanitized
+        Ok(sanitized)
     }
 }
 
@@ -44,11 +44,12 @@ fn unique_zip_entry_name(base_name: &str, used_names: &mut HashSet<String>) -> S
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or("");
+    let prefix = base_name.rsplit_once('/').map(|(parent, _)| format!("{parent}/")).unwrap_or_default();
     for index in 2.. {
         let candidate = if extension.is_empty() {
-            format!("{stem}-{index}")
+            format!("{prefix}{stem}-{index}")
         } else {
-            format!("{stem}-{index}.{extension}")
+            format!("{prefix}{stem}-{index}.{extension}")
         };
         if used_names.insert(candidate.clone()) {
             return candidate;
@@ -100,7 +101,7 @@ pub(crate) fn write_zip_archive(
             .or_else(|| path.file_name().and_then(|value| value.to_str()))
             .unwrap_or(&fallback_name);
         let entry_name = unique_zip_entry_name(
-            &sanitize_zip_entry_name(requested_name, &fallback_name),
+            &sanitize_zip_entry_name(requested_name, &fallback_name)?,
             &mut used_names,
         );
         // 媒体文件已是压缩格式，再 Deflate 一遍几乎不减小，纯烧 CPU —— 实测 36MB 的
@@ -119,10 +120,10 @@ pub(crate) fn write_zip_archive(
         } else {
             zip::CompressionMethod::Deflated
         });
-        let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+        let mut source_file = fs::File::open(&path).map_err(|error| error.to_string())?;
         zip.start_file(entry_name, options)
             .map_err(|error| error.to_string())?;
-        zip.write_all(&bytes).map_err(|error| error.to_string())?;
+        std::io::copy(&mut source_file, &mut zip).map_err(|error| error.to_string())?;
         written += 1;
     }
     zip.finish().map_err(|error| error.to_string())?;
@@ -138,13 +139,27 @@ mod tests {
     #[test]
     fn zip_entry_name_is_sanitized() {
         assert_eq!(
-            sanitize_zip_entry_name("../bad:name?.png", "fallback.png"),
+            sanitize_zip_entry_name("bad:name?.png", "fallback.png").unwrap(),
             "bad_name_.png"
         );
         assert_eq!(
-            sanitize_zip_entry_name("...", "fallback.png"),
+            sanitize_zip_entry_name("...", "fallback.png").unwrap(),
             "fallback.png"
         );
+    }
+
+    #[test]
+    fn zip_paths_preserve_material_directories_and_reject_traversal() {
+        let path = "抖音/20261111/作者/标题/二创/改写.md";
+        assert_eq!(sanitize_zip_entry_name(path, "fallback").unwrap(), path);
+        assert_eq!(sanitize_zip_entry_name("作者\\标题\\knowledge.md", "fallback").unwrap(), "作者/标题/knowledge.md");
+        for path in ["../secret", "a/../../secret", "a/ .. /secret", "/tmp/file", "C:\\file", "\\\\server\\file"] {
+            assert!(sanitize_zip_entry_name(path, "fallback").is_err(), "{path}");
+        }
+        let mut names = HashSet::new();
+        assert_eq!(unique_zip_entry_name("a/图片.png", &mut names), "a/图片.png");
+        assert_eq!(unique_zip_entry_name("b/图片.png", &mut names), "b/图片.png");
+        assert_eq!(unique_zip_entry_name("a/图片.png", &mut names), "a/图片-2.png");
     }
 
     #[test]

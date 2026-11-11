@@ -13,9 +13,9 @@ pub(crate) struct StartupPreparedState {
     pub(crate) initial_workspace_root: PathBuf,
 }
 
-pub(crate) fn prepare_startup_state() -> StartupPreparedState {
+pub(crate) fn prepare_startup_state() -> Result<StartupPreparedState, String> {
     let store_path = build_store_path();
-    let mut store = load_store(&store_path);
+    let mut store = load_store(&store_path)?;
     if let Err(error) = normalize_workspace_dir_setting(&mut store) {
         logging::emit_legacy_line(
             logging::event::LogSource::Host,
@@ -193,12 +193,12 @@ pub(crate) fn prepare_startup_state() -> StartupPreparedState {
         .to_path_buf();
     let _ = logging::initialize_logging(store_root, &settings_snapshot);
 
-    StartupPreparedState {
+    Ok(StartupPreparedState {
         store_path,
         store,
         startup_migration_status,
         initial_workspace_root,
-    }
+    })
 }
 
 pub(crate) fn run_setup_restore_sequence(

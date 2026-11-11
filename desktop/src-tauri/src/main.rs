@@ -161,7 +161,13 @@ fn main() {
         store,
         startup_migration_status,
         initial_workspace_root,
-    } = startup::prepare_startup_state();
+    } = match startup::prepare_startup_state() {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("[startup] {error}");
+            std::process::exit(1);
+        }
+    };
     let shared_store = Arc::new(Mutex::new(store));
     register_global_debug_store(Arc::clone(&shared_store));
 
