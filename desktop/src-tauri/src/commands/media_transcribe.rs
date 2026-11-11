@@ -414,6 +414,127 @@ fn transcribe_with_subtitle_fallback(
     Err(format!("无法生成字幕：{}", errors.join("；")))
 }
 
+/// 单片时长：超过这个长度的音频按段转写（ElevenLabs 这类服务处理 45 分钟音频
+/// 要几分钟，单请求固定 120s 超时必然失败，实测 2750s 的视频 curl 直接超时）。
+const CHUNK_SECONDS: f64 = 600.0;
+
+/// 把长音频切段、逐段转写、再按时间偏移合并成一份 SRT。
+fn transcribe_long_audio_in_chunks(
+    app: &AppHandle,
+    output_dir: &std::path::Path,
+    endpoint: &str,
+    api_key: Option<&str>,
+    model_name: &str,
+    audio_path: &std::path::Path,
+) -> Result<String, String> {
+    let split_dir = output_dir.join(format!("chunks-{}", now_ms()));
+    std::fs::create_dir_all(&split_dir).map_err(|error| error.to_string())?;
+    let pattern = split_dir.join("chunk-%03d.wav");
+    let input_arg = audio_path.display().to_string();
+    let pattern_arg = pattern.display().to_string();
+    let status = std::process::Command::new(ffmpeg_program(Some(app))?)
+        .args([
+            "-y",
+            "-i",
+            input_arg.as_str(),
+            "-f",
+            "segment",
+            "-segment_time",
+            "600",
+            "-c",
+            "copy",
+            pattern_arg.as_str(),
+        ])
+        .status()
+        .map_err(|error| format!("切片失败: {error}"))?;
+    if !status.success() {
+        return Err("切片失败：ffmpeg 返回非零".to_string());
+    }
+
+    let mut chunks: Vec<std::path::PathBuf> = std::fs::read_dir(&split_dir)
+        .map_err(|error| error.to_string())?
+        .filter_map(|entry| entry.ok().map(|item| item.path()))
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("wav"))
+        .collect();
+    chunks.sort();
+    if chunks.len() <= 1 {
+        return Err("切片未产生多个分段".to_string());
+    }
+
+    let mut merged = String::new();
+    let mut index = 1usize;
+    let mut offset_ms = 0i64;
+    for chunk in &chunks {
+        let (srt, _) = transcribe_with_subtitle_fallback(
+            endpoint,
+            api_key,
+            model_name,
+            chunk,
+            "srt",
+        )?;
+        merged.push_str(&shift_srt(&srt, offset_ms, &mut index));
+        // 用真实段时长推进偏移：ffmpeg 按关键帧切，未必正好 600 秒
+        offset_ms += (wav_duration_seconds(chunk).unwrap_or(CHUNK_SECONDS) * 1000.0) as i64;
+    }
+    let _ = std::fs::remove_dir_all(&split_dir);
+    Ok(merged)
+}
+
+/// 把一段 SRT 的时间戳整体后移 `offset_ms`，并重排序号。
+fn shift_srt(srt: &str, offset_ms: i64, index: &mut usize) -> String {
+    let parse = |value: &str| -> Option<i64> {
+        let parts: Vec<&str> = value.trim().split(':').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let hours: i64 = parts[0].parse().ok()?;
+        let minutes: i64 = parts[1].parse().ok()?;
+        let secs: f64 = parts[2].replace(',', ".").parse().ok()?;
+        Some(hours * 3_600_000 + minutes * 60_000 + (secs * 1000.0) as i64)
+    };
+    let format = |ms: i64| {
+        let value = ms.max(0);
+        format!(
+            "{:02}:{:02}:{:02},{:03}",
+            value / 3_600_000,
+            (value % 3_600_000) / 60_000,
+            (value % 60_000) / 1000,
+            value % 1000
+        )
+    };
+    let mut out = String::new();
+    for block in srt.replace('\r', "").split("\n\n") {
+        let mut lines = block.lines().filter(|line| !line.trim().is_empty());
+        let first = match lines.next() {
+            Some(value) => value,
+            None => continue,
+        };
+        // 有些服务不写序号行，第一行直接是时间轴
+        let (timing, text_lines) = if first.contains("-->") {
+            (first, lines.collect::<Vec<_>>())
+        } else {
+            match lines.next() {
+                Some(timing) if timing.contains("-->") => (timing, lines.collect::<Vec<_>>()),
+                _ => continue,
+            }
+        };
+        let Some((start_raw, end_raw)) = timing.split_once("-->") else { continue };
+        let (Some(start), Some(end)) = (parse(start_raw), parse(end_raw)) else { continue };
+        if text_lines.is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "{}\n{} --> {}\n{}\n\n",
+            *index,
+            format(start + offset_ms),
+            format(end + offset_ms),
+            text_lines.join("\n")
+        ));
+        *index += 1;
+    }
+    out
+}
+
 pub(crate) fn execute_media_transcribe(
     app: &AppHandle,
     state: &State<'_, AppState>,
@@ -457,8 +578,20 @@ pub(crate) fn execute_media_transcribe(
         extract_audio_for_transcription(app, state, session_id, &source_path, &output_dir)?;
     // 转写失败时把「配置来源」一并带出来：401/403 最容易白折腾的就是
     // 「以为用自己的 STT key，实际打到了默认 AI 源」—— 不说清楚来源就无从判断。
-    let transcript_result: Result<(String, &'static str), String> =
-        if matches!(response_format, "srt" | "vtt") {
+    // 长音频走切片：单个请求等 45 分钟音频的 ASR 必然超时（实测 curl 120s 直接断）
+    let audio_seconds = wav_duration_seconds(&audio_path).unwrap_or(0.0);
+    let chunked = audio_seconds > CHUNK_SECONDS && response_format == "srt";
+    let transcript_result: Result<(String, &'static str), String> = if chunked {
+        transcribe_long_audio_in_chunks(
+            app,
+            &output_dir,
+            &endpoint,
+            api_key.as_deref(),
+            &effective_model_name,
+            &audio_path,
+        )
+        .map(|srt| (srt, "chunked"))
+    } else if matches!(response_format, "srt" | "vtt") {
             transcribe_with_subtitle_fallback(
                 &endpoint,
                 api_key.as_deref(),
