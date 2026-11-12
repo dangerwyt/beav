@@ -226,6 +226,44 @@ pub(super) fn copy_if_changed(src: &Path, dst: &Path) -> Result<(), String> {
         format!("复制 {} 到 {} 失败：{error}", src.display(), dst.display()))
 }
 
+pub(super) fn export_monitor_frames(frames: &[String], l4: &Path, repair: bool) -> Result<(), String> {
+    if repair && frames.is_empty() {
+        return Err("未找到真实抽帧，已保留旧导出图片；请检查缓存目录".into());
+    }
+    for (idx, frame) in frames.iter().enumerate() {
+        let src = Path::new(frame);
+        if !src.is_file() {
+            if repair { return Err(format!("真实抽帧不存在，不能修复导出：{frame}")); }
+            continue;
+        }
+        let dst = l4.join(format!("抽帧_{:03}.jpg", idx + 1));
+        if repair {
+            // Replace the inode too: old AppleDouble exports may carry Finder's hidden flag.
+            let temp = l4.join(make_id(".beav-frame-repair"));
+            let result = std::fs::copy(src, &temp).and_then(|_| std::fs::rename(&temp, &dst));
+            if result.is_err() { let _ = std::fs::remove_file(&temp); }
+            result.map_err(|error| format!("修复抽帧 {} 失败：{error}", dst.display()))?;
+        } else {
+            copy_if_changed(src, &dst)?;
+        }
+    }
+    if repair {
+        let backup = l4.join(make_id(".beav-frame-backup"));
+        let entries = std::fs::read_dir(l4).map_err(|error| format!("读取旧抽帧失败：{error}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            let Some(number) = name.to_str().and_then(|name| name.strip_prefix("抽帧_"))
+                .and_then(|name| name.strip_suffix(".jpg")).and_then(|number| number.parse::<usize>().ok()) else { continue; };
+            if number <= frames.len() || !entry.file_type().map_err(|error| error.to_string())?.is_file() { continue; }
+            // Keep surplus generated images recoverable instead of deleting them.
+            std::fs::create_dir_all(&backup).map_err(|error| error.to_string())?;
+            std::fs::rename(entry.path(), backup.join(&name)).map_err(|error| format!("备份旧抽帧失败：{error}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// A directory link installed by the migration script opts in to video-only external storage.
 pub(super) fn exported_video_path(root: &Path, l4: &Path, post_id: &str, name: &str) -> Result<PathBuf, String> {
     let videos = root.join("导出视频");
@@ -761,13 +799,19 @@ pub(super) fn try_export_post_product(
         Some(p) => p,
         None => return Err("动态不存在".to_string()),
     };
-    let analysis = with_store(state, |store| {
+    let mut analysis = with_store(state, |store| {
         Ok(store
             .post_video_analyses
             .iter()
             .find(|a| a.post_id == post_id)
             .cloned())
     })?;
+    let original_frames = analysis.as_ref().map(|analysis| analysis.frames.clone());
+    if let Some(analysis) = &mut analysis {
+        analysis.frames = normalized_monitor_frames(&analysis.frames);
+    }
+    let repair_frames = analysis.as_ref().zip(original_frames.as_ref())
+        .is_some_and(|(analysis, original)| &analysis.frames != original);
     let decon = with_store(state, |store| {
         Ok(store
             .post_deconstructions
@@ -844,19 +888,7 @@ pub(super) fn try_export_post_product(
 
     // 抽帧图 + 视频分析文本
     if let Some(a) = &analysis {
-        for (idx, fr) in a.frames.iter().enumerate() {
-            let src = Path::new(fr);
-            if !src.exists() {
-                continue;
-            }
-            let ext = src
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("jpg")
-                .to_lowercase();
-            let dst = l4.join(format!("抽帧_{:03}.{}", idx + 1, ext));
-            copy_if_changed(src, &dst)?;
-        }
+        export_monitor_frames(&a.frames, &l4, repair_frames)?;
         if !a.transcript.trim().is_empty() {
             write_export_file(l4.join("转写全文.txt"), normalize_transcript_text(&a.transcript))?;
         }
@@ -1020,6 +1052,18 @@ pub(super) fn try_export_post_product(
 
     // 生成 Obsidian 聚合笔记（「知识卡」），用 ![[嵌入]] 关联所有产物
     write_obsidian_card(state, &root, &l4, &post, &analysis, &decon)?;
+
+    if repair_frames {
+        if let (Some(analysis), Some(original)) = (&analysis, &original_frames) {
+            with_store_mut(state, |store| {
+                if let Some(record) = store.post_video_analyses.iter_mut().find(|record| record.post_id == post_id && &record.frames == original) {
+                    record.frames = analysis.frames.clone();
+                    record.updated_at = now_i64();
+                }
+                Ok(())
+            })?;
+        }
+    }
 
     println!("[monitor] exported post product -> {}", l4.display());
     Ok(())

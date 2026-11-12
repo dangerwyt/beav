@@ -336,6 +336,70 @@ fn frames_reusable_only_when_video_unchanged() {
     assert!(!super::frames_are_reusable(true, None, 1_000));
 }
 
+#[test]
+fn monitor_frames_exclude_appledouble_and_sort_by_frame_number() {
+    use super::*;
+    let root = std::env::temp_dir().join(make_id("beav-frame-list-test"));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut recorded = Vec::new();
+    for number in (1..=49).rev() {
+        for name in [format!("frame_{number:03}.jpg"), format!("._frame_{number:03}.jpg")] {
+            let path = root.join(name);
+            std::fs::write(&path, "fixture").unwrap();
+            recorded.push(path.display().to_string());
+        }
+    }
+    std::fs::create_dir(root.join("frame_050.jpg")).unwrap();
+    std::fs::write(root.join("not-a-frame.jpg"), "fixture").unwrap();
+    assert_eq!(recorded.len(), 98);
+    let frames = normalized_monitor_frames(&recorded);
+    assert_eq!(frames.len(), 49);
+    assert!(frames[0].ends_with("frame_001.jpg"));
+    assert!(frames[48].ends_with("frame_049.jpg"));
+    assert_eq!(read_monitor_frames(&root).unwrap(), frames);
+    let large_numbers = vec![root.join("frame_1000.jpg").display().to_string(), root.join("frame_999.jpg").display().to_string()];
+    assert!(normalized_monitor_frames(&large_numbers)[0].ends_with("frame_999.jpg"));
+    assert!(monitor_frame_number(Path::new("._frame_001.jpg")).is_none());
+    assert!(monitor_frame_number(Path::new("frame_000.jpg")).is_none());
+    assert!(monitor_frame_number(Path::new("frame_1x.jpg")).is_none());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repair_frame_exports_renumbers_real_images_and_preserves_surplus_in_backup() {
+    use super::*;
+    let root = std::env::temp_dir().join(make_id("beav-frame-repair-test"));
+    let cache = root.join("cache");
+    let exports = root.join("exports");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::create_dir_all(&exports).unwrap();
+    let mut frames = Vec::new();
+    for (number, bytes) in [(1, "real-one"), (2, "real-two")] {
+        let path = cache.join(format!("frame_{number:03}.jpg"));
+        std::fs::write(&path, bytes).unwrap();
+        frames.push(path.display().to_string());
+    }
+    for number in 1..=4 {
+        std::fs::write(exports.join(format!("抽帧_{number:03}.jpg")), "bad-data").unwrap();
+    }
+    std::fs::write(exports.join("图片_1.jpg"), "cover").unwrap();
+    export_monitor_frames(&frames, &exports, true).unwrap();
+    assert_eq!(std::fs::read_to_string(exports.join("抽帧_001.jpg")).unwrap(), "real-one");
+    assert_eq!(std::fs::read_to_string(exports.join("抽帧_002.jpg")).unwrap(), "real-two");
+    assert!(!exports.join("抽帧_003.jpg").exists());
+    let backup = std::fs::read_dir(&exports).unwrap().flatten().find(|entry| entry.file_name().to_string_lossy().starts_with(".beav-frame-backup-")).unwrap().path();
+    assert_eq!(std::fs::read_to_string(backup.join("抽帧_003.jpg")).unwrap(), "bad-data");
+    assert!(backup.join("抽帧_004.jpg").exists());
+    assert_eq!(std::fs::read_to_string(exports.join("图片_1.jpg")).unwrap(), "cover");
+    let mut bundle = Vec::new();
+    collect_bundle_files(&exports, &exports, &mut bundle);
+    assert!(!bundle.iter().any(|file| file["name"].as_str().unwrap().contains(".beav-frame-backup-")));
+    assert_eq!(std::fs::read_to_string(&frames[1]).unwrap(), "real-two");
+    assert!(export_monitor_frames(&[], &exports, true).is_err());
+    assert!(exports.join("抽帧_001.jpg").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// 回归守卫：详情抓取时用干净文案纠正列表页的脏标题。
 ///
 /// 实测：抖音列表页 title = 「播放量 + 文案 + 文案重复」，

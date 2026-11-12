@@ -28,3 +28,5 @@ Web 文件访问还会在 `assistant_core/web_access.rs` 校验记录归属。�
 省略 `watchId` 的历史补采只选择当前用户拥有或获共享的监控项；后台管理员调度仍可处理全部启用项。SSE 的全局预取通知只向普通用户发送刷新信号，不包含其他用户的统计和诊断内容。
 
 验证：`cargo check --bin beav`、`cargo test --bin beav commands::monitor::tests`。修改打包路径时同时运行 `commands::file_ops::archive::tests`。
+
+外接盘上的抽帧仅接收普通文件 `frame_<正整数>.jpg`，按数字排序并去重。不要仅检查 `.jpg` 后缀：macOS 的 `._frame_001.jpg` 是 AppleDouble 元数据，可能与真实帧交错出现，造成计数翻倍、隔张坏图。读取历史分析时先规范化列表；重新导出时修复编号并回填列表，正文和转写保持不变。替换污染的导出图片须使用新临时文件后原子替换，避免保留元数据文件的隐藏标志；多余旧编号图片归档到 `.beav-frame-backup-*`，素材包排除这些备份和 `._*`。存量修复见 [维护脚本](../../../../scripts/README.md)。

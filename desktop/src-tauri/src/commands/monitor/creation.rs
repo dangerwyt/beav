@@ -744,6 +744,9 @@ pub(super) fn material_files(state: &State<'_, AppState>, payload: &Value) -> Re
 pub(super) fn collect_bundle_files(dir: &Path, root: &Path, out: &mut Vec<Value>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("._") || name.starts_with(".beav-frame-backup-") || name.starts_with(".beav-frame-repair-") { continue; }
         let path = entry.path();
         if path.is_dir() {
             if out.len() < 5000 {

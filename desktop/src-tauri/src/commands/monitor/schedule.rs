@@ -8,7 +8,10 @@ pub(super) fn video_analysis(state: &State<'_, AppState>, payload: &Value) -> Re
     })?;
     Ok(json!({
         "success": true,
-        "analysis": rec.map(|r| serde_json::to_value(&r).unwrap_or_else(|_| json!({}))),
+        "analysis": rec.map(|mut r| {
+            r.frames = normalized_monitor_frames(&r.frames);
+            serde_json::to_value(&r).unwrap_or_else(|_| json!({}))
+        }),
     }))
 }
 

@@ -32,6 +32,13 @@
 
 ## 视频分盘（macOS）
 
+外接盘解析后出现「隔张坏图 / 抽帧编号只有奇数」时，先等待迁移清理命令退出，再更新服务。`maintenance/repair-monitor-frames.mjs` 默认只读，报告分析记录中混入的 `._*.jpg` 元数据及真实帧数；加 `--apply` 后通过现有 IPC 修复受影响记录、重写导出图片和知识卡，不重新抽帧或调用 ASR。可用 `--post-id ID` 限定单篇。多余旧编号导出图片保留在素材目录的 `.beav-frame-backup-*` 中。后端约束见 [monitor README](../src-tauri/src/commands/monitor/README.md)。
+
+```bash
+node desktop/scripts/maintenance/repair-monitor-frames.mjs
+node desktop/scripts/maintenance/repair-monitor-frames.mjs --apply
+```
+
 `maintenance/migrate-video-storage.mjs` 只迁移导出目录中带 `.beav-post-id` 标记的 `视频.*`，以及当前空间的 `monitor-videos` 缓存。`knowledge.md`、图片、字幕、正文等保留在原导出目录；缓存包含其已有预览和抽帧。两个目标分别为外接盘下的 `导出视频`、`视频缓存`，绝不把整个导出目录做成外接盘链接。
 
 先退出 Obsidian，暂停正在执行的采集/下载，然后在仓库根运行（服务采用 `com.beav.desktop` / `com.beav.web` 的 launchd 部署）：

@@ -978,6 +978,36 @@ pub(super) fn frames_are_reusable(
     }
 }
 
+pub(super) fn monitor_frame_number(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let number = name.strip_prefix("frame_")?.strip_suffix(".jpg")?;
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) { return None; }
+    number.parse::<u64>().ok().filter(|number| *number > 0)
+}
+
+/// macOS AppleDouble files (._frame_001.jpg) are metadata, not video frames.
+pub(super) fn normalized_monitor_frames(frames: &[String]) -> Vec<String> {
+    let mut frames: Vec<_> = frames.iter().filter_map(|path| {
+        monitor_frame_number(Path::new(path)).map(|number| (number, path.clone()))
+    }).collect();
+    frames.sort();
+    frames.dedup();
+    frames.into_iter().map(|(_, path)| path).collect()
+}
+
+pub(super) fn read_monitor_frames(dir: &Path) -> Result<Vec<String>, String> {
+    let entries = std::fs::read_dir(dir).map_err(|error| format!("读取抽帧目录失败：{}（{error}）", dir.display()))?;
+    let mut frames = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("读取抽帧文件失败：{error}"))?;
+        let kind = entry.file_type().map_err(|error| format!("读取抽帧文件类型失败：{error}"))?;
+        if kind.is_file() && monitor_frame_number(&entry.path()).is_some() {
+            frames.push(entry.path().display().to_string());
+        }
+    }
+    Ok(normalized_monitor_frames(&frames))
+}
+
 /// 新抓到的正文能否覆盖旧正文。
 ///
 /// - 旧内容是**脏数据**（含「举报发布时间」这类界面噪音）→ 无条件覆盖，
@@ -1004,25 +1034,7 @@ pub(super) fn analyze_video(app: &AppHandle, state: &State<'_, AppState>, payloa
     let frames_dir = dir.join(&id).join("frames");
     std::fs::create_dir_all(&frames_dir).map_err(|e| format!("创建帧目录失败：{e}"))?;
 
-    let read_frames = || -> Vec<String> {
-        std::fs::read_dir(&frames_dir)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter_map(|e| {
-                        let p = e.path();
-                        if p.extension().map(|x| x == "jpg").unwrap_or(false) {
-                            Some(p.display().to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-
-    let existing_frames = read_frames();
+    let existing_frames = read_monitor_frames(&frames_dir)?;
 
     // 帧还能不能直接复用：目录里有帧，且最新一帧不早于「视频下载完成时间」。
     //
@@ -1062,7 +1074,7 @@ pub(super) fn analyze_video(app: &AppHandle, state: &State<'_, AppState>, payloa
             .arg("fps=1/5")
             .arg(&frame_pattern)
             .output();
-        read_frames()
+        read_monitor_frames(&frames_dir)?
     };
 
     // 语音转写：默认在抽帧后同步跑；`skipTranscript` 时为「只抽帧」模式（下载 worker 用），
