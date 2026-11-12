@@ -50,6 +50,15 @@ node desktop/scripts/maintenance/migrate-video-storage.mjs --exports "$HOME/Docu
 
 清理前再次校验，副本变化则保留原件。导出根的 `.beav-video-migration.json` 保存路径、校验摘要及原笔记内容；不要修改它。中途失败可重跑相同 `--apply`，已存在且内容相同的副本会复用。硬盘断开时视频不可用，笔记正文仍在内置盘；不要手工删除原目录里的链接。Obsidian 需要将原导出目录包含在当前 vault 内；目录链接的同步和跨盘拖动限制见 [Obsidian 官方说明](https://obsidian.md/help/symlinks)。
 
+**末尾检查超时不等于文件没搬完。** 用 `--status` 读取迁移记录和当前链接，不停服务、不复制或清理文件，硬盘未挂载时也可查看。`linked` 表示复制校验及链接切换已经完成，但视频读取验证未通过；`verified` 表示视频读取检查也已通过；`cleaned` 表示已执行原件清理。校验数量来自记录，状态查询不会重新校验全部文件。
+
+```bash
+node desktop/scripts/maintenance/migrate-video-storage.mjs --exports "$HOME/Documents/xiaobawang_export" --volume "/Volumes/mini bak" --status
+node desktop/scripts/maintenance/migrate-video-storage.mjs --exports "$HOME/Documents/xiaobawang_export" --volume "/Volumes/mini bak" --verify
+```
+
+`--verify` 只重新检查导出视频和缓存的 Range 读取，不复制文件、不重启服务、不删除原件。单次等待 60 秒，超时或暂时性服务故障最多尝试 3 次；权限/路径等明确错误直接报告。失败保留 `linked` 阶段；成功后写入 `verified`。已切换后重跑 `--apply` 也只重试验证。复制阶段每约 5 秒打印文件进度，复制完成和服务检查分别提示，避免把启动时的 `planned` 当成最终状态。
+
 验证：`node --test scripts/maintenance/migrate-video-storage.test.mjs`；导出行为与权限约定见 [monitor README](../src-tauri/src/commands/monitor/README.md)。
 
 ## Artifact Paths

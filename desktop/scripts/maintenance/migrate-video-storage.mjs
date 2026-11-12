@@ -129,7 +129,7 @@ function ensureLink(link, target) {
   fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
 }
 
-export async function applyPlan(plan, save = () => {}) {
+export async function applyPlan(plan, save = () => {}, report = () => {}) {
   if (plan.stage !== 'planned') return;
   const cacheSource = stat(plan.cacheBackup) ? plan.cacheBackup : plan.cacheRoot;
   const expectedCache = new Set(plan.files.filter((item) => item.kind === 'cache').map((item) => path.relative(plan.cacheRoot, item.source)));
@@ -139,6 +139,8 @@ export async function applyPlan(plan, save = () => {}) {
   }
   fs.mkdirSync(plan.videosRoot, { recursive: true });
   fs.mkdirSync(plan.cacheTarget, { recursive: true });
+  let completed = 0, lastReport = Date.now();
+  report(`开始复制并校验 ${plan.files.length} 个文件；原件暂时保留。`);
   for (const item of plan.files) {
     const source = item.kind === 'cache' && stat(plan.cacheBackup)
       ? path.join(plan.cacheBackup, path.relative(plan.cacheRoot, item.source)) : item.source;
@@ -147,6 +149,11 @@ export async function applyPlan(plan, save = () => {}) {
       const marker = path.join(path.dirname(item.target), MARKER);
       if (stat(marker) && fs.readFileSync(marker, 'utf8').trim() !== item.id) throw new Error(`视频目录标识冲突：${marker}`);
       fs.writeFileSync(marker, item.id);
+    }
+    completed++;
+    if (Date.now() - lastReport >= 5000 || completed === plan.files.length) {
+      report(`复制并校验：${completed}/${plan.files.length} 个文件`);
+      lastReport = Date.now();
     }
   }
   save(); // Save hashes before changing paths. Source videos are retained until --cleanup.
@@ -170,6 +177,7 @@ export async function applyPlan(plan, save = () => {}) {
   }
   plan.stage = 'linked';
   save();
+  report('文件复制、校验和路径切换已完成（linked）；原件仍保留。接下来恢复服务并验证视频读取。');
 }
 
 export async function cleanupPlan(plan, save = () => {}) {
@@ -256,34 +264,84 @@ async function startServices(services) {
   throw new Error('服务启动检查超时；原视频与缓存备份仍保留。');
 }
 
-async function verifyPlayback(plan) {
+export async function verifyPlayback(plan, { daemon = DAEMON, timeoutMs = 60000, report = console.log } = {}) {
+  if (!['linked', 'verified', 'cleaned'].includes(plan.stage)) throw new Error('文件尚未完成切换，不能只验证播放；请先查看 --status。');
+  for (const [link, target] of [[path.join(plan.exportsRoot, '导出视频'), plan.videosRoot], [plan.cacheRoot, plan.cacheTarget]]) {
+    if (!stat(link)?.isSymbolicLink() || fs.realpathSync(link) !== fs.realpathSync(target)) throw new Error(`目录链接已变化，不能确认迁移完成：${link}`);
+  }
   for (const kind of ['export', 'cache']) {
     const item = plan.files.find((file) => file.kind === kind && /\.(mp4|webm|mov|m4v)$/i.test(file.target) && fs.statSync(file.target).size > 0);
     if (!item) continue;
     const source = kind === 'cache' ? item.source : path.join(plan.exportsRoot, '导出视频', item.id, path.basename(item.source));
-    const response = await fetch(`${DAEMON}/api/file?path=${encodeURIComponent(source)}`, { headers: { Range: 'bytes=0-15' }, signal: AbortSignal.timeout(15000) });
-    if (response.status !== 206) { await response.body?.cancel(); throw new Error(`视频读取检查失败（${response.status}）：${source}`); }
-    const actual = Buffer.from(await response.arrayBuffer());
+    const label = kind === 'export' ? '导出视频' : '视频缓存';
     const expected = Buffer.alloc(Math.min(16, fs.statSync(item.target).size));
     const fd = fs.openSync(item.target, 'r');
     try { fs.readSync(fd, expected, 0, expected.length, 0); } finally { fs.closeSync(fd); }
-    if (!actual.equals(expected)) throw new Error(`视频读取内容不一致：${source}`);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      report(`验证${label}读取（${attempt}/3，最多等待 ${timeoutMs / 1000} 秒）：${source}`);
+      try {
+        const response = await fetch(`${daemon}/api/file?path=${encodeURIComponent(source)}`, {
+          headers: { Range: 'bytes=0-15' }, signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (response.status !== 206) {
+          await response.body?.cancel();
+          const error = new Error(`HTTP ${response.status}`);
+          error.retryable = response.status >= 500;
+          throw error;
+        }
+        const actual = Buffer.from(await response.arrayBuffer());
+        if (!actual.equals(expected)) throw new Error('服务返回的视频内容与本地副本不一致');
+        report(`${label}读取验证通过。`);
+        break;
+      } catch (error) {
+        const timedOut = ['TimeoutError', 'AbortError'].includes(error.name);
+        const reason = timedOut ? `请求超过 ${timeoutMs / 1000} 秒` : error.message;
+        const retryable = timedOut || error.retryable || (error instanceof TypeError && error.message === 'fetch failed');
+        if (!retryable || attempt === 3) {
+          throw new Error(`文件已切换，但${label}读取验证未通过：${reason}。原件清理状态未改变；请用 --status 查看、--verify 重试，不要因本次失败重新搬文件或清理原件。`);
+        }
+        report(`${label}验证暂未通过（${reason}），即将只重试读取，不复制文件。`);
+        await delay(Math.min(2000, timeoutMs));
+      }
+    }
   }
+}
+
+export function migrationStatus(plan) {
+  const stages = {
+    planned: '复制或切换尚未完成',
+    linked: '文件复制校验和路径切换已完成；服务视频读取尚未验证通过',
+    verified: '文件已切换，服务视频读取验证已通过；尚未执行原件清理',
+    cleaned: '迁移记录显示原件清理已完成',
+  };
+  return {
+    stage: plan.stage, description: stages[plan.stage] || '未知阶段，请勿清理原件',
+    total: plan.files.length, hashed: plan.files.filter((file) => file.sha256).length,
+    hashNote: '校验数量来自迁移记录，本次状态查询不重新读取全部文件',
+    links: [[path.join(plan.exportsRoot, '导出视频'), plan.videosRoot], [plan.cacheRoot, plan.cacheTarget]].map(([link, expected]) => {
+      const target = stat(link)?.isSymbolicLink() ? fs.readlinkSync(link) : null;
+      let connected = false;
+      try { connected = target !== null && fs.realpathSync(link) === fs.realpathSync(expected); } catch {}
+      return { path: link, target, expected, connected };
+    }),
+    cacheBackupExists: Boolean(stat(plan.cacheBackup)),
+  };
 }
 
 async function main() {
   const { values } = parseArgs({ options: { exports: { type: 'string' }, volume: { type: 'string' },
-    apply: { type: 'boolean' }, cleanup: { type: 'boolean' }, help: { type: 'boolean' } } });
+    apply: { type: 'boolean' }, cleanup: { type: 'boolean' }, status: { type: 'boolean' },
+    verify: { type: 'boolean' }, help: { type: 'boolean' } } });
   if (values.help) {
-    console.log('用法：node scripts/maintenance/migrate-video-storage.mjs --exports "/原导出目录" --volume "/Volumes/mini bak" [--apply | --cleanup]\n默认只读预览。--apply 复制校验、修改视频引用并切换缓存，保留原件。确认播放正常后 --cleanup 校验并删除旧视频及缓存备份。');
+    console.log('用法：node scripts/maintenance/migrate-video-storage.mjs --exports "/原导出目录" --volume "/Volumes/mini bak" [--status | --apply | --verify | --cleanup]\n默认只读预览。--status 只读迁移阶段和链接，不停服务。--apply 复制校验并切换路径，保留原件。--verify 只重试视频读取验证，不复制文件或重启服务。确认播放正常后 --cleanup 校验并删除旧视频及缓存备份。');
     return;
   }
-  if (process.platform !== 'darwin') throw new Error('实际迁移仅支持 macOS；单元测试可在其他系统运行。');
-  if (!values.exports || !values.volume || (values.apply && values.cleanup)) throw new Error('必须指定 --exports 和 --volume；--apply 与 --cleanup 不能同时使用。');
+  if (process.platform !== 'darwin' && !values.status) throw new Error('实际迁移仅支持 macOS；只读 --status 和单元测试可在其他系统运行。');
+  if (!values.exports || !values.volume || [values.apply, values.cleanup, values.status, values.verify].filter(Boolean).length > 1) throw new Error('必须指定 --exports 和 --volume；--status、--apply、--verify、--cleanup 只能选择一个。');
   const exportsRoot = path.resolve(values.exports), volume = path.resolve(values.volume);
   if (!stat(exportsRoot)?.isDirectory() || stat(exportsRoot).isSymbolicLink()) throw new Error('原导出目录必须是内置盘上的普通目录，不能是整目录链接。');
-  if (path.dirname(volume) !== '/Volumes' || !stat(volume)?.isDirectory() || stat(volume).isSymbolicLink()
-    || fs.statSync(volume).dev === fs.statSync('/Volumes').dev) throw new Error(`外接硬盘未挂载：${volume}`);
+  if (!values.status && (path.dirname(volume) !== '/Volumes' || !stat(volume)?.isDirectory() || stat(volume).isSymbolicLink()
+    || fs.statSync(volume).dev === fs.statSync('/Volumes').dev)) throw new Error(`外接硬盘未挂载：${volume}`);
   if (inside(volume, exportsRoot) || exportsRoot === volume) throw new Error('导出根目录应保留在内置盘。');
   const receipt = path.join(exportsRoot, RECEIPT);
   let plan, vault = '', fresh = false;
@@ -300,7 +358,8 @@ async function main() {
         || !inside(item.kind === 'cache' ? plan.cacheTarget : plan.videosRoot, item.target)) throw new Error('迁移记录中存在越界路径。');
     }
   } else {
-    if (values.cleanup) throw new Error('未找到迁移记录，不能清理。');
+    if (values.status) { console.log('未找到迁移记录；本次只读检查未改动任何文件。'); return; }
+    if (values.cleanup || values.verify) throw new Error('未找到迁移记录，不能清理或验证。');
     const config = await invoke('monitor:get-export-root');
     if (config.externalVideoStorageVersion !== 1 || path.resolve(config.effectiveRoot) !== exportsRoot) throw new Error('请先运行 deploy/update-server.sh 更新服务，并核对原导出目录。');
     vault = (await invoke('monitor:get-obsidian-vault')).vault || '';
@@ -313,20 +372,29 @@ async function main() {
     plan.services = labels.filter((label) => launchctl('print', `gui/${process.getuid()}/${label}`).status === 0);
     if (!plan.services.includes('com.beav.desktop')) throw new Error('脚本要求使用 com.beav.desktop 的 launchd 部署；请先确认服务启动方式。');
   }
+  if (values.status) { console.log(JSON.stringify(migrationStatus(plan), null, 2)); return; }
   console.log(`笔记、图片、字幕保留：${exportsRoot}\n导出视频：${plan.videosRoot}\n视频缓存：${plan.cacheTarget}\n待处理文件：${plan.files.length}，视频笔记：${plan.notes.length}，阶段：${plan.stage}`);
-  if (!values.apply && !values.cleanup) { console.log('只读预览完成，未改动文件。'); return; }
+  if (!values.apply && !values.cleanup && !values.verify) { console.log('只读预览完成，未改动文件。'); return; }
   for (const dir of [plan.videosRoot, plan.cacheTarget]) {
     if (stat(dir) && (!stat(dir).isDirectory() || stat(dir).isSymbolicLink())) throw new Error(`目标必须是普通目录：${dir}`);
   }
-  const probe = path.join(volume, `.beav-write-test-${randomUUID()}`);
-  fs.writeFileSync(probe, '', { flag: 'wx' }); fs.unlinkSync(probe);
   const save = () => {
     const temp = `${receipt}.${randomUUID()}.tmp`;
     fs.writeFileSync(temp, JSON.stringify(plan, null, 2), { flag: 'wx' });
     fs.renameSync(temp, receipt);
   };
+  if (values.verify || (values.apply && plan.stage !== 'planned')) {
+    console.log('只验证服务视频读取；不复制文件、不清理原件、不重启服务。');
+    await verifyPlayback(plan);
+    if (plan.stage === 'linked') { plan.stage = 'verified'; save(); }
+    console.log(`视频读取验证通过，阶段：${plan.stage}。请再确认 Web 和 knowledge.md 内联播放正常。`);
+    return;
+  }
+  const probe = path.join(volume, `.beav-write-test-${randomUUID()}`);
+  fs.writeFileSync(probe, '', { flag: 'wx' }); fs.unlinkSync(probe);
   save();
   try {
+    console.log('正在停止服务，等待文件停止写入……');
     await stopServices(plan.services);
     if (values.cleanup) await cleanupPlan(plan, save);
     else {
@@ -339,14 +407,14 @@ async function main() {
       const bytes = plan.files.reduce((sum, file) => sum + (stat(file.source)?.size || 0), 0);
       const space = fs.statfsSync(volume);
       if (plan.stage === 'planned' && space.bavail * space.bsize < bytes) throw new Error('外接盘剩余空间不足，原文件未改动。');
-      await applyPlan(plan, save);
+      await applyPlan(plan, save, console.log);
     }
-  } finally { await startServices(plan.services); }
+  } finally { console.log('正在恢复服务……'); await startServices(plan.services); }
   await verifyPlayback(plan);
   if (plan.stage === 'linked') { plan.stage = 'verified'; save(); }
   console.log(values.cleanup ? '旧视频与缓存备份已清理；笔记、图片、字幕仍在原目录。' : '迁移和服务视频读取检查通过。原件仍保留；请检查 Web 视频和 knowledge.md 内联视频，再运行 --cleanup 释放内置盘空间。');
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-  main().catch((error) => { console.error(`迁移停止：${error.message}`); process.exitCode = 1; });
+  main().catch((error) => { console.error(`操作未完成：${error.message}`); process.exitCode = 1; });
 }

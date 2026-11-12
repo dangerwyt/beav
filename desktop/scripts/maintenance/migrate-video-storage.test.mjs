@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { planMigration, applyPlan, cleanupPlan, copyVerified, rewriteVideoEmbeds } from './migrate-video-storage.mjs';
+import http from 'node:http';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { planMigration, applyPlan, cleanupPlan, copyVerified, rewriteVideoEmbeds, migrationStatus, verifyPlayback } from './migrate-video-storage.mjs';
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'beav-video-migration-'));
@@ -91,4 +94,81 @@ test('unrecorded backup files prevent cleanup', async (t) => {
   fs.writeFileSync(path.join(plan.cacheBackup, 'unexpected.txt'), 'keep');
   await assert.rejects(cleanupPlan(plan), /未记录文件/);
   assert.ok(fs.existsSync(path.join(post, '视频.mp4')));
+});
+
+async function playbackServer(t, handler) {
+  const server = http.createServer(handler);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); return new Promise((resolve) => server.close(resolve)); });
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+test('status distinguishes copied files from playback verification and does not mutate files', async (t) => {
+  const { plan } = fixture(t);
+  assert.equal(migrationStatus(plan).stage, 'planned');
+  assert.equal(migrationStatus(plan).hashed, 0);
+  await applyPlan(plan);
+  const summary = migrationStatus(plan);
+  assert.equal(summary.stage, 'linked');
+  assert.match(summary.description, /尚未验证通过/);
+  assert.equal(summary.hashed, plan.files.length);
+  assert.ok(summary.links.every((link) => link.connected));
+  assert.ok(summary.cacheBackupExists);
+  plan.services = ['com.beav.desktop'];
+  const receipt = path.join(plan.exportsRoot, '.beav-video-migration.json');
+  const before = JSON.stringify(plan);
+  fs.writeFileSync(receipt, before);
+  const script = fileURLToPath(new URL('./migrate-video-storage.mjs', import.meta.url));
+  const result = spawnSync(process.execPath, [script, '--exports', plan.exportsRoot, '--volume', path.dirname(plan.videosRoot), '--status'], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).stage, 'linked');
+  assert.equal(fs.readFileSync(receipt, 'utf8'), before);
+  fs.unlinkSync(path.join(plan.exportsRoot, '导出视频'));
+  assert.equal(migrationStatus(plan).links[0].connected, false);
+});
+
+test('playback timeout leaves migration linked and a retry only reads videos', async (t) => {
+  const { plan } = fixture(t);
+  await applyPlan(plan);
+  const before = JSON.stringify(plan);
+  const logs = [];
+  let requests = 0, responding = false;
+  const daemon = await playbackServer(t, (req, res) => {
+    requests++;
+    if (!responding) return; // Simulate a daemon that accepts connections but stalls on disk reads.
+    assert.equal(req.headers.range, 'bytes=0-15');
+    const file = new URL(req.url, 'http://localhost').searchParams.get('path');
+    const bytes = fs.readFileSync(file).subarray(0, 16);
+    res.writeHead(206, { 'Content-Length': bytes.length }); res.end(bytes);
+  });
+  await assert.rejects(verifyPlayback(plan, { daemon, timeoutMs: 100, report: (line) => logs.push(line) }), /文件已切换.*导出视频读取验证未通过.*--verify/);
+  assert.equal(plan.stage, 'linked');
+  assert.equal(JSON.stringify(plan), before);
+  assert.ok(logs.some((line) => line.includes('3/3')));
+  assert.ok(fs.existsSync(plan.files[0].source));
+  assert.ok(fs.existsSync(plan.cacheBackup));
+  const failedRequests = requests;
+  responding = true;
+  await verifyPlayback(plan, { daemon, report: () => {} });
+  assert.equal(requests - failedRequests, 2); // One export and one cache sample, no copy pass.
+  assert.equal(JSON.stringify(plan), before);
+});
+
+test('transient server errors retry, permanent permission failures do not', async (t) => {
+  const { plan } = fixture(t);
+  await applyPlan(plan);
+  let requests = 0, deny = false;
+  const daemon = await playbackServer(t, (req, res) => {
+    requests++;
+    if (deny) { res.writeHead(404); res.end(); return; }
+    if (requests === 1) { res.writeHead(503); res.end(); return; }
+    const file = new URL(req.url, 'http://localhost').searchParams.get('path');
+    res.writeHead(206); res.end(fs.readFileSync(file).subarray(0, 16));
+  });
+  await verifyPlayback(plan, { daemon, timeoutMs: 100, report: () => {} });
+  assert.equal(requests, 3);
+  deny = true;
+  await assert.rejects(verifyPlayback(plan, { daemon, report: () => {} }), /HTTP 404/);
+  assert.equal(requests, 4);
+  assert.equal(plan.stage, 'linked');
 });
