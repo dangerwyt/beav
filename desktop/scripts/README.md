@@ -30,6 +30,28 @@
 - [maintenance/retry-transcribe.mjs](/desktop/scripts/maintenance/retry-transcribe.mjs): 批量重跑失败的语音转写。按 `postVideoAnalyses[].transcriptStatus` 分类处理：`failed` / `pending` 直接重试转写；`no-audio` 先走 `monitor:download-video {patchAudio:true}` 补音轨再转写；`not-configured` 跳过（没配 ASR 重试无意义）。调 `monitor:transcribe-video`（只补转写，不重抽帧）。`--status` 指定要处理的状态（默认 `failed,pending`）、`--limit`、`--concurrency`、`--platform`、`--watch-id`、`--dry-run`。结束时报「仍待重跑 N 条」，可中断续做。**前提**：桌面端在运行、平台 Chrome 已登录、已配好 ASR 服务。
 - [sync-wb-memory.mjs](/desktop/scripts/sync-wb-memory.mjs): 同步 WorkBuddy 的**工作区记忆**到另一台机器。WorkBuddy 的云端 profile、用户级 MEMORY.md、对话历史都跟账号走（换机自动有），**只有工作区记忆**（`<workspace>/.workbuddy/memory/`）是纯本地文件，需要手动同步。`status` 看状态 / `push` 导出到私有 git 仓库 / `pull` 合并回来（同名文件按 mtime 新者胜，冲突会列出来）。仓库路径用 `WB_MEMORY_REPO` 指定（默认 `~/wb-memory`），工作区用 `WB_WORKSPACE` 指定（默认按记忆文件数自动选）
 
+## 视频分盘（macOS）
+
+`maintenance/migrate-video-storage.mjs` 只迁移导出目录中带 `.beav-post-id` 标记的 `视频.*`，以及当前空间的 `monitor-videos` 缓存。`knowledge.md`、图片、字幕、正文等保留在原导出目录；缓存包含其已有预览和抽帧。两个目标分别为外接盘下的 `导出视频`、`视频缓存`，绝不把整个导出目录做成外接盘链接。
+
+先退出 Obsidian，暂停正在执行的采集/下载，然后在仓库根运行（服务采用 `com.beav.desktop` / `com.beav.web` 的 launchd 部署）：
+
+```bash
+bash desktop/deploy/update-server.sh
+node desktop/scripts/maintenance/migrate-video-storage.mjs --exports "$HOME/Documents/xiaobawang_export" --volume "/Volumes/mini bak"
+node desktop/scripts/maintenance/migrate-video-storage.mjs --exports "$HOME/Documents/xiaobawang_export" --volume "/Volumes/mini bak" --apply
+```
+
+默认只读预览。`--apply` 自动停止服务、逐文件 SHA-256 校验、调整生成知识卡中的视频嵌入、切换目录链接，再恢复服务并检查视频 Range 读取。非标准视频引用、不同内容的同名目标或未挂载硬盘会停止操作并保留原件。视频按帖子 ID 存放，不受帖子目录改名影响。原导出视频暂时保留，旧缓存改名为 `monitor-videos.beav-migration-backup`；确认 Web 播放与 Obsidian 知识卡正常后释放旧占用：
+
+```bash
+node desktop/scripts/maintenance/migrate-video-storage.mjs --exports "$HOME/Documents/xiaobawang_export" --volume "/Volumes/mini bak" --cleanup
+```
+
+清理前再次校验，副本变化则保留原件。导出根的 `.beav-video-migration.json` 保存路径、校验摘要及原笔记内容；不要修改它。中途失败可重跑相同 `--apply`，已存在且内容相同的副本会复用。硬盘断开时视频不可用，笔记正文仍在内置盘；不要手工删除原目录里的链接。Obsidian 需要将原导出目录包含在当前 vault 内；目录链接的同步和跨盘拖动限制见 [Obsidian 官方说明](https://obsidian.md/help/symlinks)。
+
+验证：`node --test scripts/maintenance/migrate-video-storage.test.mjs`；导出行为与权限约定见 [monitor README](../src-tauri/src/commands/monitor/README.md)。
+
 ## Artifact Paths
 
 - 最终 macOS 安装包复制到 `artifacts/installers/macos/`

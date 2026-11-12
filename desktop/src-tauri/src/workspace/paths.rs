@@ -173,12 +173,64 @@ pub(crate) fn workspace_root(state: &State<'_, AppState>) -> Result<PathBuf, Str
 /// 该目录不在白名单 → 视频 / 抽帧图的 `asset://` / `convertFileSrc` 全部 404。
 /// 这里在启动与切换目录时动态放行，避免媒体预览失效。
 pub(crate) fn allow_workspace_in_asset_scope(app: &AppHandle, root: &Path) {
-    match app.asset_protocol_scope().allow_directory(root, true) {
-        Ok(()) => {}
-        Err(error) => eprintln!(
-            "[workspace] allow asset dir {} failed: {error}",
-            root.display()
-        ),
+    let export_root = app.try_state::<AppState>().and_then(|state| {
+        with_store(&state, |store| Ok(store.monitor_export_root.clone())).ok()
+    }).filter(|value| !value.trim().is_empty()).map(PathBuf::from);
+    for directory in local_media_access_roots(root, export_root.as_deref()) {
+        if let Err(error) = app.asset_protocol_scope().allow_directory(&directory, true) {
+            eprintln!("[workspace] allow asset dir {} failed: {error}", directory.display());
+        }
+    }
+}
+
+/// Resolve only configured media directories, never the external disk's entire mount point.
+pub(crate) fn local_media_access_roots(workspace: &Path, export_root: Option<&Path>) -> Vec<PathBuf> {
+    let cache = workspace.join("monitor-videos");
+    let export_videos = export_root.unwrap_or(workspace).join("导出视频");
+    let mut roots = Vec::new();
+    for path in [Some(workspace), Some(cache.as_path()), export_root, Some(export_videos.as_path())].into_iter().flatten() {
+        if let Ok(canonical) = path.canonicalize() {
+            if canonical.is_dir() && !roots.contains(&canonical) { roots.push(canonical); }
+        }
+    }
+    roots
+}
+
+#[cfg(test)]
+mod media_access_tests {
+    use super::*;
+
+    #[test]
+    fn external_cache_links_are_allowed_without_opening_the_whole_disk() {
+        let root = std::env::temp_dir().join(crate::make_id("media-roots-test"));
+        let workspace = root.join("workspace");
+        let cache = root.join("external disk").join("视频缓存");
+        let exports = root.join("external disk").join("导出素材");
+        let videos = root.join("external disk").join("导出视频");
+        for dir in [&workspace, &cache, &exports, &videos] { fs::create_dir_all(dir).unwrap(); }
+        let link = workspace.join("monitor-videos");
+        let video_link = exports.join("导出视频");
+        #[cfg(unix)]
+        for (target, link) in [(&cache, &link), (&videos, &video_link)] {
+            std::os::unix::fs::symlink(target, link).unwrap();
+        }
+        #[cfg(windows)]
+        for (target, link) in [(&cache, &link), (&videos, &video_link)] {
+            assert!(std::process::Command::new("cmd").args(["/C", "mklink", "/J"])
+                .arg(link).arg(target).output().unwrap().status.success());
+        }
+        let roots = local_media_access_roots(&workspace, Some(&exports));
+        let canonical_cache = cache.canonicalize().unwrap();
+        assert!(roots.contains(&canonical_cache));
+        assert!(roots.contains(&exports.canonicalize().unwrap()));
+        assert!(roots.contains(&videos.canonicalize().unwrap()));
+        assert!(!roots.iter().any(|allowed| canonical_cache.parent().unwrap().starts_with(allowed)));
+        #[cfg(unix)]
+        for link in [&link, &video_link] { fs::remove_file(link).unwrap(); }
+        #[cfg(windows)]
+        for link in [&link, &video_link] { fs::remove_dir(link).unwrap(); }
+        assert!(!local_media_access_roots(&workspace, Some(&exports)).contains(&canonical_cache));
+        fs::remove_dir_all(root).unwrap();
     }
 }
 

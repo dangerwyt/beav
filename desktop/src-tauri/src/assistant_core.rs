@@ -1359,20 +1359,10 @@ fn serve_local_file(
         .map_err(|_| format!("文件不存在: {}", requested.display()))?;
 
     let state = app.state::<AppState>();
-    let mut roots: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(guard) = state.workspace_root_cache.lock() {
-        if let Ok(root) = guard.canonicalize() {
-            roots.push(root);
-        }
-    }
-    if let Ok(export_root) = with_store(&state, |store| Ok(store.monitor_export_root.clone())) {
-        let export_root = export_root.trim();
-        if !export_root.is_empty() {
-            if let Ok(root) = std::path::PathBuf::from(export_root).canonicalize() {
-                roots.push(root);
-            }
-        }
-    }
+    let workspace = state.workspace_root_cache.lock().map_err(|_| "工作区锁已损坏".to_string())?.clone();
+    let export_root = with_store(&state, |store| Ok(store.monitor_export_root.clone()))?;
+    let export_root = (!export_root.trim().is_empty()).then(|| std::path::Path::new(export_root.trim()));
+    let roots = crate::local_media_access_roots(&workspace, export_root);
     if !roots.iter().any(|root| canonical.starts_with(root)) {
         return Err("路径不在允许的目录内".to_string());
     }

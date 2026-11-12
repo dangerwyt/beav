@@ -85,6 +85,41 @@ fn export_write_errors_include_the_target_path() {
     std::fs::remove_dir(&root).unwrap();
 }
 
+#[test]
+fn external_video_export_preserves_notes_and_rejects_a_disconnected_drive() {
+    use super::*;
+    let root = std::env::temp_dir().join(make_id("beav-video-export-test"));
+    let exports = root.join("exports");
+    let l4 = exports.join("platform/date/author/title");
+    let disk = root.join("mini bak").join("导出视频");
+    std::fs::create_dir_all(&l4).unwrap();
+    std::fs::create_dir_all(&disk).unwrap();
+    let name = "视频.mp4";
+    assert_eq!(exported_video_path(&exports, &l4, "post-1", name).unwrap(), l4.join(name));
+    assert_eq!(export_video_embed(&exports, &l4, "post-1", name, "hub/").unwrap(), "![[hub/视频.mp4]]");
+    let link = exports.join("导出视频");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&disk, &link).unwrap();
+    #[cfg(windows)]
+    assert!(Command::new("cmd").args(["/C", "mklink", "/J"])
+        .arg(&link).arg(&disk).output().unwrap().status.success());
+    assert_eq!(exported_video_path(&exports, &l4, "post-1", name).unwrap(), link.join("post-1").join(name));
+    assert_eq!(export_video_embed(&exports, &l4, "post-1", name, "hub/").unwrap(), "![[导出视频/post-1/视频.mp4]]");
+    assert!(exported_video_path(&exports, &l4, "../escape", name).is_err());
+    std::fs::write(l4.join("knowledge.md"), "note").unwrap();
+    std::fs::write(l4.join("图片_1.jpg"), "image").unwrap();
+    std::fs::remove_dir(&disk).unwrap();
+    assert!(exported_video_path(&exports, &l4, "post-1", name).is_err());
+    assert!(l4.join("knowledge.md").is_file());
+    assert!(l4.join("图片_1.jpg").is_file());
+    assert!(!disk.exists());
+    #[cfg(unix)]
+    std::fs::remove_file(&link).unwrap();
+    #[cfg(windows)]
+    std::fs::remove_dir(&link).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// 拆解输入：SRT 必须能解析出真实时间码，大纲按步长抽样且不越界。
 #[test]
 fn srt_outline_keeps_real_timecodes() {

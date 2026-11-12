@@ -226,6 +226,34 @@ pub(super) fn copy_if_changed(src: &Path, dst: &Path) -> Result<(), String> {
         format!("复制 {} 到 {} 失败：{error}", src.display(), dst.display()))
 }
 
+/// A directory link installed by the migration script opts in to video-only external storage.
+pub(super) fn exported_video_path(root: &Path, l4: &Path, post_id: &str, name: &str) -> Result<PathBuf, String> {
+    let videos = root.join("导出视频");
+    match std::fs::symlink_metadata(&videos) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(l4.join(name)),
+        Err(error) => return Err(format!("读取导出视频目录失败：{error}")),
+        Ok(meta) if !meta.file_type().is_symlink() => return Ok(l4.join(name)),
+        Ok(_) => {}
+    }
+    // Do not create a replacement directory on the internal disk when the drive is disconnected.
+    if !videos.is_dir() {
+        return Err("导出视频硬盘未连接或目录不可访问，请连接硬盘后重试".into());
+    }
+    if post_id.is_empty() || post_id == "." || post_id == ".." || post_id.contains(['/', '\\', ':', '[', ']', '|', '#']) {
+        return Err("无效的导出帖子标识".into());
+    }
+    Ok(videos.join(post_id).join(name))
+}
+
+pub(super) fn export_video_embed(root: &Path, l4: &Path, post_id: &str, name: &str, vault: &str) -> Result<String, String> {
+    let path = exported_video_path(root, l4, post_id, name)?;
+    if path.parent() == Some(l4) {
+        return Ok(format!("![[{vault}{name}]]"));
+    }
+    // The post id makes this vault-relative suffix unique, including hub notes outside the export root.
+    Ok(format!("![[导出视频/{post_id}/{name}]]"))
+}
+
 /// 真实落盘一篇帖子的「最终产物」到 5 级目录树。best-effort：任何失败都只记日志不阻断主流程。
 pub(super) fn export_post_product(state: &State<'_, AppState>, post_id: &str) {
     if let Err(e) = try_export_post_product(state, post_id) {
@@ -460,6 +488,10 @@ pub(super) fn write_obsidian_card(
         .filter(|p| Path::new(p).exists())
         .or_else(|| post.video_local_path.as_ref().filter(|p| Path::new(p).exists()));
     let video_name = video_src.map(|p| format!("视频.{}", ext_of(p)));
+    let external_video_embed = video_name.as_ref()
+        .map(|name| export_video_embed(root, l4, &post.id, name, ""))
+        .transpose()?
+        .filter(|embed| embed.starts_with("![[导出视频/"));
 
     let body = post.content.trim();
     let transcript = analysis
@@ -616,7 +648,9 @@ pub(super) fn write_obsidian_card(
             // 会把 `![[视频.mp4]]` 当纯文本原样显示（实测）。图片用 HTML `<img>` 没事，
             // 但 `![[...]]` 是 Obsidian 自己的语法，必须裸放在正文里。
             md.push_str("## 视频\n\n");
-            md.push_str(&format!("![[{vault}{v}]]\n\n"));
+            let local_embed = format!("![[{vault}{v}]]");
+            let embed = external_video_embed.as_deref().unwrap_or(&local_embed);
+            md.push_str(&format!("{embed}\n\n"));
         }
 
         md.push_str("---\n\n");
@@ -856,7 +890,13 @@ pub(super) fn try_export_post_product(
                 .and_then(|e| e.to_str())
                 .unwrap_or("mp4")
                 .to_lowercase();
-            copy_if_changed(src, &l4.join(format!("视频.{ext}")))?;
+            let dst = exported_video_path(&root, &l4, post_id, &format!("视频.{ext}"))?;
+            if dst.parent() != Some(l4.as_path()) {
+                let dir = dst.parent().ok_or("导出视频路径无效")?;
+                std::fs::create_dir_all(dir).map_err(|error| format!("创建导出视频目录失败：{error}"))?;
+                write_export_file(dir.join(".beav-post-id"), post_id)?;
+            }
+            copy_if_changed(src, &dst)?;
         }
     }
 
@@ -989,9 +1029,12 @@ pub(super) fn try_export_post_product(
 ///
 /// 返回 `{ success, root }`；`root` 为空表示跟随工作区根。
 pub(super) fn get_export_root(state: &State<'_, AppState>) -> Result<Value, String> {
-    with_store(state, |store| {
-        Ok(json!({ "success": true, "root": store.monitor_export_root.clone() }))
-    })
+    let root = with_store(state, |store| Ok(store.monitor_export_root.clone()))?;
+    let workspace = workspace_root(state)?;
+    Ok(json!({ "success": true, "root": root,
+        "effectiveRoot": resolve_export_target(state)?,
+        "videoCacheRoot": workspace.join("monitor-videos"),
+        "externalVideoStorageVersion": 1 }))
 }
 
 /// 设置全局「导出根目录」（`monitor:set-export-root`）。
