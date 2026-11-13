@@ -2250,12 +2250,6 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                 )}
 
                 <div className="flex gap-1.5">
-                  <button
-                    onClick={() => void checkPlatformLogin(true)}
-                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
-                  >
-                    <RefreshCw className="w-3 h-3" />检测登录状态
-                  </button>
                   {/* 桌面端不用扫码：它自己就有「打开 Chrome 登录」，扫码只是冗余入口 */}
                   {!isTauriRuntime() && (
                     <button
