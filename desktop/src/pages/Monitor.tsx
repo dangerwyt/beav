@@ -2212,7 +2212,7 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
               <p className="text-[11px] leading-relaxed text-text-tertiary">
                 小红书 / 抖音 / B 站需要登录态抓取。
                 {isTauriRuntime()
-                  ? `先选平台点「打开登录页」，在弹出的 Chrome 内完成登录（cookie 仅存于本机独立 profile）；也可点「扫码登录」用手机 App 扫。之后 ${APP_BRAND.displayName} 复用登录态抓取。`
+                  ? '先选平台点「打开登录页」，在弹出的 Chrome 内完成登录。'
                   : '点「扫码登录」用手机 App 扫服务器上的二维码即可（服务器上的账号对所有用户共享）。'}
               </p>
 
@@ -2294,31 +2294,6 @@ export function Monitor({ isActive = true }: { isActive?: boolean }) {
                   )}
                 </div>
 
-                {/* 平台登录态：主要靠管理员在服务器上登录，web 端只做检测与展示 */}
-                {platformLoginState === false && (
-                  <div className="rounded-md border border-amber-200 bg-amber-50/60 px-2.5 py-2 text-[11px] leading-relaxed text-amber-800">
-                    平台未登录。请在<b>服务器桌面端</b>完成登录：
-                    <br />
-                    桌面端 → 对标监控 → 登录管理 → <b>打开 Chrome 登录</b>
-                    <br />
-                    登录完成后点上面「检测登录状态」即可（web 端无需扫码）。
-                    <button
-                      onClick={() => {
-                        void (async () => {
-                          try {
-                            const result = await window.ipcRenderer.monitor.chromeLoginDebug(chromeLoginPlatform);
-                            setLoginDebug(JSON.stringify(result, null, 2));
-                          } catch (e) {
-                            setLoginDebug(`诊断失败：${String(e)}`);
-                          }
-                        })();
-                      }}
-                      className="mt-1.5 underline decoration-dotted hover:text-amber-900"
-                    >
-                      查看登录诊断
-                    </button>
-                  </div>
-                )}
                 {loginDebug && (
                   <div className="rounded-md border border-border bg-surface-secondary/60 px-2 py-1.5">
                     <div className="flex items-center justify-between mb-1">
