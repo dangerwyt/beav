@@ -32,7 +32,7 @@
 
 ## 视频分盘（macOS）
 
-外接盘解析后出现「隔张坏图 / 抽帧编号只有奇数」时，先等待迁移清理命令退出，再更新服务。`maintenance/repair-monitor-frames.mjs` 默认只读，报告分析记录中混入的 `._*.jpg` 元数据及真实帧数；加 `--apply` 后通过现有 IPC 修复受影响记录、重写导出图片和知识卡，不重新抽帧或调用 ASR。可用 `--post-id ID` 限定单篇。多余旧编号导出图片保留在素材目录的 `.beav-frame-backup-*` 中。后端约束见 [monitor README](../src-tauri/src/commands/monitor/README.md)。
+外接盘解析后出现「隔张坏图 / 抽帧编号只有奇数」时，先等待迁移清理命令退出，再更新服务。`maintenance/repair-monitor-frames.mjs` 默认只读，仅筛选混入 `._*.jpg` 元数据的分析记录，不因单纯乱序或重复而重导出；关联动态已不存在的记录会计数并跳过，原记录和文件保留。加 `--apply` 后通过运行中服务的现有 IPC 修复受影响记录、重写导出图片和知识卡，不重新抽帧或调用 ASR。可用 `--post-id ID` 限定单篇。运行期间动态被删除也会跳过并继续下一条；其他错误仍停止并报告原因。结束时汇总成功和跳过数。多余旧编号导出图片保留在素材目录的 `.beav-frame-backup-*` 中。后端约束见 [monitor README](../src-tauri/src/commands/monitor/README.md)。
 
 ```bash
 node desktop/scripts/maintenance/repair-monitor-frames.mjs
